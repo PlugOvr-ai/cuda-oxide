@@ -667,8 +667,8 @@ fn run_ort_cuda_inference(model_path: &str, input_data: &[f32]) -> Result<Vec<f3
     let script = std::path::Path::new(model_path)
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("../scripts/infer_ort.py"))
-        .unwrap_or_else(|| std::path::PathBuf::from("../scripts/infer_ort.py"));
+        .map(|p| p.join("./scripts/infer_ort.py"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./scripts/infer_ort.py"));
 
     if !script.exists() {
         return Err(anyhow::anyhow!("infer_ort.py not found at {:?}", script));
@@ -826,8 +826,8 @@ fn run_ort_script(
     let script = std::path::Path::new(model_path)
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("../scripts").join(script_name))
-        .unwrap_or_else(|| std::path::PathBuf::from(format!("../scripts/{}", script_name)));
+        .map(|p| p.join("./scripts").join(script_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("./scripts/{}", script_name)));
     if !script.exists() {
         return Err(anyhow::anyhow!("{} not found at {:?}", script_name, script));
     }

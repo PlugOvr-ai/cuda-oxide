@@ -100,6 +100,39 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // ReLU (out-of-place) — c[i] = max(0, a[i])
+    //   Fused read→write: avoids a separate full-tensor D2D copy + launch.
+    // =========================================================================
+    #[kernel]
+    pub fn relu_fwd(a: &[f32], mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            let v = a[i];
+            *o = if v > 0.0f32 { v } else { 0.0f32 };
+        }
+    }
+
+    // =========================================================================
+    // Clip (out-of-place) — c[i] = clamp(a[i], lo, hi)
+    // =========================================================================
+    #[kernel]
+    pub fn clip_fwd(a: &[f32], lo: f32, hi: f32, mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            let v = a[i];
+            *o = if v < lo {
+                lo
+            } else if v > hi {
+                hi
+            } else {
+                v
+            };
+        }
+    }
+
+    // =========================================================================
     // Clip — in-place clamp to [lo, hi]
     // =========================================================================
     #[kernel]
@@ -241,7 +274,13 @@ pub mod gpu {
         if let Some(c_idx) = unsafe { thread::index_2d_runtime(n_sz) } {
             if row < m_sz {
                 if let Some(c_elem) = c.get_mut(c_idx) {
-                    *c_elem = alpha * sum + beta * (*c_elem);
+                    // Output buffer may be uninitialized (skip-memset alloc):
+                    // never read/scale it when beta == 0.
+                    *c_elem = if beta != 0.0f32 {
+                        alpha * sum + beta * (*c_elem)
+                    } else {
+                        alpha * sum
+                    };
                 }
             }
         }
@@ -349,6 +388,221 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // GEMM register-blocked — C = alpha·A·B + beta·C  (row-major).
+    //
+    //   A: m×k,  B: k×n,  C: m×n.  Block computes a 64×64 C tile; 256 threads
+    //   (16×16), each thread a 4×4 micro-tile held in registers. A/B are staged
+    //   in shared memory in BK=8 slabs, so every global element is reused 64×
+    //   and each thread does 16 FMAs per 8 shared loads (high arithmetic
+    //   intensity — the naive 1-elem/thread tiled and the no-reuse mma kernels
+    //   are both memory-bound; this is not).
+    //
+    //   Launch: grid=(⌈n/64⌉, ⌈m/64⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_rb(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        beta: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        // AS: [BM=64][BK=8] = 512.  BS: [BK=8][BN=64] = 512.
+        static mut AS: SharedArray<f32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x() as usize;
+        let ty = thread::threadIdx_y() as usize;
+        let tid = ty * 16 + tx;
+        let row0 = thread::blockIdx_y() as usize * 64;
+        let col0 = thread::blockIdx_x() as usize * 64;
+
+        let m_sz = m as usize;
+        let n_sz = n as usize;
+        let k_sz = k as usize;
+
+        // 16 *scalar* accumulators. This rustc→PTX backend spills
+        // array-indexed per-thread locals to local memory (killing the whole
+        // point of register blocking), so the micro-tile must be plain
+        // scalars to stay in registers.
+        let mut c00 = 0.0f32;
+        let mut c01 = 0.0f32;
+        let mut c02 = 0.0f32;
+        let mut c03 = 0.0f32;
+        let mut c10 = 0.0f32;
+        let mut c11 = 0.0f32;
+        let mut c12 = 0.0f32;
+        let mut c13 = 0.0f32;
+        let mut c20 = 0.0f32;
+        let mut c21 = 0.0f32;
+        let mut c22 = 0.0f32;
+        let mut c23 = 0.0f32;
+        let mut c30 = 0.0f32;
+        let mut c31 = 0.0f32;
+        let mut c32 = 0.0f32;
+        let mut c33 = 0.0f32;
+
+        let a_base = ty * 4;
+        let b_base = tx * 4;
+
+        let mut k0 = 0usize;
+        while k0 < k_sz {
+            // Stage A (64×8) and B (8×64) into shared memory: 512 elems each,
+            // 256 threads → 2 elements per thread (tid and tid+256).
+            let mut s = 0usize;
+            while s < 2 {
+                let e = tid + s * 256;
+                let ar = e >> 3; // 0..64
+                let ac = e & 7; //  0..8
+                let gar = row0 + ar;
+                let gac = k0 + ac;
+                unsafe {
+                    AS[e] = if gar < m_sz && gac < k_sz {
+                        a[gar * k_sz + gac]
+                    } else {
+                        0.0f32
+                    };
+                }
+                let br = e >> 6; // 0..8
+                let bc = e & 63; // 0..64
+                let gbr = k0 + br;
+                let gbc = col0 + bc;
+                unsafe {
+                    BS[e] = if gbr < k_sz && gbc < n_sz {
+                        b[gbr * n_sz + gbc]
+                    } else {
+                        0.0f32
+                    };
+                }
+                s += 1;
+            }
+            thread::sync_threads();
+
+            let mut kk = 0usize;
+            while kk < 8 {
+                let a0 = unsafe { AS[a_base * 8 + kk] };
+                let a1 = unsafe { AS[(a_base + 1) * 8 + kk] };
+                let a2 = unsafe { AS[(a_base + 2) * 8 + kk] };
+                let a3 = unsafe { AS[(a_base + 3) * 8 + kk] };
+                let bk = kk * 64 + b_base;
+                let b0 = unsafe { BS[bk] };
+                let b1 = unsafe { BS[bk + 1] };
+                let b2 = unsafe { BS[bk + 2] };
+                let b3 = unsafe { BS[bk + 3] };
+                c00 += a0 * b0;
+                c01 += a0 * b1;
+                c02 += a0 * b2;
+                c03 += a0 * b3;
+                c10 += a1 * b0;
+                c11 += a1 * b1;
+                c12 += a1 * b2;
+                c13 += a1 * b3;
+                c20 += a2 * b0;
+                c21 += a2 * b1;
+                c22 += a2 * b2;
+                c23 += a2 * b3;
+                c30 += a3 * b0;
+                c31 += a3 * b1;
+                c32 += a3 * b2;
+                c33 += a3 * b3;
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        // Fully-unrolled 4×4 store (no closures/arrays — keep it register-only).
+        // Output may be uninitialized (skip-memset alloc), so never read/scale
+        // a cell when beta == 0.
+        let gr0 = row0 + a_base;
+        let gc0 = col0 + b_base;
+        let has_beta = beta != 0.0f32;
+
+        if gr0 < m_sz {
+            if gc0 < n_sz {
+                let p = gr0 * n_sz + gc0;
+                let cell = unsafe { c.get_unchecked_mut(p) };
+                *cell = if has_beta { alpha * c00 + beta * (*cell) } else { alpha * c00 };
+            }
+            if gc0 + 1 < n_sz {
+                let p = gr0 * n_sz + gc0 + 1;
+                let cell = unsafe { c.get_unchecked_mut(p) };
+                *cell = if has_beta { alpha * c01 + beta * (*cell) } else { alpha * c01 };
+            }
+            if gc0 + 2 < n_sz {
+                let p = gr0 * n_sz + gc0 + 2;
+                let cell = unsafe { c.get_unchecked_mut(p) };
+                *cell = if has_beta { alpha * c02 + beta * (*cell) } else { alpha * c02 };
+            }
+            if gc0 + 3 < n_sz {
+                let p = gr0 * n_sz + gc0 + 3;
+                let cell = unsafe { c.get_unchecked_mut(p) };
+                *cell = if has_beta { alpha * c03 + beta * (*cell) } else { alpha * c03 };
+            }
+        }
+        if gr0 + 1 < m_sz {
+            let r = gr0 + 1;
+            if gc0 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
+                *cell = if has_beta { alpha * c10 + beta * (*cell) } else { alpha * c10 };
+            }
+            if gc0 + 1 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
+                *cell = if has_beta { alpha * c11 + beta * (*cell) } else { alpha * c11 };
+            }
+            if gc0 + 2 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
+                *cell = if has_beta { alpha * c12 + beta * (*cell) } else { alpha * c12 };
+            }
+            if gc0 + 3 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
+                *cell = if has_beta { alpha * c13 + beta * (*cell) } else { alpha * c13 };
+            }
+        }
+        if gr0 + 2 < m_sz {
+            let r = gr0 + 2;
+            if gc0 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
+                *cell = if has_beta { alpha * c20 + beta * (*cell) } else { alpha * c20 };
+            }
+            if gc0 + 1 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
+                *cell = if has_beta { alpha * c21 + beta * (*cell) } else { alpha * c21 };
+            }
+            if gc0 + 2 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
+                *cell = if has_beta { alpha * c22 + beta * (*cell) } else { alpha * c22 };
+            }
+            if gc0 + 3 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
+                *cell = if has_beta { alpha * c23 + beta * (*cell) } else { alpha * c23 };
+            }
+        }
+        if gr0 + 3 < m_sz {
+            let r = gr0 + 3;
+            if gc0 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
+                *cell = if has_beta { alpha * c30 + beta * (*cell) } else { alpha * c30 };
+            }
+            if gc0 + 1 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
+                *cell = if has_beta { alpha * c31 + beta * (*cell) } else { alpha * c31 };
+            }
+            if gc0 + 2 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
+                *cell = if has_beta { alpha * c32 + beta * (*cell) } else { alpha * c32 };
+            }
+            if gc0 + 3 < n_sz {
+                let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
+                *cell = if has_beta { alpha * c33 + beta * (*cell) } else { alpha * c33 };
+            }
+        }
+    }
+
+    // =========================================================================
     // GEMM tiled, B transposed — C = alpha * A * Bᵀ + beta * C  (row-major)
     //   A: m×k,  B: n×k (stored row-major; logically Bᵀ is k×n),  C: m×n.
     //   Used for ONNX Gemm with transB=1 (final classifier layer).
@@ -413,7 +667,13 @@ pub mod gpu {
         if let Some(c_idx) = unsafe { thread::index_2d_runtime(n_sz) } {
             if row < m_sz {
                 if let Some(c_elem) = c.get_mut(c_idx) {
-                    *c_elem = alpha * sum + beta * (*c_elem);
+                    // Output buffer may be uninitialized (skip-memset alloc):
+                    // never read/scale it when beta == 0.
+                    *c_elem = if beta != 0.0f32 {
+                        alpha * sum + beta * (*c_elem)
+                    } else {
+                        alpha * sum
+                    };
                 }
             }
         }
@@ -748,6 +1008,152 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // Softmax — one 256-thread BLOCK per row (parallel reduction).
+    //   Replaces the 1-thread-per-row softmax_row, which left ~all GPU lanes
+    //   idle for transformer shapes (few rows, wide cols). Launch:
+    //   grid=(rows,1,1), block=(256,1,1).
+    // =========================================================================
+    #[kernel]
+    pub fn softmax_block(x: &[f32], _rows: u32, cols: u32, mut y: DisjointSlice<f32>) {
+        static mut SM: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let row = thread::blockIdx_x() as usize;
+        let c = cols as usize;
+        let base = row * c;
+
+        // Phase 1: row max (strided local, then shared tree reduce).
+        let mut lmax = f32::NEG_INFINITY;
+        let mut j = tid;
+        while j < c {
+            let v = x[base + j];
+            if v > lmax {
+                lmax = v;
+            }
+            j += 256;
+        }
+        unsafe { SM[tid] = lmax };
+        thread::sync_threads();
+        let mut s = 128usize;
+        while s > 0 {
+            if tid < s {
+                let a = unsafe { SM[tid] };
+                let b = unsafe { SM[tid + s] };
+                unsafe { SM[tid] = if a > b { a } else { b } };
+            }
+            thread::sync_threads();
+            s >>= 1;
+        }
+        let rmax = unsafe { SM[0] };
+        thread::sync_threads();
+
+        // Phase 2: write exp(x-rmax) and accumulate the row sum.
+        let mut lsum = 0.0f32;
+        let mut j = tid;
+        while j < c {
+            let e = gpu_expf(x[base + j] - rmax);
+            unsafe { *y.get_unchecked_mut(base + j) = e };
+            lsum += e;
+            j += 256;
+        }
+        unsafe { SM[tid] = lsum };
+        thread::sync_threads();
+        let mut s = 128usize;
+        while s > 0 {
+            if tid < s {
+                let a = unsafe { SM[tid] };
+                let b = unsafe { SM[tid + s] };
+                unsafe { SM[tid] = a + b };
+            }
+            thread::sync_threads();
+            s >>= 1;
+        }
+        let inv = 1.0f32 / unsafe { SM[0] };
+        thread::sync_threads();
+
+        // Phase 3: normalize.
+        let mut j = tid;
+        while j < c {
+            unsafe { *y.get_unchecked_mut(base + j) *= inv };
+            j += 256;
+        }
+    }
+
+    // =========================================================================
+    // LayerNormalization — one 256-thread BLOCK per row (parallel reduction).
+    //   Launch: grid=(rows,1,1), block=(256,1,1).
+    // =========================================================================
+    #[kernel]
+    pub fn layernorm_block(
+        x: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        _rows: u32,
+        cols: u32,
+        eps: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut SM: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let row = thread::blockIdx_x() as usize;
+        let c = cols as usize;
+        let base = row * c;
+        let inv_c = 1.0f32 / c as f32;
+
+        // Phase 1: mean.
+        let mut lsum = 0.0f32;
+        let mut j = tid;
+        while j < c {
+            lsum += x[base + j];
+            j += 256;
+        }
+        unsafe { SM[tid] = lsum };
+        thread::sync_threads();
+        let mut s = 128usize;
+        while s > 0 {
+            if tid < s {
+                let a = unsafe { SM[tid] };
+                let b = unsafe { SM[tid + s] };
+                unsafe { SM[tid] = a + b };
+            }
+            thread::sync_threads();
+            s >>= 1;
+        }
+        let mean = unsafe { SM[0] } * inv_c;
+        thread::sync_threads();
+
+        // Phase 2: variance.
+        let mut lss = 0.0f32;
+        let mut j = tid;
+        while j < c {
+            let d = x[base + j] - mean;
+            lss += d * d;
+            j += 256;
+        }
+        unsafe { SM[tid] = lss };
+        thread::sync_threads();
+        let mut s = 128usize;
+        while s > 0 {
+            if tid < s {
+                let a = unsafe { SM[tid] };
+                let b = unsafe { SM[tid + s] };
+                unsafe { SM[tid] = a + b };
+            }
+            thread::sync_threads();
+            s >>= 1;
+        }
+        let inv = gpu_rsqrt(unsafe { SM[0] } * inv_c + eps);
+        thread::sync_threads();
+
+        // Phase 3: normalize + affine.
+        let mut j = tid;
+        while j < c {
+            let nrm = (x[base + j] - mean) * inv;
+            unsafe { *y.get_unchecked_mut(base + j) = nrm * gamma[j] + beta[j] };
+            j += 256;
+        }
+    }
+
+    // =========================================================================
     // LayerNormalization — normalize over the last axis (size `cols`).
     //   y = (x - mean) / sqrt(var + eps) * gamma + beta
     //   One thread per row; `rows` = numel / cols.
@@ -809,6 +1215,26 @@ pub mod gpu {
         }
     }
 
+    // Erf (out-of-place) — c[i] = erf(a[i]). Fused read→write.
+    #[kernel]
+    pub fn erf_fwd(a: &[f32], mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            *o = gpu_erf(a[i]);
+        }
+    }
+
+    // Tanh (out-of-place) — c[i] = tanh(a[i]). Fused read→write.
+    #[kernel]
+    pub fn tanh_fwd(a: &[f32], mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            *o = gpu_tanh(a[i]);
+        }
+    }
+
     // =========================================================================
     // Tensor ⊙ scalar — c[i] = a[i] + s   /   c[i] = a[i] * s
     //   Used for scalar-broadcast Add/Mul/Div (e.g. GELU constants).
@@ -862,6 +1288,39 @@ pub mod gpu {
                 d += 1;
             }
             *o = input[in_off];
+        }
+    }
+
+    // =========================================================================
+    // Concat one input into the output along `axis`, fully on GPU (no host
+    // round-trip / stream sync). Output is [outer, out_axis_len, inner]; this
+    // input is [outer, sz, inner] placed at axis offset `start`.
+    //   One thread per *input* element; scatters into the big output.
+    // =========================================================================
+    #[kernel]
+    pub fn concat_axis(
+        input: &[f32],
+        out_axis_len: u32,
+        inner: u32,
+        start: u32,
+        sz: u32,
+        outer: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let inn = inner as usize;
+        let sz_inn = sz as usize * inn;
+        let total = outer as usize * sz_inn;
+        if i < total {
+            let oo = i / sz_inn;
+            let rem = i % sz_inn;
+            let j = rem / inn;
+            let k = rem % inn;
+            let dst = oo * (out_axis_len as usize) * inn + (start as usize + j) * inn + k;
+            unsafe {
+                *y.get_unchecked_mut(dst) = input[i];
+            }
         }
     }
 

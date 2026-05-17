@@ -243,6 +243,31 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         })
     }
 
+    /// Allocates device memory of `len` elements **without zeroing it**,
+    /// enqueued on `stream`.
+    ///
+    /// Use this when the caller writes every element before any read (e.g. a
+    /// kernel output that fully covers its buffer). Skips the full-buffer
+    /// `cuMemsetD8` that [`zeroed`](Self::zeroed) performs, which is pure
+    /// wasted DRAM bandwidth when the buffer is immediately overwritten.
+    ///
+    /// # Safety contract
+    ///
+    /// The contents are indeterminate until written. Reading before writing
+    /// observes arbitrary bytes (not a memory-safety hazard for `DeviceCopy`
+    /// `T`, but a correctness one).
+    pub fn uninit(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
+        let ctx = stream.context().clone();
+        let num_bytes = len * std::mem::size_of::<T>();
+        let ptr = unsafe { crate::memory::malloc_async(stream.cu_stream(), num_bytes)? };
+        Ok(Self {
+            ptr,
+            len,
+            ctx,
+            _marker: PhantomData,
+        })
+    }
+
     /// Copies the entire buffer back to the host, returning a `Vec<T>`.
     ///
     /// Synchronizes on `stream` before returning so the host vector is safe
