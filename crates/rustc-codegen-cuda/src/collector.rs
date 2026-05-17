@@ -1352,6 +1352,10 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         };
         let fn_path = self.tcx.def_path_str(*def_id);
+        if fn_path.contains("mma_sync") {
+            eprintln!("[MMA-DBG pco-top] fn_path={} caller={}", fn_path,
+                self.tcx.def_path_str(caller.def_id()));
+        }
         if fn_path.contains("DynamicSharedArray")
             && (fn_path.contains("::get")
                 || fn_path.contains("::get_raw")
@@ -1636,6 +1640,21 @@ impl<'tcx> DeviceCollector<'tcx> {
                 );
             }
             return;
+        }
+
+        if raw_name.contains("mma_sync") {
+            let nblocks = if self.tcx.is_mir_available(resolved.def_id()) {
+                self.tcx.optimized_mir(resolved.def_id()).basic_blocks.len()
+            } else {
+                usize::MAX
+            };
+            eprintln!(
+                "[MMA-DBG collector] name={} mir_avail={} nblocks={} is_unreachable={}",
+                raw_name,
+                self.tcx.is_mir_available(resolved.def_id()),
+                nblocks,
+                self.is_unreachable_body(resolved.def_id())
+            );
         }
 
         // Check if it has an unreachable body (intrinsic placeholder)

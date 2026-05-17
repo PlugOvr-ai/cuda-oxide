@@ -36,9 +36,9 @@ use dialect_mir::ops::{
     MirStorageLiveOp, MirStoreOp, MirSubOp, MirUndefOp, MirUnreachableOp, MirUnrollHintOp,
 };
 use dialect_nvvm::ops::{
-    AssertFailOp, InlinePtxOp, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp, NvvmAtomicRmwOp,
-    NvvmAtomicStoreOp, ReadPtxSregClusterIdxOp, ReadPtxSregNclusterIdOp, VprintfOp,
-    WgmmaMakeSmemDescOp, WgmmaMmaGroupM64N64K16F32Bf16Op, WgmmaMmaM64N64K16F32Bf16Op,
+    AssertFailOp, InlinePtxOp, MmaSyncM16N8K8F32Tf32Op, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
+    NvvmAtomicRmwOp, NvvmAtomicStoreOp, ReadPtxSregClusterIdxOp, ReadPtxSregNclusterIdOp,
+    VprintfOp, WgmmaMakeSmemDescOp, WgmmaMmaGroupM64N64K16F32Bf16Op, WgmmaMmaM64N64K16F32Bf16Op,
 };
 
 // ---- Arithmetic ops --------------------------------------------------------
@@ -1011,6 +1011,23 @@ impl MirToLlvmConversion for WgmmaMmaM64N64K16F32Bf16Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::wgmma::convert_mma(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MmaSyncM16N8K8F32Tf32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_sync(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
     }
 }
 
