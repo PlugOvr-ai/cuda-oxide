@@ -315,6 +315,38 @@ pub unsafe fn wgmma_mma_m64n64k16_f32_tf32(acc: &mut [[f32; 8]; 4], desc_a: u64,
 // Accumulator Utilities
 // =============================================================================
 
+// =============================================================================
+// Ampere warp-level MMA (mma.sync) — sm_80+
+// =============================================================================
+
+/// Ampere tensor-core MMA: `D = A·B + C` for one `m16n8k8` tile, tf32 inputs,
+/// f32 accumulate. Warp-collective (all 32 lanes participate).
+///
+/// Per-thread fragment layout (CUDA PTX ISA, `mma.sync.aligned.m16n8k8`):
+/// - `acc`: 4 f32 accumulator regs (C in, D out — read-modify-write).
+/// - `a0..a3`: A 16×8 tf32 fragment — 4 `.b32` registers (tf32 is bit-stored
+///   in 32-bit lanes; round f32→tf32 by masking the low 13 mantissa bits).
+/// - `b0,b1`: B 8×8 tf32 fragment — 2 `.b32` registers.
+///
+/// PTX: `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`
+///
+/// # Safety
+/// - Must be called by all 32 lanes of a warp from a `#[kernel]` on sm_80+.
+/// - Caller owns the lane→element packing per the PTX ISA fragment layout.
+#[inline(never)]
+pub unsafe fn mma_sync_m16n8k8_f32_tf32(
+    acc: &mut [f32; 4],
+    a0: u32,
+    a1: u32,
+    a2: u32,
+    a3: u32,
+    b0: u32,
+    b1: u32,
+) {
+    let _ = (acc, a0, a1, a2, a3, b0, b1);
+    unreachable!("mma_sync_m16n8k8_f32_tf32 called outside CUDA kernel context")
+}
+
 /// Type alias for the WGMMA accumulator (m64n64 tile, 32 floats per thread).
 pub type Acc64x64 = [[f32; 8]; 4];
 

@@ -16,13 +16,18 @@
 //! | `MmaM64N64K16F32Bf16` | `wgmma.mma_async`               | Matrix multiply                |
 
 use crate::convert::intrinsics::common::*;
+use dialect_llvm::ops as llvm;
+use dialect_llvm::ops::GepIndex;
 use dialect_llvm::types as llvm_types;
-use pliron::builtin::types::{IntegerType, Signedness};
+use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
+use pliron::irbuild::inserter::Inserter;
 use pliron::irbuild::rewriter::Rewriter;
+use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
+use pliron::value::Value;
 
 pub(crate) fn convert_fence(
     ctx: &mut Context,
@@ -147,4 +152,80 @@ pub(crate) fn convert_mma(
          currently unsupported. Tracking issue: full lowering requires \
          register allocation for 16+ output registers."
     )
+}
+
+/// Convert Ampere `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`.
+///
+/// Operands: `[acc_ptr, a0, a1, a2, a3, b0, b1]`. Loads the 4-f32
+/// accumulator from `acc_ptr`, issues the tensor-core MMA with the C/D
+/// accumulator tied (read-modify-write), and stores the 4 results back.
+pub(crate) fn convert_mma_sync(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 7 {
+        return pliron::input_err_noloc!(
+            "mma_sync_m16n8k8_f32_tf32 requires 7 operands [acc_ptr, a0..a3, b0, b1]"
+        );
+    }
+    let acc_ptr = operands[0];
+    let (a0, a1, a2, a3) = (operands[1], operands[2], operands[3], operands[4]);
+    let (b0, b1) = (operands[5], operands[6]);
+
+    let f32_ty = FP32Type::get(ctx);
+
+    // Load c0..c3 from the accumulator (acc_ptr is f32*; index by element).
+    let mut c = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        let gep = llvm::GetElementPtrOp::new(
+            ctx,
+            acc_ptr,
+            vec![GepIndex::Constant(i)],
+            f32_ty.into(),
+        )?;
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let ld = llvm::LoadOp::new(ctx, gptr, f32_ty.into());
+        rewriter.insert_operation(ctx, ld.get_operation());
+        c.push(ld.get_operation().deref(ctx).get_result(0));
+    }
+
+    // D = A·B + C. C/D are the 4 tied accumulator registers ($0..$3);
+    // A = {$4,$5,$6,$7}, B = {$8,$9}.
+    let asm = llvm::InlineAsmMultiOp::new_tied_convergent(
+        ctx,
+        4,
+        f32_ty.into(),
+        c.clone(),
+        vec![a0, a1, a2, a3, b0, b1],
+        // Operand numbering: $0..$3 = outputs (D). Inputs follow: the 4 tied
+        // accumulator inputs are $4..$7 (alias $0..$3), then A = $8..$11,
+        // B = $12,$13. C uses the tied outputs $0..$3.
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \
+{$0,$1,$2,$3}, {$8,$9,$10,$11}, {$12,$13}, {$0,$1,$2,$3};",
+        "f",
+        "r,r,r,r,r,r",
+    );
+    rewriter.insert_operation(ctx, asm.get_operation());
+
+    // Store the 4 D results back into the accumulator.
+    for i in 0..4usize {
+        let d = asm.get_operation().deref(ctx).get_result(i);
+        let gep = llvm::GetElementPtrOp::new(
+            ctx,
+            acc_ptr,
+            vec![GepIndex::Constant(i as u32)],
+            f32_ty.into(),
+        )?;
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+
+    rewriter.erase_operation(ctx, op);
+    Ok(())
 }

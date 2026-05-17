@@ -210,6 +210,36 @@ impl WgmmaMmaM64N64K16F32Bf16Op {
     }
 }
 
+/// Ampere warp-level MMA: m16n8k8, f32 accumulator, tf32 inputs.
+///
+/// Performs `D = A × B + C` for one warp-collective 16×8×8 tile.
+///
+/// PTX: `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`
+///
+/// # Operands
+///
+/// - `acc_ptr` (ptr): pointer to the 4-f32 accumulator (read-modify-write)
+/// - `a0..a3` (i32): A fragment, 4 tf32-in-b32 registers
+/// - `b0,b1` (i32): B fragment, 2 tf32-in-b32 registers
+///
+/// # Results
+///
+/// - None (accumulator is updated in-place via pointer)
+#[pliron_op(
+    name = "nvvm.mma_sync_m16n8k8_f32_tf32",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<7>, NResultsInterface<0>],
+)]
+pub struct MmaSyncM16N8K8F32Tf32Op;
+
+impl MmaSyncM16N8K8F32Tf32Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MmaSyncM16N8K8F32Tf32Op { op }
+    }
+}
+
 /// Register WGMMA operations with the context.
 pub(super) fn register(ctx: &mut Context) {
     WgmmaFenceSyncAlignedOp::register(ctx);
@@ -217,4 +247,5 @@ pub(super) fn register(ctx: &mut Context) {
     WgmmaWaitGroupSyncAlignedOp::register(ctx);
     WgmmaMakeSmemDescOp::register(ctx);
     WgmmaMmaM64N64K16F32Bf16Op::register(ctx);
+    MmaSyncM16N8K8F32Tf32Op::register(ctx);
 }

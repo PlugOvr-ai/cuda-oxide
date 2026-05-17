@@ -2452,6 +2452,11 @@ fn try_dispatch_intrinsic(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
             )?))
         }
+        "cuda_device::wgmma::mma_sync_m16n8k8_f32_tf32" => {
+            Ok(Some(intrinsics::wgmma::emit_mma_sync_m16n8k8_f32_tf32(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
 
         // =================================================================
         // TMA (from intrinsics::tma)

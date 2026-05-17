@@ -13,8 +13,8 @@ use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
 use dialect_mir::ops::MirConstantOp;
 use dialect_nvvm::ops::{
-    WgmmaCommitGroupSyncAlignedOp, WgmmaFenceSyncAlignedOp, WgmmaMakeSmemDescOp,
-    WgmmaMmaM64N64K16F32Bf16Op, WgmmaWaitGroupSyncAlignedOp,
+    MmaSyncM16N8K8F32Tf32Op, WgmmaCommitGroupSyncAlignedOp, WgmmaFenceSyncAlignedOp,
+    WgmmaMakeSmemDescOp, WgmmaMmaM64N64K16F32Bf16Op, WgmmaWaitGroupSyncAlignedOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -385,6 +385,77 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
             loc.clone(),
             TranslationErr::unsupported(
                 "wgmma_mma_m64n64k16_f32_bf16 call without target block".to_string()
+            )
+        )
+    }
+}
+
+/// Emit `mma_sync_m16n8k8_f32_tf32`: Ampere warp MMA (D = A·B + C).
+///
+/// Args: `[acc_ptr, a0, a1, a2, a3, b0, b1]`.  Returns: void (acc in place).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_mma_sync_m16n8k8_f32_tf32(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 7 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "mma_sync_m16n8k8_f32_tf32 expects 7 arguments \
+                 (acc_ptr, a0..a3, b0, b1), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let mut last_op = prev_op;
+    let mut operands = Vec::with_capacity(7);
+    for arg in args {
+        let (val, last_op_after) = rvalue::translate_operand(
+            ctx,
+            body,
+            arg,
+            value_map,
+            block_ptr,
+            last_op,
+            loc.clone(),
+        )?;
+        last_op = last_op_after;
+        operands.push(val);
+    }
+
+    let mma_op = Operation::new(
+        ctx,
+        MmaSyncM16N8K8F32Tf32Op::get_concrete_op_info(),
+        vec![], // No results (accumulator updated in-place via acc_ptr)
+        operands,
+        vec![],
+        0,
+    );
+    mma_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        mma_op.insert_after(ctx, prev);
+    } else {
+        mma_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if let Some(target_idx) = target {
+        let goto_op = emit_goto(ctx, *target_idx, mma_op, block_map, loc);
+        Ok(goto_op)
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(
+                "mma_sync_m16n8k8_f32_tf32 call without target block".to_string()
             )
         )
     }
