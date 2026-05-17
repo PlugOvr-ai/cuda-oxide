@@ -1,0 +1,37 @@
+[package]
+name = "oxide-onnx"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate — not part of any parent workspace.
+[workspace]
+
+# Build and run with:
+#   cd /workspaces/cuda-oxide-kernel-lib/oxide-onnx
+#   cargo oxide build
+#   cargo oxide run
+
+[dependencies]
+# Device-side intrinsics (thread indexing, barriers, etc.)
+cuda-device = { path = "../../../cuda-device" }
+
+# Host-side utilities (CudaKernel trait, etc.)
+cuda-host = { path = "../../../cuda-host" }
+
+cuda-core = { path = "../../../cuda-core" }
+
+
+# ONNX protobuf decoding
+prost = "0.14"
+
+# CPU reference implementations for unit-test verification
+ndarray = "0.16"
+
+# Error handling
+anyhow = "1.0"
+
+# tract — Rust ONNX runtime used as correctness reference and CPU baseline
+tract-onnx = "0.21"
+
+[build-dependencies]
+prost-build = "0.14"

@@ -1,0 +1,1189 @@
+/*
+ * oxide_onnx — CUDA ONNX inference engine built on cuda-oxide.
+ *
+ * Sections:
+ *   1. Proto include (prost-generated ONNX types)
+ *   2. Module declarations
+ *   3. Unit tests for individual CUDA kernels (vs CPU reference)
+ *   4. End-to-end model test (ResNet50/MobileNetV2 if present)
+ *   5. Speed benchmark: oxide vs Candle (if CUDA Candle available)
+ *
+ * Build and run:
+ *   cargo oxide run oxide_onnx
+ */
+
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
+// ---------------------------------------------------------------------------
+// 1. Include prost-generated ONNX types.
+// ---------------------------------------------------------------------------
+pub mod proto {
+    pub mod onnx {
+        include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Module declarations
+// ---------------------------------------------------------------------------
+pub mod cpu_ref;
+pub mod executor;
+pub mod kernels;
+pub mod model;
+pub mod tensor;
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use anyhow::Result;
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+
+use crate::executor::OnnxExecutor;
+use crate::kernels::gpu;
+use crate::model::load_model;
+
+const RESNET50_PATH: &str = "models/resnet50-v2-7.onnx";
+const MOBILENET_PATH: &str = "models/mobilenetv2-10.onnx";
+const VIT_PATH: &str = "models/vit-base-patch16-224.onnx";
+const BERT_PATH: &str = "models/bert-base-uncased.onnx";
+const GPT2_PATH: &str = "models/gpt2-lmhead.onnx";
+
+fn main() -> Result<()> {
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║         oxide_onnx — CUDA ONNX inference engine       ║");
+    println!("╚══════════════════════════════════════════════════════╝");
+    println!();
+
+    println!("═══ Section 1: Unit kernel tests ═══");
+    unit_tests()?;
+    println!();
+
+    let resnet_present = std::path::Path::new(RESNET50_PATH).exists();
+    let mobilenet_present = std::path::Path::new(MOBILENET_PATH).exists();
+    let vit_present = std::path::Path::new(VIT_PATH).exists();
+    let bert_present = std::path::Path::new(BERT_PATH).exists();
+    let gpt2_present = std::path::Path::new(GPT2_PATH).exists();
+
+    if resnet_present || mobilenet_present || vit_present || bert_present || gpt2_present {
+        println!("═══ Section 2: End-to-end model inference ═══");
+        if resnet_present {
+            run_model(RESNET50_PATH, "ResNet50-v2")?;
+        }
+        if mobilenet_present {
+            run_model(MOBILENET_PATH, "MobileNetV2")?;
+        }
+        if vit_present {
+            run_model(VIT_PATH, "ViT-B/16")?;
+        }
+        if bert_present {
+            run_bert(BERT_PATH, "BERT-base")?;
+        }
+        if gpt2_present {
+            run_gpt2(GPT2_PATH, "GPT-2-LMHead")?;
+        }
+        println!();
+
+        println!("═══ Section 3: Throughput benchmark ═══");
+        if resnet_present {
+            run_benchmarks(RESNET50_PATH, "ResNet50-v2")?;
+        }
+        if vit_present {
+            run_benchmarks(VIT_PATH, "ViT-B/16")?;
+        }
+    } else {
+        println!("No ONNX models found. Run scripts/download_models.sh to download ResNet50 and MobileNetV2.");
+        println!();
+        println!("══════════════════════════════════════════");
+        println!("Unit tests passed. Build is correct.");
+        println!("══════════════════════════════════════════");
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// Section 1: Unit tests — GPU kernel vs CPU reference
+// ===========================================================================
+
+fn unit_tests() -> Result<()> {
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA context: {:?}", e))?;
+    let stream = ctx.default_stream();
+    let module = gpu::load(&ctx).map_err(|e| anyhow::anyhow!("load module: {:?}", e))?;
+
+    let mut all_pass = true;
+    all_pass &= test_relu(&stream, &module)?;
+    all_pass &= test_clip(&stream, &module)?;
+    all_pass &= test_add(&stream, &module)?;
+    all_pass &= test_sgemm(&stream, &module)?;
+    all_pass &= test_bias_add(&stream, &module)?;
+    all_pass &= test_batchnorm(&stream, &module)?;
+    all_pass &= test_conv2d(&stream, &module)?;
+    all_pass &= test_maxpool(&stream, &module)?;
+    all_pass &= test_global_avg_pool(&stream, &module)?;
+    all_pass &= test_softmax(&stream, &module)?;
+
+    println!();
+    if all_pass {
+        println!("✓ All unit tests PASSED");
+    } else {
+        println!("✗ Some unit tests FAILED");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn test_relu(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let n = 1024usize;
+    let x: Vec<f32> = (0..n).map(|i| i as f32 - 512.0).collect();
+    let expected = cpu_ref::relu(&x);
+    let mut dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .relu(stream, LaunchConfig::for_num_elems(n as u32), &mut dev)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-6;
+    println!(
+        "  relu         max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_clip(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let n = 512usize;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.5).collect();
+    let (lo, hi) = (-10.0f32, 10.0f32);
+    let expected = cpu_ref::clip(&x, lo, hi);
+    let mut dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .clip(
+            stream,
+            LaunchConfig::for_num_elems(n as u32),
+            &mut dev,
+            lo,
+            hi,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-6;
+    println!(
+        "  clip         max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_add(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let n = 1024usize;
+    let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..n).map(|i| -(i as f32 * 0.05)).collect();
+    let expected = cpu_ref::add(&a, &b);
+    let a_dev = DeviceBuffer::from_host(stream, &a).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let b_dev = DeviceBuffer::from_host(stream, &b).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut c_dev =
+        DeviceBuffer::<f32>::zeroed(stream, n).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .add_elementwise(
+            stream,
+            LaunchConfig::for_num_elems(n as u32),
+            &a_dev,
+            &b_dev,
+            &mut c_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = c_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-6;
+    println!(
+        "  add          max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_sgemm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    // Non-tile-aligned dims exercise the 16×16 tiled kernel's boundary guards.
+    let (m, n, k) = (100usize, 70usize, 130usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.1 - 0.2).collect();
+    let c_init = vec![0.0f32; m * n];
+    let expected = cpu_ref::sgemm(m, n, k, 1.0, &a, &b, 0.0, &c_init);
+    let a_dev = DeviceBuffer::from_host(stream, &a).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let b_dev = DeviceBuffer::from_host(stream, &b).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut c_dev =
+        DeviceBuffer::<f32>::zeroed(stream, m * n).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let block = 16u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(block), (m as u32).div_ceil(block), 1),
+        block_dim: (block, block, 1),
+        shared_mem_bytes: 0,
+    };
+    module
+        .sgemm_tiled(
+            stream, cfg, m as u32, n as u32, k as u32, 1.0, &a_dev, &b_dev, 0.0, &mut c_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = c_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-2;
+    println!(
+        "  sgemm tiled  max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_bias_add(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (batch, feat) = (4usize, 16usize);
+    let x: Vec<f32> = (0..batch * feat).map(|i| i as f32 * 0.1).collect();
+    let bias: Vec<f32> = (0..feat).map(|i| i as f32 * 0.5).collect();
+    let expected = cpu_ref::bias_add(&x, &bias, feat);
+    let mut x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let bias_dev =
+        DeviceBuffer::from_host(stream, &bias).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .bias_add(
+            stream,
+            LaunchConfig::for_num_elems((batch * feat) as u32),
+            &mut x_dev,
+            &bias_dev,
+            1u32,
+            feat as u32,
+        ) // spatial=1 for [batch, feat] layout
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = x_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-5;
+    println!(
+        "  bias_add     max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_batchnorm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (n, c, h, w) = (1usize, 8usize, 4usize, 4usize);
+    let hw = h * w;
+    let numel = n * c * hw;
+    let x: Vec<f32> = (0..numel).map(|i| i as f32 * 0.1 - 1.6).collect();
+    let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.1).collect();
+    let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.05).collect();
+    let mean: Vec<f32> = (0..c).map(|i| i as f32 * 0.2).collect();
+    let var: Vec<f32> = (0..c).map(|_| 1.0f32).collect();
+    let eps = 1e-5f32;
+    let expected = cpu_ref::batch_norm_inference(&x, &gamma, &beta, &mean, &var, eps, c, hw);
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let g_dev = DeviceBuffer::from_host(stream, &gamma).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let b_dev = DeviceBuffer::from_host(stream, &beta).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let m_dev = DeviceBuffer::from_host(stream, &mean).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let v_dev = DeviceBuffer::from_host(stream, &var).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut out_dev =
+        DeviceBuffer::<f32>::zeroed(stream, numel).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .batch_norm_inference(
+            stream,
+            LaunchConfig::for_num_elems(numel as u32),
+            &x_dev,
+            &g_dev,
+            &b_dev,
+            &m_dev,
+            &v_dev,
+            eps,
+            n as u32,
+            c as u32,
+            hw as u32,
+            &mut out_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = out_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-4;
+    println!(
+        "  batch_norm   max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_conv2d(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (bn, c_in, h_in, w_in) = (1usize, 3usize, 8usize, 8usize);
+    let (n_out, kh, kw) = (4usize, 3usize, 3usize);
+    let (pad_h, pad_w, stride_h, stride_w) = (0usize, 0usize, 1usize, 1usize);
+    let x: Vec<f32> = (0..bn * c_in * h_in * w_in)
+        .map(|i| i as f32 * 0.01)
+        .collect();
+    let w: Vec<f32> = (0..n_out * c_in * kh * kw)
+        .map(|i| (i % 5) as f32 * 0.1 - 0.2)
+        .collect();
+    let (expected, out_h, out_w) = cpu_ref::conv2d(
+        &x, &w, None, bn, c_in, h_in, w_in, n_out, kh, kw, pad_h, pad_w, stride_h, stride_w,
+    );
+    let col_rows = c_in * kh * kw;
+    let col_cols = out_h * out_w;
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut col_dev = DeviceBuffer::<f32>::zeroed(stream, col_rows * col_cols)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .im2col(
+            stream,
+            LaunchConfig::for_num_elems((col_rows * col_cols) as u32),
+            &x_dev,
+            c_in as u32,
+            h_in as u32,
+            w_in as u32,
+            kh as u32,
+            kw as u32,
+            pad_h as u32,
+            pad_w as u32,
+            stride_h as u32,
+            stride_w as u32,
+            1u32,
+            1u32,
+            out_h as u32,
+            out_w as u32,
+            &mut col_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let w_dev = DeviceBuffer::from_host(stream, &w).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(stream, n_out * out_h * out_w)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let block = 16u32;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (col_cols as u32).div_ceil(block),
+            (n_out as u32).div_ceil(block),
+            1,
+        ),
+        block_dim: (block, block, 1),
+        shared_mem_bytes: 0,
+    };
+    module
+        .sgemm_naive(
+            stream,
+            cfg,
+            n_out as u32,
+            col_cols as u32,
+            col_rows as u32,
+            1.0,
+            &w_dev,
+            &col_dev,
+            0.0,
+            &mut out_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = out_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-3;
+    println!(
+        "  conv2d 3×3   max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_maxpool(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (n, c, in_h, in_w) = (1usize, 4usize, 8usize, 8usize);
+    let (kh, kw, pad_h, pad_w, stride_h, stride_w) =
+        (2usize, 2usize, 0usize, 0usize, 2usize, 2usize);
+    let x: Vec<f32> = (0..n * c * in_h * in_w)
+        .map(|i| (i % 13) as f32 - 5.0)
+        .collect();
+    let (expected, out_h, out_w) = cpu_ref::maxpool2d(
+        &x, n, c, in_h, in_w, kh, kw, pad_h, pad_w, stride_h, stride_w,
+    );
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(stream, n * c * out_h * out_w)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .maxpool2d(
+            stream,
+            LaunchConfig::for_num_elems((n * c * out_h * out_w) as u32),
+            &x_dev,
+            c as u32,
+            in_h as u32,
+            in_w as u32,
+            kh as u32,
+            kw as u32,
+            pad_h as u32,
+            pad_w as u32,
+            stride_h as u32,
+            stride_w as u32,
+            out_h as u32,
+            out_w as u32,
+            &mut out_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = out_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-6;
+    println!(
+        "  maxpool2d    max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_global_avg_pool(
+    stream: &cuda_core::CudaStream,
+    module: &gpu::LoadedModule,
+) -> Result<bool> {
+    let (n, c, h, w) = (2usize, 8usize, 7usize, 7usize);
+    let hw = h * w;
+    let x: Vec<f32> = (0..n * c * hw).map(|i| i as f32 * 0.01).collect();
+    let expected = cpu_ref::global_avg_pool(&x, n, c, hw);
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut out_dev =
+        DeviceBuffer::<f32>::zeroed(stream, n * c).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .global_avg_pool(
+            stream,
+            LaunchConfig::for_num_elems((n * c) as u32),
+            &x_dev,
+            c as u32,
+            hw as u32,
+            &mut out_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = out_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-5;
+    println!(
+        "  global_avg   max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+fn test_softmax(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (rows, cols) = (4usize, 1000usize);
+    let x: Vec<f32> = (0..rows * cols)
+        .map(|i| (i % 17) as f32 * 0.1 - 0.8)
+        .collect();
+    let expected = cpu_ref::softmax(&x, rows, cols);
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut out_dev =
+        DeviceBuffer::<f32>::zeroed(stream, rows * cols).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    module
+        .softmax_row(
+            stream,
+            LaunchConfig::for_num_elems(rows as u32),
+            &x_dev,
+            rows as u32,
+            cols as u32,
+            &mut out_dev,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let got = out_dev
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let err = cpu_ref::max_abs_diff(&got, &expected);
+    let pass = err < 1e-5;
+    println!(
+        "  softmax      max_err={:.2e}  {}",
+        err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+// ===========================================================================
+// Section 2: End-to-end model inference
+// ===========================================================================
+
+fn run_model(model_path: &str, model_name: &str) -> Result<()> {
+    print!("  Loading {}... ", model_name);
+    let model = load_model(model_path)?;
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Model has no graph"))?;
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA: {:?}", e))?;
+    let executor = OnnxExecutor::from_graph(graph, ctx)?;
+    println!(
+        "{} nodes, {} inputs, {} outputs",
+        executor.nodes.len(),
+        executor.input_names.len(),
+        executor.output_names.len()
+    );
+
+    let input_shape = vec![1usize, 3, 224, 224];
+    let input_numel: usize = input_shape.iter().product();
+    // Deterministic pseudo-random input in [0, 1)
+    let input_data: Vec<f32> = (0..input_numel)
+        .map(|i| ((i * 6271 + 1337) % 1000) as f32 / 1000.0)
+        .collect();
+
+    let input_name = executor
+        .input_names
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No input names"))?
+        .clone();
+    let mut inputs = HashMap::new();
+    inputs.insert(input_name, (input_data.clone(), input_shape));
+
+    // --- oxide GPU inference ---
+    let t0 = Instant::now();
+    let outputs = executor.run(&inputs)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut oxide_logits: Option<Vec<f32>> = None;
+    for (out_name, (logits, shape)) in &outputs {
+        let top5 = cpu_ref::top_k(logits, 5);
+        let top5_vals: Vec<f32> = top5.iter().map(|&i| logits[i]).collect();
+        println!("  [oxide] Output '{}' shape={:?}", out_name, shape);
+        println!("  [oxide] Top-5 indices: {:?}", top5);
+        println!(
+            "  [oxide] Top-5 scores:  {:?}",
+            top5_vals
+                .iter()
+                .map(|v| format!("{:.4}", v))
+                .collect::<Vec<_>>()
+        );
+        oxide_logits = Some(logits.clone());
+    }
+    println!("  [oxide] Inference time: {:.1} ms", elapsed_ms);
+
+    // --- tract CPU reference ---
+    print!("  [tract] Running reference inference... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match run_tract_inference(model_path, &input_data) {
+        Ok(tract_logits) => {
+            println!("done");
+            let top5_tract = cpu_ref::top_k(&tract_logits, 5);
+            let top5_tract_vals: Vec<f32> = top5_tract.iter().map(|&i| tract_logits[i]).collect();
+            println!("  [tract] Top-5 indices: {:?}", top5_tract);
+            println!(
+                "  [tract] Top-5 scores:  {:?}",
+                top5_tract_vals
+                    .iter()
+                    .map(|v| format!("{:.4}", v))
+                    .collect::<Vec<_>>()
+            );
+
+            if let Some(ref ol) = oxide_logits {
+                let top1_oxide = cpu_ref::top_k(ol, 1)[0];
+                let top1_tract = top5_tract[0];
+                let oxide_in_tract5 = top5_tract.contains(&top1_oxide);
+                let max_err: f32 = ol
+                    .iter()
+                    .zip(tract_logits.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!("  ┌─ vs tract (CPU) ───────────────────────────────");
+                println!(
+                    "  │ top-1  oxide={:<4} tract={:<4} exact_match={}",
+                    top1_oxide,
+                    top1_tract,
+                    top1_oxide == top1_tract
+                );
+                println!("  │ oxide top-1 in tract top-5: {}", oxide_in_tract5);
+                println!("  │ max |oxide − tract|: {:.4e}", max_err);
+                println!("  └────────────────────────────────────────────────");
+            }
+        }
+        Err(e) => println!("skipped ({})", e),
+    }
+
+    // --- ORT CUDA correctness comparison ---
+    print!("  [ort]    Running ORT CUDA inference... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match run_ort_cuda_inference(model_path, &input_data) {
+        Ok(ort_logits) => {
+            println!("done");
+            let top5_ort = cpu_ref::top_k(&ort_logits, 5);
+            let top5_ort_vals: Vec<f32> = top5_ort.iter().map(|&i| ort_logits[i]).collect();
+            println!("  [ort]    Top-5 indices: {:?}", top5_ort);
+            println!(
+                "  [ort]    Top-5 scores:  {:?}",
+                top5_ort_vals
+                    .iter()
+                    .map(|v| format!("{:.4}", v))
+                    .collect::<Vec<_>>()
+            );
+
+            if let Some(ref ol) = oxide_logits {
+                let top1_oxide = cpu_ref::top_k(ol, 1)[0];
+                let top1_ort = top5_ort[0];
+                let oxide_in_ort5 = top5_ort.contains(&top1_oxide);
+                let max_err: f32 = ol
+                    .iter()
+                    .zip(ort_logits.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!("  ┌─ vs ORT CUDA ────────────────────────────────────");
+                println!(
+                    "  │ top-1  oxide={:<4} ort={:<4}    exact_match={}",
+                    top1_oxide,
+                    top1_ort,
+                    top1_oxide == top1_ort
+                );
+                println!("  │ oxide top-1 in ORT top-5: {}", oxide_in_ort5);
+                println!("  │ max |oxide − ort|: {:.4e}", max_err);
+                println!("  └────────────────────────────────────────────────");
+            }
+        }
+        Err(e) => println!("skipped ({})", e),
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// ORT CUDA single-shot inference (correctness check)
+// ===========================================================================
+
+/// Run one forward pass via the Python bench_gpu.py in correctness mode.
+/// Returns the output logits by writing them to a temp file.
+fn run_ort_cuda_inference(model_path: &str, input_data: &[f32]) -> Result<Vec<f32>> {
+    let script = std::path::Path::new(model_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("../scripts/infer_ort.py"))
+        .unwrap_or_else(|| std::path::PathBuf::from("../scripts/infer_ort.py"));
+
+    if !script.exists() {
+        return Err(anyhow::anyhow!("infer_ort.py not found at {:?}", script));
+    }
+
+    // Write input as raw f32 LE bytes to a temp file
+    let tmp_in = std::env::temp_dir().join("oxide_ort_input.bin");
+    let tmp_out = std::env::temp_dir().join("oxide_ort_output.bin");
+    {
+        use std::io::Write;
+        let bytes: Vec<u8> = input_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        std::fs::File::create(&tmp_in)?.write_all(&bytes)?;
+    }
+
+    let status = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(model_path)
+        .arg(&tmp_in)
+        .arg(&tmp_out)
+        .status()
+        .map_err(|e| anyhow::anyhow!("python3: {}", e))?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("infer_ort.py exited with {}", status));
+    }
+
+    let bytes = std::fs::read(&tmp_out)?;
+    let logits: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    Ok(logits)
+}
+
+// ===========================================================================
+// Tract CPU reference inference
+// ===========================================================================
+
+fn run_tract_inference(model_path: &str, input_data: &[f32]) -> Result<Vec<f32>> {
+    use tract_onnx::prelude::*;
+
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path)
+        .map_err(|e| anyhow::anyhow!("tract load: {}", e))?
+        .into_optimized()
+        .map_err(|e| anyhow::anyhow!("tract optimize: {}", e))?
+        .into_runnable()
+        .map_err(|e| anyhow::anyhow!("tract runnable: {}", e))?;
+
+    let input_arr =
+        tract_ndarray::Array4::<f32>::from_shape_vec((1, 3, 224, 224), input_data.to_vec())
+            .map_err(|e| anyhow::anyhow!("tract input array: {}", e))?;
+    let input_tensor: Tensor = input_arr.into();
+
+    let result = model
+        .run(tvec![input_tensor.into()])
+        .map_err(|e| anyhow::anyhow!("tract run: {}", e))?;
+
+    let output = result[0]
+        .to_array_view::<f32>()
+        .map_err(|e| anyhow::anyhow!("tract output: {}", e))?;
+
+    Ok(output.iter().copied().collect())
+}
+
+// ===========================================================================
+// BERT — two integer/float inputs, output diff vs tract (not classification)
+// ===========================================================================
+
+fn run_bert(model_path: &str, model_name: &str) -> Result<()> {
+    print!("  Loading {}... ", model_name);
+    let model = load_model(model_path)?;
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Model has no graph"))?;
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA: {:?}", e))?;
+    let executor = OnnxExecutor::from_graph(graph, ctx)?;
+    println!(
+        "{} nodes, {} inputs, {} outputs",
+        executor.nodes.len(),
+        executor.input_names.len(),
+        executor.output_names.len()
+    );
+
+    let seq = 128usize;
+    // Deterministic token ids; mask: first 100 real tokens, last 28 padding.
+    let ids: Vec<i64> = (0..seq).map(|i| ((i * 7919 + 13) % 30522) as i64).collect();
+    let mask: Vec<f32> = (0..seq).map(|i| if i < 100 { 1.0 } else { 0.0 }).collect();
+    let ids_f: Vec<f32> = ids.iter().map(|&v| v as f32).collect();
+
+    let mut inputs = HashMap::new();
+    inputs.insert("input_ids".to_string(), (ids_f, vec![1, seq]));
+    inputs.insert("attention_mask".to_string(), (mask.clone(), vec![1, seq]));
+
+    let t0 = Instant::now();
+    let outputs = executor.run(&inputs)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    for name in &executor.output_names {
+        if let Some((v, shape)) = outputs.get(name) {
+            let sum: f64 = v.iter().map(|&x| x.abs() as f64).sum();
+            println!("  [oxide] '{}' shape={:?}  |Σ|={:.4}", name, shape, sum);
+        }
+    }
+    println!("  [oxide] Inference time: {:.1} ms", elapsed_ms);
+
+    // ORT is the authoritative reference here: this BERT graph is already
+    // ORT-graph-optimized, and tract.into_optimized() re-optimizes it into a
+    // numerically divergent form (verified), so tract is NOT a valid oracle.
+    // ORT is the authoritative reference: this BERT graph is already
+    // ORT-graph-optimized; tract.into_optimized() diverges, so it is not used.
+    print!("  [ort]    Running ORT reference + benchmark... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match run_ort_script("infer_bert_ort.py", model_path, seq) {
+        Ok((ort_blob, ort_ms)) => {
+            println!("done");
+            let mut off = 0usize;
+            for name in &executor.output_names {
+                if let Some((ov, shape)) = outputs.get(name) {
+                    let n = ov.len();
+                    if off + n <= ort_blob.len() {
+                        let tv = &ort_blob[off..off + n];
+                        let max_err = ov
+                            .iter()
+                            .zip(tv.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        let rel = max_err / tv.iter().map(|v| v.abs()).fold(1e-9, f32::max);
+                        println!("  ┌─ '{}' {:?} vs ORT ───", name, shape);
+                        println!("  │ max |oxide − ort|: {:.4e}  (rel {:.2e})", max_err, rel);
+                        println!("  └────────────────────");
+                        off += n;
+                    }
+                }
+            }
+            let ox = bench_fn("BERT oxide", 3, 10, || {
+                executor.run(&inputs).unwrap();
+            });
+            print_speed_row(model_name, ox, ort_ms);
+        }
+        Err(e) => println!("skipped ({})", e),
+    }
+    Ok(())
+}
+
+/// Run a model via a named ORT helper script (deterministic inputs are
+/// generated inside the script). Returns (output blob, ORT mean ms).
+/// The script writes its f32 output to a temp file and prints `ort_ms=<x>`.
+fn run_ort_script(
+    script_name: &str,
+    model_path: &str,
+    seq: usize,
+) -> Result<(Vec<f32>, Option<f64>)> {
+    let script = std::path::Path::new(model_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("../scripts").join(script_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("../scripts/{}", script_name)));
+    if !script.exists() {
+        return Err(anyhow::anyhow!("{} not found at {:?}", script_name, script));
+    }
+    let tmp_out = std::env::temp_dir().join("oxide_ort_ref.bin");
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(model_path)
+        .arg(&tmp_out)
+        .arg(seq.to_string())
+        .output()
+        .map_err(|e| anyhow::anyhow!("python3: {}", e))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("{} failed: {}", script_name, err.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ort_ms = stdout.lines().find_map(|l| {
+        l.strip_prefix("ort_ms=")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    });
+    let bytes = std::fs::read(&tmp_out)?;
+    let blob = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    Ok((blob, ort_ms))
+}
+
+// ===========================================================================
+// GPT-2 LM head — causal decoder; compare logits vs ORT
+// ===========================================================================
+
+fn run_gpt2(model_path: &str, model_name: &str) -> Result<()> {
+    print!("  Loading {}... ", model_name);
+    let model = load_model(model_path)?;
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Model has no graph"))?;
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA: {:?}", e))?;
+    let executor = OnnxExecutor::from_graph(graph, ctx)?;
+    println!(
+        "{} nodes, {} inputs, {} outputs",
+        executor.nodes.len(),
+        executor.input_names.len(),
+        executor.output_names.len()
+    );
+
+    let seq = 128usize;
+    let ids: Vec<f32> = (0..seq).map(|i| ((i * 7919 + 13) % 50257) as f32).collect();
+    let mask: Vec<f32> = vec![1.0; seq];
+
+    let mut inputs = HashMap::new();
+    inputs.insert("input_ids".to_string(), (ids, vec![1, seq]));
+    inputs.insert("attention_mask".to_string(), (mask, vec![1, seq]));
+
+    let t0 = Instant::now();
+    let outputs = executor.run(&inputs)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Logits are the first graph output ([1, seq, vocab]); ignore KV cache.
+    let logits_name = executor
+        .output_names
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no GPT-2 outputs"))?;
+    let (logits, lshape) = outputs
+        .get(logits_name)
+        .ok_or_else(|| anyhow::anyhow!("logits '{}' missing", logits_name))?;
+    let vocab = *lshape.last().unwrap();
+    let last = &logits[(seq - 1) * vocab..seq * vocab];
+    let next_tok = last
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    println!(
+        "  [oxide] logits '{}' shape={:?}  argmax(last)={}",
+        logits_name, lshape, next_tok
+    );
+    println!("  [oxide] Inference time: {:.1} ms", elapsed_ms);
+
+    print!("  [ort]    Running ORT reference + benchmark... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match run_ort_script("infer_gpt2_ort.py", model_path, seq) {
+        Ok((ort_logits, ort_ms)) => {
+            println!("done");
+            let n = logits.len().min(ort_logits.len());
+            let max_err = logits[..n]
+                .iter()
+                .zip(ort_logits[..n].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let denom = ort_logits[..n].iter().map(|v| v.abs()).fold(1e-9, f32::max);
+            let ort_next = ort_logits[(seq - 1) * vocab..seq * vocab]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            println!("  ┌─ logits vs ORT ───");
+            println!(
+                "  │ argmax(last) oxide={} ort={} match={}",
+                next_tok,
+                ort_next,
+                next_tok == ort_next
+            );
+            println!(
+                "  │ max |oxide − ort|: {:.4e}  (rel {:.2e})",
+                max_err,
+                max_err / denom
+            );
+            println!("  └────────────────────");
+            let ox = bench_fn("GPT-2 oxide", 3, 10, || {
+                executor.run(&inputs).unwrap();
+            });
+            print_speed_row(model_name, ox, ort_ms);
+        }
+        Err(e) => println!("skipped ({})", e),
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Section 3: Throughput benchmark
+// ===========================================================================
+
+fn run_benchmarks(model_path: &str, model_name: &str) -> Result<()> {
+    const WARMUP: usize = 3;
+    const RUNS: usize = 20;
+
+    let input_shape = vec![1usize, 3, 224, 224];
+    let input_numel: usize = input_shape.iter().product();
+    let input_data: Vec<f32> = (0..input_numel)
+        .map(|i| i as f32 / input_numel as f32)
+        .collect();
+
+    let model = load_model(model_path)?;
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No graph"))?;
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA: {:?}", e))?;
+    let executor = OnnxExecutor::from_graph(graph, ctx)?;
+    let input_name = executor.input_names.first().unwrap().clone();
+    let mut inputs = HashMap::new();
+    inputs.insert(input_name, (input_data.clone(), input_shape.clone()));
+
+    let oxide_ms = bench_fn("oxide_onnx", WARMUP, RUNS, || {
+        executor.run(&inputs).expect("oxide run failed");
+    });
+
+    let tract_ms = bench_tract(model_path, WARMUP, RUNS);
+    let ort_gpu_ms = bench_ort_gpu(model_path, WARMUP, RUNS);
+    let trt_ms = bench_trtexec(model_path);
+
+    println!();
+    println!("  Model: {} (batch=1, 3×224×224)", model_name);
+    println!("  ──────────────────────────────────────────────────────────────────");
+    println!(
+        "  oxide_onnx    GPU  tiled shared-mem SGEMM: {:>8.2} ms/inference",
+        oxide_ms
+    );
+    match &ort_gpu_ms {
+        Ok(ms) => println!(
+            "  ORT CUDA      GPU  cuDNN/cuBLAS          : {:>8.2} ms/inference  [{:.1}× faster]",
+            ms,
+            oxide_ms / ms
+        ),
+        Err(e) => println!("  ORT CUDA      GPU  skipped: {}", e),
+    }
+    match &trt_ms {
+        Ok(ms) => println!(
+            "  TensorRT      GPU  fused/optimised        : {:>8.2} ms/inference  [{:.1}× faster]",
+            ms,
+            oxide_ms / ms
+        ),
+        Err(e) => println!("  TensorRT      GPU  skipped: {}", e),
+    }
+    match &tract_ms {
+        Ok(ms) => println!(
+            "  tract-onnx    CPU  reference              : {:>8.2} ms/inference  [{:.1}× slower]",
+            ms,
+            ms / oxide_ms
+        ),
+        Err(e) => println!("  tract-onnx    CPU  skipped: {}", e),
+    }
+    println!("  ──────────────────────────────────────────────────────────────────");
+    Ok(())
+}
+
+fn bench_fn<F: Fn()>(name: &str, warmup: usize, runs: usize, f: F) -> f64 {
+    print!(
+        "  Benchmarking {} ({} warmup + {} timed runs)... ",
+        name, warmup, runs
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    for _ in 0..warmup {
+        f();
+    }
+    let t0 = Instant::now();
+    for _ in 0..runs {
+        f();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+    println!("{:.2} ms/run", ms);
+    ms
+}
+
+/// One-line oxide-vs-ORT comparison row (used by the NLP models).
+fn print_speed_row(model: &str, oxide_ms: f64, ort_ms: Option<f64>) {
+    println!("  ──────────────────────────────────────────────────────────────────");
+    println!(
+        "  {:<14} oxide GPU (tiled SGEMM) : {:>8.2} ms/inference",
+        model, oxide_ms
+    );
+    match ort_ms {
+        Some(o) => println!(
+            "  {:<14} ORT  GPU (cuDNN/cuBLAS) : {:>8.2} ms/inference  [{:.1}× faster]",
+            "",
+            o,
+            oxide_ms / o
+        ),
+        None => println!("  {:<14} ORT timing unavailable", ""),
+    }
+    println!("  ──────────────────────────────────────────────────────────────────");
+}
+
+/// Run `scripts/bench_gpu.py` which benchmarks ONNX Runtime with the CUDA
+/// execution provider.  Returns the mean inference latency in milliseconds.
+fn bench_ort_gpu(model_path: &str, warmup: usize, runs: usize) -> Result<f64> {
+    // The script is one directory above oxide-onnx/
+    let script = std::path::Path::new(model_path)
+        .parent() // models/
+        .and_then(|p| p.parent()) // oxide-onnx/
+        .map(|p| p.join("./scripts/bench_gpu.py"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./scripts/bench_gpu.py"));
+
+    if !script.exists() {
+        return Err(anyhow::anyhow!("bench_gpu.py not found at {:?}", script));
+    }
+
+    print!("  Running ORT CUDA benchmark (python3 bench_gpu.py)... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(model_path)
+        .arg(warmup.to_string())
+        .arg(runs.to_string())
+        .output()
+        .map_err(|e| anyhow::anyhow!("python3 exec: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("bench_gpu.py failed: {}", err.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("ort_cuda_ms=") {
+            let ms: f64 = rest
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("bad ort_cuda_ms: '{}'", rest))?;
+            println!("{:.2} ms/run", ms);
+            return Ok(ms);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "ort_cuda_ms not found in output: {}",
+        stdout.trim()
+    ))
+}
+
+/// Run `trtexec` (TensorRT CLI) and return mean latency in milliseconds.
+fn bench_trtexec(model_path: &str) -> Result<f64> {
+    let exe = which_trtexec()?;
+
+    print!("  Running TensorRT benchmark (trtexec)... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let output = std::process::Command::new(&exe)
+        .args([
+            &format!("--onnx={}", model_path),
+            "--warmUp=2000",
+            "--iterations=20",
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("trtexec exec: {}", e))?;
+
+    // trtexec writes the "Latency:" summary to stdout
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("Latency:")
+            && line.contains("mean =")
+            && !line.contains("H2D")
+            && !line.contains("D2H")
+        {
+            if let Some(mean_part) = line.split("mean =").nth(1) {
+                let ms_str = mean_part
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(',');
+                let ms: f64 = ms_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad trtexec mean: '{}'", ms_str))?;
+                println!("{:.2} ms/run", ms);
+                return Ok(ms);
+            }
+        }
+    }
+    Err(anyhow::anyhow!("trtexec Latency line not found"))
+}
+
+fn which_trtexec() -> Result<String> {
+    for candidate in &["/usr/bin/trtexec", "/usr/local/bin/trtexec"] {
+        if std::path::Path::new(candidate).exists() {
+            return Ok(candidate.to_string());
+        }
+    }
+    // fall back to PATH lookup
+    let out = std::process::Command::new("which").arg("trtexec").output();
+    if let Ok(o) = out {
+        let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(path);
+        }
+    }
+    Err(anyhow::anyhow!("trtexec not found"))
+}
+
+fn bench_tract(model_path: &str, warmup: usize, runs: usize) -> Result<f64> {
+    use tract_onnx::prelude::*;
+
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path)
+        .map_err(|e| anyhow::anyhow!("tract: {}", e))?
+        .into_optimized()
+        .map_err(|e| anyhow::anyhow!("tract: {}", e))?
+        .into_runnable()
+        .map_err(|e| anyhow::anyhow!("tract: {}", e))?;
+
+    let input_numel = 1usize * 3 * 224 * 224;
+    let input_data: Vec<f32> = (0..input_numel)
+        .map(|i| i as f32 / input_numel as f32)
+        .collect();
+    let input_arr = tract_ndarray::Array4::<f32>::from_shape_vec((1, 3, 224, 224), input_data)
+        .map_err(|e| anyhow::anyhow!("tract shape: {}", e))?;
+    let proto_tensor: Tensor = input_arr.into();
+
+    let ms = bench_fn("tract CPU", warmup, runs, || {
+        let t: Tensor = proto_tensor.clone();
+        model.run(tvec![t.into()]).expect("tract run failed");
+    });
+    Ok(ms)
+}
