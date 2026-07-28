@@ -633,29 +633,6 @@ impl<'tcx> DeviceCollector<'tcx> {
                     );
                 }
 
-                if func.export_name.contains("gemm") || func.export_name.contains("mma") {
-                    eprintln!(
-                        "[MMA-DBG collect] {} nblocks={}",
-                        func.export_name,
-                        mir.basic_blocks.len()
-                    );
-                    for (bi, bb_data) in mir.basic_blocks.iter().enumerate() {
-                        if let Some(ref t) = bb_data.terminator {
-                            let desc = match &t.kind {
-                                TerminatorKind::Call { func, target, .. } => {
-                                    let callee = self
-                                        .get_call_def_id(func)
-                                        .map(|d| self.tcx.def_path_str(d))
-                                        .unwrap_or_else(|| "<indirect>".into());
-                                    format!("Call -> {callee} (target={target:?})")
-                                }
-                                other => format!("{other:?}"),
-                            };
-                            eprintln!("[MMA-DBG collect]   bb{bi}: {desc}");
-                        }
-                    }
-                }
-
                 // Walk all basic blocks looking for calls.
                 // Pass the caller's instance so we can substitute its args into callees.
                 for bb_data in mir.basic_blocks.iter() {
@@ -763,10 +740,6 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         };
         let fn_path = self.tcx.def_path_str(*def_id);
-        if fn_path.contains("mma_sync") {
-            eprintln!("[MMA-DBG pco-top] fn_path={} caller={}", fn_path,
-                self.tcx.def_path_str(caller.def_id()));
-        }
         if fn_path.contains("DynamicSharedArray")
             && (fn_path.contains("::get")
                 || fn_path.contains("::get_raw")
@@ -937,16 +910,6 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         }
 
-        if self.tcx.def_path_str(resolved.def_id()).contains("mma_sync") {
-            eprintln!(
-                "[MMA-DBG pco] path={} seen={} mono={} kind_is_item={}",
-                self.tcx.def_path_str(resolved.def_id()),
-                self.seen.contains(&mangled),
-                is_fully_monomorphized(self.tcx, resolved),
-                matches!(resolved.def, InstanceKind::Item(_)),
-            );
-        }
-
         // Skip intrinsics and other special functions
         if !matches!(resolved.def, InstanceKind::Item(_)) {
             return;
@@ -971,21 +934,6 @@ impl<'tcx> DeviceCollector<'tcx> {
                 );
             }
             return;
-        }
-
-        if raw_name.contains("mma_sync") {
-            let nblocks = if self.tcx.is_mir_available(resolved.def_id()) {
-                self.tcx.optimized_mir(resolved.def_id()).basic_blocks.len()
-            } else {
-                usize::MAX
-            };
-            eprintln!(
-                "[MMA-DBG collector] name={} mir_avail={} nblocks={} is_unreachable={}",
-                raw_name,
-                self.tcx.is_mir_available(resolved.def_id()),
-                nblocks,
-                self.is_unreachable_body(resolved.def_id())
-            );
         }
 
         // Check if it has an unreachable body (intrinsic placeholder)
