@@ -4,13 +4,12 @@
  * Generated prost types are in the `onnx` module (via include! in main.rs).
  */
 
+use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet, VecDeque};
-use anyhow::{anyhow, Result};
 
 // Re-export the prost-generated ONNX types used across this crate.
 pub use crate::proto::onnx::{
-    AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto,
-    attribute_proto::AttributeType,
+    AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, attribute_proto::AttributeType,
     tensor_proto::DataType,
 };
 
@@ -21,8 +20,7 @@ pub use crate::proto::onnx::{
 /// Decode an ONNX `.onnx` file from disk into a `ModelProto`.
 pub fn load_model(path: &str) -> Result<ModelProto> {
     use prost::Message;
-    let bytes = std::fs::read(path)
-        .map_err(|e| anyhow!("Cannot read model '{}': {}", path, e))?;
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("Cannot read model '{}': {}", path, e))?;
     ModelProto::decode(bytes.as_slice())
         .map_err(|e| anyhow!("Proto decode error for '{}': {}", path, e))
 }
@@ -80,7 +78,9 @@ pub fn tensor_to_f32(t: &TensorProto) -> Result<Vec<f32>> {
             let values: Vec<f32> = t
                 .raw_data
                 .chunks_exact(8)
-                .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+                .map(|b| {
+                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+                })
                 .collect();
             return Ok(values);
         }
@@ -97,7 +97,9 @@ pub fn tensor_to_f32(t: &TensorProto) -> Result<Vec<f32>> {
             let values: Vec<f32> = t
                 .raw_data
                 .chunks_exact(8)
-                .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+                .map(|b| {
+                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+                })
                 .collect();
             return Ok(values);
         }
@@ -125,10 +127,18 @@ pub fn tensor_to_f32(t: &TensorProto) -> Result<Vec<f32>> {
     // --- BOOL (9) — 1 byte per element; e.g. GPT-2 causal mask → 0.0/1.0 ---
     if dtype == DataType::Bool as i32 {
         if !t.int32_data.is_empty() {
-            return Ok(t.int32_data.iter().map(|&v| if v != 0 { 1.0 } else { 0.0 }).collect());
+            return Ok(t
+                .int32_data
+                .iter()
+                .map(|&v| if v != 0 { 1.0 } else { 0.0 })
+                .collect());
         }
         if !t.raw_data.is_empty() {
-            return Ok(t.raw_data.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect());
+            return Ok(t
+                .raw_data
+                .iter()
+                .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+                .collect());
         }
         let numel: usize = t.dims.iter().map(|&d| d as usize).product();
         return Ok(vec![0.0f32; numel]);
@@ -136,7 +146,8 @@ pub fn tensor_to_f32(t: &TensorProto) -> Result<Vec<f32>> {
 
     Err(anyhow!(
         "Unsupported tensor dtype {} for '{}'; supported: FLOAT(1), BOOL(9), INT32(6), INT64(7), DOUBLE(11)",
-        dtype, t.name
+        dtype,
+        t.name
     ))
 }
 
@@ -252,11 +263,16 @@ pub fn attr_string(node: &NodeProto, name: &str) -> String {
 
 /// Compute the output shape for a 2D convolution.
 pub fn conv2d_output_shape(
-    in_h: usize, in_w: usize,
-    kh: usize, kw: usize,
-    pad_h: usize, pad_w: usize,
-    stride_h: usize, stride_w: usize,
-    dil_h: usize, dil_w: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    dil_h: usize,
+    dil_w: usize,
 ) -> (usize, usize) {
     let eff_kh = dil_h * (kh - 1) + 1;
     let eff_kw = dil_w * (kw - 1) + 1;
@@ -267,10 +283,14 @@ pub fn conv2d_output_shape(
 
 /// Compute output shape for MaxPool2D.
 pub fn maxpool_output_shape(
-    in_h: usize, in_w: usize,
-    kh: usize, kw: usize,
-    pad_h: usize, pad_w: usize,
-    stride_h: usize, stride_w: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
 ) -> (usize, usize) {
     let out_h = (in_h + 2 * pad_h).saturating_sub(kh) / stride_h + 1;
     let out_w = (in_w + 2 * pad_w).saturating_sub(kw) / stride_w + 1;

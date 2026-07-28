@@ -13,7 +13,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use cuda_device::wgmma::mma_sync_m16n8k8_f32_tf32;
-use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 
 // These helpers avoid core::intrinsics::sqrtf32 / expf32, which the oxide
@@ -740,79 +740,143 @@ pub mod gpu {
             if gc0 < n_sz {
                 let p = gr0 * n_sz + gc0;
                 let cell = unsafe { c.get_unchecked_mut(p) };
-                *cell = if has_beta { alpha * c00 + beta * (*cell) } else { alpha * c00 };
+                *cell = if has_beta {
+                    alpha * c00 + beta * (*cell)
+                } else {
+                    alpha * c00
+                };
             }
             if gc0 + 1 < n_sz {
                 let p = gr0 * n_sz + gc0 + 1;
                 let cell = unsafe { c.get_unchecked_mut(p) };
-                *cell = if has_beta { alpha * c01 + beta * (*cell) } else { alpha * c01 };
+                *cell = if has_beta {
+                    alpha * c01 + beta * (*cell)
+                } else {
+                    alpha * c01
+                };
             }
             if gc0 + 2 < n_sz {
                 let p = gr0 * n_sz + gc0 + 2;
                 let cell = unsafe { c.get_unchecked_mut(p) };
-                *cell = if has_beta { alpha * c02 + beta * (*cell) } else { alpha * c02 };
+                *cell = if has_beta {
+                    alpha * c02 + beta * (*cell)
+                } else {
+                    alpha * c02
+                };
             }
             if gc0 + 3 < n_sz {
                 let p = gr0 * n_sz + gc0 + 3;
                 let cell = unsafe { c.get_unchecked_mut(p) };
-                *cell = if has_beta { alpha * c03 + beta * (*cell) } else { alpha * c03 };
+                *cell = if has_beta {
+                    alpha * c03 + beta * (*cell)
+                } else {
+                    alpha * c03
+                };
             }
         }
         if gr0 + 1 < m_sz {
             let r = gr0 + 1;
             if gc0 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
-                *cell = if has_beta { alpha * c10 + beta * (*cell) } else { alpha * c10 };
+                *cell = if has_beta {
+                    alpha * c10 + beta * (*cell)
+                } else {
+                    alpha * c10
+                };
             }
             if gc0 + 1 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
-                *cell = if has_beta { alpha * c11 + beta * (*cell) } else { alpha * c11 };
+                *cell = if has_beta {
+                    alpha * c11 + beta * (*cell)
+                } else {
+                    alpha * c11
+                };
             }
             if gc0 + 2 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
-                *cell = if has_beta { alpha * c12 + beta * (*cell) } else { alpha * c12 };
+                *cell = if has_beta {
+                    alpha * c12 + beta * (*cell)
+                } else {
+                    alpha * c12
+                };
             }
             if gc0 + 3 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
-                *cell = if has_beta { alpha * c13 + beta * (*cell) } else { alpha * c13 };
+                *cell = if has_beta {
+                    alpha * c13 + beta * (*cell)
+                } else {
+                    alpha * c13
+                };
             }
         }
         if gr0 + 2 < m_sz {
             let r = gr0 + 2;
             if gc0 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
-                *cell = if has_beta { alpha * c20 + beta * (*cell) } else { alpha * c20 };
+                *cell = if has_beta {
+                    alpha * c20 + beta * (*cell)
+                } else {
+                    alpha * c20
+                };
             }
             if gc0 + 1 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
-                *cell = if has_beta { alpha * c21 + beta * (*cell) } else { alpha * c21 };
+                *cell = if has_beta {
+                    alpha * c21 + beta * (*cell)
+                } else {
+                    alpha * c21
+                };
             }
             if gc0 + 2 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
-                *cell = if has_beta { alpha * c22 + beta * (*cell) } else { alpha * c22 };
+                *cell = if has_beta {
+                    alpha * c22 + beta * (*cell)
+                } else {
+                    alpha * c22
+                };
             }
             if gc0 + 3 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
-                *cell = if has_beta { alpha * c23 + beta * (*cell) } else { alpha * c23 };
+                *cell = if has_beta {
+                    alpha * c23 + beta * (*cell)
+                } else {
+                    alpha * c23
+                };
             }
         }
         if gr0 + 3 < m_sz {
             let r = gr0 + 3;
             if gc0 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0) };
-                *cell = if has_beta { alpha * c30 + beta * (*cell) } else { alpha * c30 };
+                *cell = if has_beta {
+                    alpha * c30 + beta * (*cell)
+                } else {
+                    alpha * c30
+                };
             }
             if gc0 + 1 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 1) };
-                *cell = if has_beta { alpha * c31 + beta * (*cell) } else { alpha * c31 };
+                *cell = if has_beta {
+                    alpha * c31 + beta * (*cell)
+                } else {
+                    alpha * c31
+                };
             }
             if gc0 + 2 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 2) };
-                *cell = if has_beta { alpha * c32 + beta * (*cell) } else { alpha * c32 };
+                *cell = if has_beta {
+                    alpha * c32 + beta * (*cell)
+                } else {
+                    alpha * c32
+                };
             }
             if gc0 + 3 < n_sz {
                 let cell = unsafe { c.get_unchecked_mut(r * n_sz + gc0 + 3) };
-                *cell = if has_beta { alpha * c33 + beta * (*cell) } else { alpha * c33 };
+                *cell = if has_beta {
+                    alpha * c33 + beta * (*cell)
+                } else {
+                    alpha * c33
+                };
             }
         }
     }

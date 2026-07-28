@@ -5,7 +5,6 @@
  * outputs to validate each CUDA kernel in isolation.
  */
 
-
 // ============================================================================
 // Element-wise ops
 // ============================================================================
@@ -27,7 +26,9 @@ pub fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
 // ============================================================================
 
 pub fn sgemm(
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     alpha: f32,
     a: &[f32],
     b: &[f32],
@@ -52,7 +53,10 @@ pub fn sgemm(
 // ============================================================================
 
 pub fn bias_add(x: &[f32], bias: &[f32], features: usize) -> Vec<f32> {
-    x.iter().enumerate().map(|(i, &v)| v + bias[i % features]).collect()
+    x.iter()
+        .enumerate()
+        .map(|(i, &v)| v + bias[i % features])
+        .collect()
 }
 
 // ============================================================================
@@ -69,10 +73,13 @@ pub fn batch_norm_inference(
     c: usize,
     hw: usize,
 ) -> Vec<f32> {
-    x.iter().enumerate().map(|(i, &xi)| {
-        let chan = (i / hw) % c;
-        gamma[chan] * (xi - mean[chan]) / (var[chan] + eps).sqrt() + beta[chan]
-    }).collect()
+    x.iter()
+        .enumerate()
+        .map(|(i, &xi)| {
+            let chan = (i / hw) % c;
+            gamma[chan] * (xi - mean[chan]) / (var[chan] + eps).sqrt() + beta[chan]
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -83,7 +90,10 @@ pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for row in 0..rows {
         let base = row * cols;
-        let max_val = x[base..base + cols].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_val = x[base..base + cols]
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for j in 0..cols {
             let e = (x[base + j] - max_val).exp();
@@ -103,10 +113,16 @@ pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 
 pub fn maxpool2d(
     x: &[f32],
-    n: usize, c: usize, in_h: usize, in_w: usize,
-    kh: usize, kw: usize,
-    pad_h: usize, pad_w: usize,
-    stride_h: usize, stride_w: usize,
+    n: usize,
+    c: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
 ) -> (Vec<f32>, usize, usize) {
     let out_h = (in_h + 2 * pad_h).saturating_sub(kh) / stride_h + 1;
     let out_w = (in_w + 2 * pad_w).saturating_sub(kw) / stride_w + 1;
@@ -123,14 +139,18 @@ pub fn maxpool2d(
                             let iw = ow * stride_w + kj;
                             let ih_unpad = ih as isize - pad_h as isize;
                             let iw_unpad = iw as isize - pad_w as isize;
-                            if ih_unpad >= 0 && ih_unpad < in_h as isize
-                                && iw_unpad >= 0 && iw_unpad < in_w as isize
+                            if ih_unpad >= 0
+                                && ih_unpad < in_h as isize
+                                && iw_unpad >= 0
+                                && iw_unpad < in_w as isize
                             {
                                 let v = x[bn * c * in_h * in_w
                                     + bc * in_h * in_w
                                     + ih_unpad as usize * in_w
                                     + iw_unpad as usize];
-                                if v > max_val { max_val = v; }
+                                if v > max_val {
+                                    max_val = v;
+                                }
                             }
                         }
                     }
@@ -165,10 +185,17 @@ pub fn conv2d(
     x: &[f32],
     w: &[f32],
     bias: Option<&[f32]>,
-    n: usize, c_in: usize, h_in: usize, w_in: usize,
-    n_out: usize, kh: usize, kw: usize,
-    pad_h: usize, pad_w: usize,
-    stride_h: usize, stride_w: usize,
+    n: usize,
+    c_in: usize,
+    h_in: usize,
+    w_in: usize,
+    n_out: usize,
+    kh: usize,
+    kw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
 ) -> (Vec<f32>, usize, usize) {
     let out_h = (h_in + 2 * pad_h).saturating_sub(kh) / stride_h + 1;
     let out_w = (w_in + 2 * pad_w).saturating_sub(kw) / stride_w + 1;
@@ -186,17 +213,17 @@ pub fn conv2d(
                                 let iw = ow * stride_w + kj;
                                 let ih_unpad = ih as isize - pad_h as isize;
                                 let iw_unpad = iw as isize - pad_w as isize;
-                                if ih_unpad >= 0 && ih_unpad < h_in as isize
-                                    && iw_unpad >= 0 && iw_unpad < w_in as isize
+                                if ih_unpad >= 0
+                                    && ih_unpad < h_in as isize
+                                    && iw_unpad >= 0
+                                    && iw_unpad < w_in as isize
                                 {
                                     let x_val = x[bn * c_in * h_in * w_in
                                         + ci * h_in * w_in
                                         + ih_unpad as usize * w_in
                                         + iw_unpad as usize];
-                                    let w_val = w[co * c_in * kh * kw
-                                        + ci * kh * kw
-                                        + ki * kw
-                                        + kj];
+                                    let w_val =
+                                        w[co * c_in * kh * kw + ci * kh * kw + ki * kw + kj];
                                     sum += x_val * w_val;
                                 }
                             }
@@ -218,7 +245,10 @@ pub fn conv2d(
 // ============================================================================
 
 pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// Return indices of the top-k largest values.

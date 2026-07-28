@@ -23,11 +23,17 @@ pub enum TensorData {
 
 impl Tensor {
     pub fn from_host(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        Self { data: TensorData::Host(data), shape }
+        Self {
+            data: TensorData::Host(data),
+            shape,
+        }
     }
 
     pub fn from_device(buf: DeviceBuffer<f32>, shape: Vec<usize>) -> Self {
-        Self { data: TensorData::Device(std::sync::Arc::new(buf)), shape }
+        Self {
+            data: TensorData::Device(std::sync::Arc::new(buf)),
+            shape,
+        }
     }
 
     pub fn numel(&self) -> usize {
@@ -37,10 +43,8 @@ impl Tensor {
     /// Upload to device if not already there; returns a reference to the DeviceBuffer.
     pub fn to_device_buf(&self, stream: &CudaStream) -> Result<DeviceBuffer<f32>> {
         match &self.data {
-            TensorData::Host(v) => {
-                Ok(DeviceBuffer::from_host(stream, v)
-                    .map_err(|e| anyhow::anyhow!("H2D failed: {:?}", e))?)
-            }
+            TensorData::Host(v) => Ok(DeviceBuffer::from_host(stream, v)
+                .map_err(|e| anyhow::anyhow!("H2D failed: {:?}", e))?),
             TensorData::Device(arc) => {
                 // Clone the device buffer by copying D2D
                 let n = arc.len();
@@ -64,10 +68,9 @@ impl Tensor {
     pub fn to_host_vec(&self, stream: &CudaStream) -> Result<Vec<f32>> {
         match &self.data {
             TensorData::Host(v) => Ok(v.clone()),
-            TensorData::Device(arc) => {
-                arc.to_host_vec(stream)
-                    .map_err(|e| anyhow::anyhow!("D2H failed: {:?}", e))
-            }
+            TensorData::Device(arc) => arc
+                .to_host_vec(stream)
+                .map_err(|e| anyhow::anyhow!("D2H failed: {:?}", e)),
         }
     }
 
@@ -117,7 +120,8 @@ impl TensorMap {
 
     /// Record a zero-copy view of `target` (which may itself be an alias).
     pub fn insert_alias(&mut self, name: &str, target: &str, shape: Vec<usize>) {
-        self.alias.insert(name.to_string(), (target.to_string(), shape));
+        self.alias
+            .insert(name.to_string(), (target.to_string(), shape));
     }
 
     /// Follow an alias chain to the real owning name; returns (owner, view shape).

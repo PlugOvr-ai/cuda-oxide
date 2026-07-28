@@ -211,44 +211,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-artifact-finalizer"
+version = "0.2.1"
+dependencies = [
+ "libnvvm-sys",
+ "nvjitlink-sys",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "cuda-bindings"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "cuda-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "cuda-bindings",
+ "cuda-macros",
  "half",
  "oxide-artifacts",
 ]
 
 [[package]]
 name = "cuda-device"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "cuda-macros",
 ]
 
 [[package]]
 name = "cuda-host"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
+ "cuda-artifact-finalizer",
  "cuda-core",
  "cuda-macros",
  "half",
- "libnvvm-sys",
- "nvjitlink-sys",
+ "sha2",
  "thiserror",
 ]
 
 [[package]]
 name = "cuda-macros"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -564,7 +575,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libnvvm-sys"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "libloading",
  "thiserror",
@@ -762,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "nvjitlink-sys"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "libloading",
  "thiserror",
@@ -788,7 +799,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "oxide-artifacts"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "object",
 ]
@@ -1149,7 +1160,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reserved-oxide-symbols"
-version = "0.1.0"
+version = "0.2.1"
 
 [[package]]
 name = "rustc-hash"

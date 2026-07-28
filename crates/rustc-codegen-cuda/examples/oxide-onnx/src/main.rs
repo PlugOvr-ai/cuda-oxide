@@ -91,7 +91,9 @@ fn main() -> Result<()> {
             run_benchmarks(VIT_PATH, "ViT-B/16")?;
         }
     } else {
-        println!("No ONNX models found. Run scripts/download_models.sh to download ResNet50 and MobileNetV2.");
+        println!(
+            "No ONNX models found. Run scripts/download_models.sh to download ResNet50 and MobileNetV2."
+        );
         println!();
         println!("══════════════════════════════════════════");
         println!("Unit tests passed. Build is correct.");
@@ -137,8 +139,7 @@ fn test_relu(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Resu
     let x: Vec<f32> = (0..n).map(|i| i as f32 - 512.0).collect();
     let expected = cpu_ref::relu(&x);
     let mut dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .relu(stream, LaunchConfig::for_num_elems(n as u32), &mut dev)
+    unsafe { module.relu(stream, LaunchConfig::for_num_elems(n as u32), &mut dev) }
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = dev
         .to_host_vec(stream)
@@ -159,15 +160,16 @@ fn test_clip(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Resu
     let (lo, hi) = (-10.0f32, 10.0f32);
     let expected = cpu_ref::clip(&x, lo, hi);
     let mut dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .clip(
+    unsafe {
+        module.clip(
             stream,
             LaunchConfig::for_num_elems(n as u32),
             &mut dev,
             lo,
             hi,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -190,15 +192,16 @@ fn test_add(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Resul
     let b_dev = DeviceBuffer::from_host(stream, &b).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut c_dev =
         DeviceBuffer::<f32>::zeroed(stream, n).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .add_elementwise(
+    unsafe {
+        module.add_elementwise(
             stream,
             LaunchConfig::for_num_elems(n as u32),
             &a_dev,
             &b_dev,
             &mut c_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = c_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -229,11 +232,12 @@ fn test_sgemm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Res
         block_dim: (block, block, 1),
         shared_mem_bytes: 0,
     };
-    module
-        .sgemm_tiled(
+    unsafe {
+        module.sgemm_tiled(
             stream, cfg, m as u32, n as u32, k as u32, 1.0, &a_dev, &b_dev, 0.0, &mut c_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = c_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -255,16 +259,17 @@ fn test_bias_add(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> 
     let mut x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let bias_dev =
         DeviceBuffer::from_host(stream, &bias).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .bias_add(
+    unsafe {
+        module.bias_add(
             stream,
             LaunchConfig::for_num_elems((batch * feat) as u32),
             &mut x_dev,
             &bias_dev,
             1u32,
             feat as u32,
-        ) // spatial=1 for [batch, feat] layout
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        )
+    } // spatial=1 for [batch, feat] layout
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = x_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -296,8 +301,8 @@ fn test_batchnorm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) ->
     let v_dev = DeviceBuffer::from_host(stream, &var).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut out_dev =
         DeviceBuffer::<f32>::zeroed(stream, numel).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .batch_norm_inference(
+    unsafe {
+        module.batch_norm_inference(
             stream,
             LaunchConfig::for_num_elems(numel as u32),
             &x_dev,
@@ -311,7 +316,8 @@ fn test_batchnorm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) ->
             hw as u32,
             &mut out_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = out_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -343,8 +349,8 @@ fn test_conv2d(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Re
     let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut col_dev = DeviceBuffer::<f32>::zeroed(stream, col_rows * col_cols)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .im2col(
+    unsafe {
+        module.im2col(
             stream,
             LaunchConfig::for_num_elems((col_rows * col_cols) as u32),
             &x_dev,
@@ -363,7 +369,8 @@ fn test_conv2d(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Re
             out_w as u32,
             &mut col_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let w_dev = DeviceBuffer::from_host(stream, &w).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(stream, n_out * out_h * out_w)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -377,8 +384,8 @@ fn test_conv2d(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Re
         block_dim: (block, block, 1),
         shared_mem_bytes: 0,
     };
-    module
-        .sgemm_naive(
+    unsafe {
+        module.sgemm_naive(
             stream,
             cfg,
             n_out as u32,
@@ -390,7 +397,8 @@ fn test_conv2d(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Re
             0.0,
             &mut out_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = out_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -417,8 +425,8 @@ fn test_maxpool(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> R
     let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(stream, n * c * out_h * out_w)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .maxpool2d(
+    unsafe {
+        module.maxpool2d(
             stream,
             LaunchConfig::for_num_elems((n * c * out_h * out_w) as u32),
             &x_dev,
@@ -435,7 +443,8 @@ fn test_maxpool(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> R
             out_w as u32,
             &mut out_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = out_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -460,8 +469,8 @@ fn test_global_avg_pool(
     let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut out_dev =
         DeviceBuffer::<f32>::zeroed(stream, n * c).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .global_avg_pool(
+    unsafe {
+        module.global_avg_pool(
             stream,
             LaunchConfig::for_num_elems((n * c) as u32),
             &x_dev,
@@ -469,7 +478,8 @@ fn test_global_avg_pool(
             hw as u32,
             &mut out_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = out_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -492,8 +502,8 @@ fn test_softmax(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> R
     let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let mut out_dev =
         DeviceBuffer::<f32>::zeroed(stream, rows * cols).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    module
-        .softmax_row(
+    unsafe {
+        module.softmax_row(
             stream,
             LaunchConfig::for_num_elems(rows as u32),
             &x_dev,
@@ -501,7 +511,8 @@ fn test_softmax(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> R
             cols as u32,
             &mut out_dev,
         )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let got = out_dev
         .to_host_vec(stream)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
