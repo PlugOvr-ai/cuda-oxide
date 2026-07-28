@@ -95,8 +95,20 @@ fn is_signed_int_op(
 }
 
 /// Add fastmath flags attribute to a floating-point operation.
+///
+/// We set `contract`, which lets LLVM's NVPTX backend fuse `a*b + c` into a
+/// single `fma.rn.f32` (→ hardware `FFMA`) instead of emitting separate
+/// `mul.rn.f32` + `add.rn.f32`. Without it, ptxas cannot contract the
+/// explicitly-rounded ops, so every multiply-add costs two FP instructions —
+/// a ~2× penalty on GEMM/conv-bound kernels (the bulk of real workloads).
+///
+/// `contract` is the only flag enabled: it is value-safe (FMA single-rounding
+/// is at least as accurate as separate mul+add and matches what nvcc/clang do
+/// for CUDA by default). The looser flags (nnan/ninf/nsz/reassoc) are NOT set,
+/// so results stay within normal floating-point expectations.
 fn add_fastmath_flags(ctx: &mut Context, op: Ptr<Operation>) {
-    let flags = FastmathFlagsAttr::default();
+    let flags: FastmathFlagsAttr =
+        dialect_llvm::attributes::FastmathFlags::CONTRACT.into();
     let key: pliron::identifier::Identifier = "llvm_fast_math_flags".try_into().unwrap();
     op.deref_mut(ctx).attributes.0.insert(key, flags.into());
 }

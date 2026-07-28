@@ -2242,6 +2242,21 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
 
         write!(output, "  {res_name} = {op_name} ").unwrap();
+        // Emit LLVM fast-math flags (e.g. `contract`) so the NVPTX backend can
+        // fuse `a*b + c` into a hardware FMA. mir-lower attaches these only to
+        // float fadd/fmul ops; integer ops never carry the attribute, so this
+        // is a no-op for them and never produces invalid IR.
+        if let Some(fmf) = op_ref
+            .attributes
+            .get::<crate::attributes::FastmathFlagsAttr>(
+                &crate::op_interfaces::ATTR_KEY_FAST_MATH_FLAGS,
+            )
+        {
+            let kw = Self::fast_math_keywords(fmf.0);
+            if !kw.is_empty() {
+                write!(output, "{kw} ").unwrap();
+            }
+        }
         self.export_type(lhs.get_type(self.ctx), output)?;
         write!(output, " ").unwrap();
         self.export_value(lhs, value_names, output)?;
@@ -2249,6 +2264,38 @@ impl<'a> ModuleExportState<'a> {
         self.export_value(rhs, value_names, output)?;
         writeln!(output).unwrap();
         Ok(())
+    }
+
+    /// LLVM-IR fast-math keyword string for a [`FastmathFlags`] set
+    /// (e.g. `"contract"`, `"nnan ninf"`, or `"fast"` when all bits are set).
+    fn fast_math_keywords(f: crate::attributes::FastmathFlags) -> String {
+        use crate::attributes::FastmathFlags as F;
+        if f == F::FAST {
+            return "fast".to_string();
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        if f.contains(F::NNAN) {
+            parts.push("nnan");
+        }
+        if f.contains(F::NINF) {
+            parts.push("ninf");
+        }
+        if f.contains(F::NSZ) {
+            parts.push("nsz");
+        }
+        if f.contains(F::ARCP) {
+            parts.push("arcp");
+        }
+        if f.contains(F::CONTRACT) {
+            parts.push("contract");
+        }
+        if f.contains(F::AFN) {
+            parts.push("afn");
+        }
+        if f.contains(F::REASSOC) {
+            parts.push("reassoc");
+        }
+        parts.join(" ")
     }
 
     /// Export a cast operation: `%res = <op_name> <src_type> <val> to <dst_type>`

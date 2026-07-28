@@ -95,9 +95,33 @@ impl OnnxExecutor {
             tensors.insert(name, buf, shape.clone());
         }
 
-        for node in &self.nodes {
-            self.dispatch_node(node, &mut tensors)
-                .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
+        let profile = std::env::var("OXIDE_PROFILE").is_ok();
+        if profile {
+            use std::collections::BTreeMap;
+            let mut acc: BTreeMap<String, (f64, u32)> = BTreeMap::new();
+            for node in &self.nodes {
+                let t0 = std::time::Instant::now();
+                self.dispatch_node(node, &mut tensors)
+                    .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
+                self.stream.synchronize().ok();
+                let dt = t0.elapsed().as_secs_f64() * 1000.0;
+                let e = acc.entry(node.op_type.clone()).or_insert((0.0, 0));
+                e.0 += dt;
+                e.1 += 1;
+            }
+            let mut rows: Vec<_> = acc.into_iter().collect();
+            rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            let total: f64 = rows.iter().map(|r| r.1.0).sum();
+            eprintln!("  ── OXIDE_PROFILE (per op-type, ms) ──");
+            for (op, (ms, n)) in &rows {
+                eprintln!("  {:>20}  {:>8.2} ms  ({:>3}×, {:>5.1}%)", op, ms, n, 100.0 * ms / total);
+            }
+            eprintln!("  {:>20}  {:>8.2} ms  (sum incl. per-op sync)", "TOTAL", total);
+        } else {
+            for node in &self.nodes {
+                self.dispatch_node(node, &mut tensors)
+                    .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
+            }
         }
 
         let mut outputs = HashMap::new();
@@ -252,9 +276,21 @@ impl OnnxExecutor {
 
     /// Launch config for the register-blocked SGEMM: one 256-thread block per
     /// 64×64 output tile, each thread a 4×4 micro-tile.
+    #[allow(dead_code)]
     fn sgemm_rb_cfg(m: usize, n: usize) -> LaunchConfig {
         LaunchConfig {
             grid_dim: ((n as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// Launch config for the N-register-tiled SGEMM (`sgemm_fast`): one
+    /// 256-thread block per 16(M)×128(N) tile.
+    #[allow(dead_code)]
+    fn sgemm_fast_cfg(m: usize, n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(128), (m as u32).div_ceil(16), 1),
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         }

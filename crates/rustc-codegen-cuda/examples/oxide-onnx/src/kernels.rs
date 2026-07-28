@@ -287,6 +287,221 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // GEMM 16×16 tiled, **u32-indexed** — C = alpha·A·B + beta·C (row-major).
+    //
+    //   Same algorithm as sgemm_tiled, but every index/loop var is u32 and the
+    //   output is a flat slice (no Runtime2DIndex struct). On this backend
+    //   `usize` math is widened to 64-bit, and the b64 register bloat caps
+    //   occupancy (sgemm_tiled spills ~178 regs/thread). Staying in 32-bit
+    //   roughly halves the register file footprint → far higher occupancy.
+    //   All index products here are < 2^31 for the benchmarked models.
+    //
+    //   Launch: grid=(⌈n/16⌉, ⌈m/16⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_u32(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        beta: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        static mut TILE_A: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let row = thread::blockIdx_y() * 16 + ty;
+        let col = thread::blockIdx_x() * 16 + tx;
+        let smem = (ty * 16 + tx) as usize;
+
+        let num_tiles = k.div_ceil(16);
+        let mut sum = 0.0f32;
+
+        let mut t = 0u32;
+        while t < num_tiles {
+            let tile_start = t * 16;
+            unsafe {
+                let a_col = tile_start + tx;
+                TILE_A[smem] = if row < m && a_col < k {
+                    a[(row * k + a_col) as usize]
+                } else {
+                    0.0f32
+                };
+                let b_row = tile_start + ty;
+                TILE_B[smem] = if b_row < k && col < n {
+                    b[(b_row * n + col) as usize]
+                } else {
+                    0.0f32
+                };
+            }
+            thread::sync_threads();
+            unsafe {
+                let arow = (ty * 16) as usize;
+                let mut i = 0usize;
+                while i < 16 {
+                    sum += TILE_A[arow + i] * TILE_B[i * 16 + tx as usize];
+                    i += 1;
+                }
+            }
+            thread::sync_threads();
+            t += 1;
+        }
+
+        if row < m && col < n {
+            let idx = (row * n + col) as usize;
+            let cell = unsafe { c.get_unchecked_mut(idx) };
+            *cell = if beta != 0.0f32 {
+                alpha * sum + beta * (*cell)
+            } else {
+                alpha * sum
+            };
+        }
+    }
+
+    // =========================================================================
+    // GEMM, N-register-tiled — C = alpha·A·B + beta·C  (row-major).
+    //
+    //   The naive 16×16 tiled kernel does 1 MAC per 2 shared loads inside a
+    //   non-unrolled K-loop; this backend also can't fuse mul+add, so that is
+    //   ~4 instructions per useful MAC. Here each thread owns ONE C row and
+    //   EIGHT C columns (scalar accumulators), so each staged A value feeds 8
+    //   MACs: arithmetic intensity ~2× higher and loop overhead amortised 8×.
+    //   Block tile 16(M)×128(N), BK=8. Row-major M-parallel mapping keeps the
+    //   block count high for the small-M conv-im2col GEMM shapes (where the
+    //   square 64×64 register-blocked variant starves occupancy).
+    //
+    //   Launch: grid=(⌈n/128⌉, ⌈m/16⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_fast(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        beta: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        // AS: [16][8] = 128.  BS: [8][128] = 1024.
+        static mut AS: SharedArray<f32, 128> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 1024> = SharedArray::UNINIT;
+
+        // All index math is u32 (this backend widens usize→64-bit, and the
+        // b64 register bloat caps occupancy). Cast to usize only at the
+        // slice/shared-array access. Index products < 2^31 for these models.
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tid = ty * 16 + tx;
+        let row = thread::blockIdx_y() * 16 + ty;
+        let brow0 = thread::blockIdx_y() * 16;
+        let col0 = thread::blockIdx_x() * 128;
+
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        let mut s2 = 0.0f32;
+        let mut s3 = 0.0f32;
+        let mut s4 = 0.0f32;
+        let mut s5 = 0.0f32;
+        let mut s6 = 0.0f32;
+        let mut s7 = 0.0f32;
+
+        let mut k0 = 0u32;
+        while k0 < k {
+            // Stage A (16×8 = 128): threads [0,128) load one element each.
+            if tid < 128 {
+                let r = tid >> 3; // 0..16
+                let cc = tid & 7; // 0..8
+                let gr = brow0 + r;
+                let gc = k0 + cc;
+                unsafe {
+                    AS[tid as usize] = if gr < m && gc < k {
+                        a[(gr * k + gc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+            }
+            // Stage B (8×128 = 1024): 256 threads, 4 elements each.
+            let mut q = 0u32;
+            while q < 4 {
+                let e = tid + q * 256;
+                let r = e >> 7; // 0..8
+                let cc = e & 127; // 0..128
+                let gr = k0 + r;
+                let gc = col0 + cc;
+                unsafe {
+                    BS[e as usize] = if gr < k && gc < n {
+                        b[(gr * n + gc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+                q += 1;
+            }
+            thread::sync_threads();
+
+            let arow = (ty * 8) as usize;
+            let bcol = tx as usize;
+            let mut kk = 0usize;
+            while kk < 8 {
+                let av = unsafe { AS[arow + kk] };
+                let bo = kk * 128 + bcol;
+                s0 += av * unsafe { BS[bo] };
+                s1 += av * unsafe { BS[bo + 16] };
+                s2 += av * unsafe { BS[bo + 32] };
+                s3 += av * unsafe { BS[bo + 48] };
+                s4 += av * unsafe { BS[bo + 64] };
+                s5 += av * unsafe { BS[bo + 80] };
+                s6 += av * unsafe { BS[bo + 96] };
+                s7 += av * unsafe { BS[bo + 112] };
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        if row < m {
+            let has_beta = beta != 0.0f32;
+            let base = row * n;
+            let mut t = 0u32;
+            while t < 8 {
+                let gc = col0 + tx + 16 * t;
+                if gc < n {
+                    let sv = if t == 0 {
+                        s0
+                    } else if t == 1 {
+                        s1
+                    } else if t == 2 {
+                        s2
+                    } else if t == 3 {
+                        s3
+                    } else if t == 4 {
+                        s4
+                    } else if t == 5 {
+                        s5
+                    } else if t == 6 {
+                        s6
+                    } else {
+                        s7
+                    };
+                    let cell = unsafe { c.get_unchecked_mut((base + gc) as usize) };
+                    *cell = if has_beta {
+                        alpha * sv + beta * (*cell)
+                    } else {
+                        alpha * sv
+                    };
+                }
+                t += 1;
+            }
+        }
+    }
+
+    // =========================================================================
     // GEMM via Ampere tensor cores — C = alpha·A·B + beta·C  (row-major).
     //   One warp computes a 16×8 output tile; K looped in steps of 8 via
     //   mma.sync.m16n8k8 (tf32 inputs, f32 accumulate). f32 reinterpreted as
