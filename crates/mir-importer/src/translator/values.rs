@@ -42,7 +42,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::{TypeObj, Typed};
+use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
 use rustc_public::CrateDef;
 use rustc_public::mir;
@@ -59,6 +59,12 @@ use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
 /// - ZST locals (and the unit return slot) remain `None` in `slots`.
 pub struct ValueMap {
     slots: Vec<Option<Value>>,
+    /// Per-body unchecked-indexing policy, resolved once by
+    /// [`super::body::translate_body`] from the `__unchecked_indexing_config`
+    /// marker and the `CUDA_OXIDE_UNCHECKED_INDEXING` environment switch.
+    /// When set, `translate_assert` elides `AssertMessage::BoundsCheck`
+    /// terminators (out-of-bounds indexing becomes UB, like `get_unchecked`).
+    unchecked_indexing: bool,
 }
 
 impl ValueMap {
@@ -66,7 +72,18 @@ impl ValueMap {
     pub fn new(num_locals: usize) -> Self {
         Self {
             slots: vec![None; num_locals],
+            unchecked_indexing: false,
         }
+    }
+
+    /// Record the resolved unchecked-indexing policy for this body.
+    pub fn set_unchecked_indexing(&mut self, enabled: bool) {
+        self.unchecked_indexing = enabled;
+    }
+
+    /// Whether bounds-check asserts in this body are elided.
+    pub fn unchecked_indexing(&self) -> bool {
+        self.unchecked_indexing
     }
 
     /// Return the alloca pointer backing `local`, or `None` if the local is
@@ -95,7 +112,7 @@ impl ValueMap {
     /// Returns the inserted op and its result pointer value.
     pub fn emit_alloca(
         ctx: &mut Context,
-        elem_ty: Ptr<TypeObj>,
+        elem_ty: TypeHandle,
         block: Ptr<BasicBlock>,
         prev_op: Option<Ptr<Operation>>,
     ) -> (Ptr<Operation>, Value) {
@@ -175,10 +192,10 @@ impl ValueMap {
 /// If `value` is a pointer whose type differs from `target_ty` (also a
 /// pointer), emit a `mir.cast <PtrToPtr>` that converts it. Returns the (new)
 /// value and the (new) anchor op. Otherwise this is a no-op.
-fn maybe_ptr_coerce(
+pub(crate) fn maybe_ptr_coerce(
     ctx: &mut Context,
     value: Value,
-    target_ty: Ptr<TypeObj>,
+    target_ty: TypeHandle,
     block: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
 ) -> (Value, Option<Ptr<Operation>>) {
@@ -213,7 +230,7 @@ fn maybe_ptr_coerce(
 /// Recover the pointee (element) type of a slot value. Panics if the value is
 /// not a `MirPtrType`; this invariant is established when a slot is recorded
 /// via [`ValueMap::set_slot`] after an [`ValueMap::emit_alloca`] call.
-fn slot_pointee(ctx: &Context, slot: Value) -> Ptr<TypeObj> {
+fn slot_pointee(ctx: &Context, slot: Value) -> TypeHandle {
     let ptr_ty = slot.get_type(ctx);
     ptr_ty
         .deref(ctx)
@@ -295,13 +312,11 @@ enum WriteClass {
     /// (aggregates, arithmetic, casts, complex projections, `Ref`/`AddressOf`,
     /// arbitrary function returns not in the intrinsic whitelist, …).
     ///
-    /// Crucially this does **not** demote the slot: we already trust
-    /// Rust's declared addrspace as the fallback (see [`SlotAddrSpace::Uninit`]),
-    /// so an unclassified write is equivalent to no observation. If the slot
-    /// was already `Known(n)` from a prior classified write, it stays
-    /// `Known(n)`. Demoting would be catastrophic for locals whose declared
-    /// type is a non-generic addrspace (e.g. `&mut SharedArray<_>` reborrows
-    /// in `tiled_gemm`).
+    /// The analyzer resolves this to the destination's declared lowering.
+    /// For ordinary references and raw pointers that is generic address space
+    /// zero, so a reachable unknown write prevents unsound narrowing to a
+    /// concrete space. Special pointer stand-ins such as `&mut SharedArray<_>`
+    /// retain their declared shared address space.
     Unclassified,
     /// The write is `_y = _x`-style propagation from a local whose state is
     /// still [`SlotAddrSpace::Uninit`]. That's a timing artefact of the
@@ -320,27 +335,48 @@ pub struct SlotAddrSpaceMap {
 }
 
 impl SlotAddrSpaceMap {
-    /// Infer per-local slot pointee address spaces by pre-scanning `body`.
+    /// Infer per-local slot pointee address spaces by pre-scanning only the
+    /// blocks rustc selected for this concrete monomorphized instance.
     ///
     /// Each iteration walks every statement and every `Call` terminator,
-    /// classifies the RHS, and merges classified observations into the
-    /// destination local's state. Only `Classified(_)` observations change
-    /// state; `Unclassified` and `Pending` are no-ops by design (see
-    /// [`WriteClass::Unclassified`] / [`resolve`] for the rationale).
+    /// classifies the RHS, and merges observations into the destination
+    /// local's state. Unclassified pointer writes contribute the pointer's
+    /// declared lowering; only temporarily unresolved copy chains are skipped.
     ///
     /// Convergence: each local can transition at most
     /// `Uninit → Known(n) → Generic` (two steps). Propagation chains
     /// `_a = _b = … = _z` are bounded by `num_locals`, so `num_locals + 2`
     /// iterations are guaranteed sufficient.
-    pub fn analyze(body: &mir::Body) -> Self {
+    pub fn analyze(
+        body: &mir::Body,
+        reachable: &std::collections::BTreeSet<usize>,
+        num_args: usize,
+        declared_addr_spaces: &[Option<u32>],
+    ) -> Self {
         let num_locals = body.locals().len();
         let mut classes = vec![SlotAddrSpace::Uninit; num_locals];
+
+        // Function arguments are live writes performed at entry, outside the
+        // MIR statement list. Seed their declared address spaces so copy
+        // chains originating at a generic pointer argument cannot be mistaken
+        // for evidence that a destination is exclusively shared/global/etc.
+        for (class, declared) in classes
+            .iter_mut()
+            .zip(declared_addr_spaces)
+            .skip(1)
+            .take(num_args)
+        {
+            if let Some(address_space) = *declared {
+                *class = SlotAddrSpace::Known(address_space);
+            }
+        }
 
         let cap = num_locals.saturating_add(2).max(2);
         for _ in 0..cap {
             let mut changed = false;
 
-            for block in &body.blocks {
+            for &block_idx in reachable {
+                let block = &body.blocks[block_idx];
                 for stmt in &block.statements {
                     let mir::StatementKind::Assign(place, rvalue) = &stmt.kind else {
                         continue;
@@ -349,7 +385,9 @@ impl SlotAddrSpaceMap {
                         continue;
                     }
                     let class = classify_rvalue(rvalue, &classes);
-                    if let Some(observation) = resolve(class, false)
+                    let local_idx: usize = place.local;
+                    let declared = declared_addr_spaces.get(local_idx).copied().flatten();
+                    if let Some(observation) = resolve(class, declared)
                         && merge_into(&mut classes, place.local, observation)
                     {
                         changed = true;
@@ -366,7 +404,9 @@ impl SlotAddrSpaceMap {
                     continue;
                 }
                 let class = classify_call(func);
-                if let Some(observation) = resolve(class, false)
+                let local_idx: usize = destination.local;
+                let declared = declared_addr_spaces.get(local_idx).copied().flatten();
+                if let Some(observation) = resolve(class, declared)
                     && merge_into(&mut classes, destination.local, observation)
                 {
                     changed = true;
@@ -402,17 +442,15 @@ impl SlotAddrSpaceMap {
     }
 }
 
-/// Turn a [`WriteClass`] into a [`SlotAddrSpace`] observation, or `None`
-/// when the observation should be skipped this iteration.
-///
-/// `Unclassified` and `Pending` both resolve to `None` ("skip"): we never
-/// demote a slot based on lack of information. Demotion to `Generic` only
-/// happens when two genuinely disagreeing `Classified(_)` observations hit
-/// the same slot.
-fn resolve(class: WriteClass, _final_pass: bool) -> Option<SlotAddrSpace> {
+/// Turn a [`WriteClass`] into a [`SlotAddrSpace`] observation. An unknown
+/// pointer-producing write contributes its destination's declared lowering;
+/// non-pointer writes have no address-space observation. `Pending` is the
+/// only skipped state and is revisited by the bounded fixed-point loop.
+fn resolve(class: WriteClass, declared: Option<u32>) -> Option<SlotAddrSpace> {
     match class {
         WriteClass::Classified(n) => Some(SlotAddrSpace::Known(n)),
-        WriteClass::Unclassified | WriteClass::Pending => None,
+        WriteClass::Unclassified => declared.map(SlotAddrSpace::Known),
+        WriteClass::Pending => None,
     }
 }
 
@@ -438,10 +476,10 @@ fn merge_into(
 /// Classify the write produced by an `Assign(_, rvalue)` statement.
 ///
 /// The rule set is intentionally narrow: when in doubt, return
-/// [`WriteClass::Unclassified`] so the final state merges to `Generic`. The
-/// safety invariant is "a slot is only promoted out of generic when every
-/// write into it is confidently classified," so an incomplete classifier
-/// at worst leaves the slot generic — i.e. today's behavior.
+/// [`WriteClass::Unclassified`] so the destination's declared lowering is
+/// observed. The safety invariant is "an ordinary pointer slot is narrowed
+/// to a concrete address space only when every reachable write agrees";
+/// incomplete classification therefore leaves ordinary pointers generic.
 fn classify_rvalue(rvalue: &mir::Rvalue, classes: &[SlotAddrSpace]) -> WriteClass {
     match rvalue {
         // `_y = _x` — propagate `_x`'s current classification. `Move` and
@@ -498,9 +536,31 @@ fn classify_constant(const_op: &mir::ConstOperand) -> WriteClass {
         return WriteClass::Unclassified;
     };
     match GlobalAlloc::from(prov.0) {
-        GlobalAlloc::Static(_) => WriteClass::Classified(address_space::GLOBAL),
+        GlobalAlloc::Static(static_def) => {
+            // `#[constant]` statics live in addrspace(4) and are recognised
+            // by the `ConstantMemory<T>` wrapper on the static's declared type.
+            // Other statics live in addrspace(1).
+            let static_ty = static_def.ty();
+            if is_constant_wrapper_type(&static_ty) {
+                WriteClass::Classified(address_space::CONSTANT)
+            } else {
+                WriteClass::Classified(address_space::GLOBAL)
+            }
+        }
         _ => WriteClass::Unclassified,
     }
+}
+
+/// `true` if `ty` is `cuda_device::ConstantMemory<_>`. Detection by trimmed ADT
+/// name, mirroring the `SharedArray | Barrier` check above in
+/// [`classify_constant`].
+pub(super) fn is_constant_wrapper_type(ty: &rustc_public::ty::Ty) -> bool {
+    use rustc_public::ty::{RigidTy, TyKind};
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, _)) = ty.kind() else {
+        return false;
+    };
+    adt_def.krate().name.as_str() == "cuda_device"
+        && adt_def.trimmed_name().as_str() == "ConstantMemory"
 }
 
 /// Classify the write produced by a `Call` terminator's destination.
@@ -564,7 +624,7 @@ fn classify_call(func: &mir::Operand) -> WriteClass {
 fn propagate_from_local(local: mir::Local, classes: &[SlotAddrSpace]) -> WriteClass {
     match classes.get(local).copied().unwrap_or(SlotAddrSpace::Uninit) {
         SlotAddrSpace::Known(n) => WriteClass::Classified(n),
-        SlotAddrSpace::Generic => WriteClass::Unclassified,
+        SlotAddrSpace::Generic => WriteClass::Classified(address_space::GENERIC),
         // Source hasn't been classified yet in this iteration — try again
         // on the next pass rather than prematurely demoting the destination.
         SlotAddrSpace::Uninit => WriteClass::Pending,
@@ -576,11 +636,7 @@ fn propagate_from_local(local: mir::Local, classes: &[SlotAddrSpace]) -> WriteCl
 ///
 /// Used by `body::emit_entry_allocas` to override a Rust-declared pointer
 /// addrspace with the one inferred by [`SlotAddrSpaceMap`].
-pub fn align_pointer_addr_space(
-    ctx: &mut Context,
-    elem_ty: Ptr<TypeObj>,
-    target: u32,
-) -> Ptr<TypeObj> {
+pub fn align_pointer_addr_space(ctx: &mut Context, elem_ty: TypeHandle, target: u32) -> TypeHandle {
     let ptr_info = elem_ty
         .deref(ctx)
         .downcast_ref::<MirPtrType>()
@@ -597,9 +653,35 @@ pub fn align_pointer_addr_space(
 /// Extract a pointer type's address space, or `None` if `elem_ty` is not a
 /// [`MirPtrType`]. Useful as the `rust_declared` fallback for
 /// [`SlotAddrSpaceMap::effective`].
-pub fn pointer_addr_space(ctx: &Context, elem_ty: Ptr<TypeObj>) -> Option<u32> {
+pub fn pointer_addr_space(ctx: &Context, elem_ty: TypeHandle) -> Option<u32> {
     elem_ty
         .deref(ctx)
         .downcast_ref::<MirPtrType>()
         .map(|pt| pt.address_space)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachable_unknown_pointer_write_prevents_concrete_narrowing() {
+        let shared = resolve(
+            WriteClass::Classified(address_space::SHARED),
+            Some(address_space::GENERIC),
+        )
+        .unwrap();
+        let unknown = resolve(WriteClass::Unclassified, Some(address_space::GENERIC)).unwrap();
+
+        assert_eq!(shared.merge(unknown), SlotAddrSpace::Generic);
+    }
+
+    #[test]
+    fn generic_source_propagates_as_a_generic_observation() {
+        let source = mir::Local::from(0usize);
+        assert!(matches!(
+            propagate_from_local(source, &[SlotAddrSpace::Generic]),
+            WriteClass::Classified(space) if space == address_space::GENERIC
+        ));
+    }
 }

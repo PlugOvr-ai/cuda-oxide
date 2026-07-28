@@ -6,7 +6,7 @@
 //! `dialect-mir` operation converters.
 //!
 //! This module contains submodules that convert standard `dialect-mir` ops
-//! to their `dialect-llvm` equivalents. Each submodule handles a category of
+//! to their LLVM dialect equivalents. Each submodule handles a category of
 //! operations with similar semantics and conversion patterns.
 //!
 //! # Module Organization
@@ -38,3 +38,6 @@ pub mod cast;
 pub mod constants;
 pub mod control_flow;
 pub mod memory;
+
+#[cfg(test)]
+pub(crate) mod test_util;

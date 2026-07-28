@@ -183,10 +183,16 @@ impl SchedulingPolicy for StreamPoolRoundRobin {
             .stream_pool
             .as_ref()
             .ok_or_else(|| device_error(self.device_id, "Stream pool not initialized."))?;
+        // `DeviceFuture` implements `Drop`, so functional-update syntax
+        // (`..Default::default()`) would move fields out of a droppable
+        // value (E0509). Spell every field out instead.
         Ok(DeviceFuture {
             device_operation: Some(op),
             execution_context: Some(ExecutionContext::new(Arc::clone(&pool[idx]))),
-            ..Default::default()
+            result: None,
+            error: None,
+            state: Default::default(),
+            callback_state: None,
         })
     }
 }
@@ -225,10 +231,15 @@ impl SchedulingPolicy for SingleStream {
         op: O,
     ) -> Result<DeviceFuture<T, O>, DeviceError> {
         let stream = self.stream.as_ref().unwrap();
+        // See `StreamPoolRoundRobin::schedule` for why the fields are
+        // spelled out instead of using `..Default::default()`.
         Ok(DeviceFuture {
             device_operation: Some(op),
             execution_context: Some(ExecutionContext::new(Arc::clone(stream))),
-            ..Default::default()
+            result: None,
+            error: None,
+            state: Default::default(),
+            callback_state: None,
         })
     }
 

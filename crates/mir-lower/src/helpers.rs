@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Helper functions for `dialect-mir` → `dialect-llvm` lowering.
+//! Helper functions for `dialect-mir` → LLVM dialect lowering.
 //!
 //! This module provides utility functions that are shared across multiple
 //! operation converters. These helpers handle common tasks like:
@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-use dialect_llvm::ops as llvm;
+use llvm_export::ops as llvm;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -262,7 +262,7 @@ pub fn create_i64_constant(
 ///
 /// # Returns
 ///
-/// `Ok(())` if the intrinsic was already declared or was successfully created,
+/// Returns the existing or newly created LLVM function declaration,
 /// or an error if the IR structure is invalid.
 ///
 /// # IR Navigation
@@ -293,12 +293,13 @@ pub fn create_i64_constant(
 /// Pliron IR symbol system (e.g., `llvm_nvvm_read_ptx_sreg_tid_x`). These are
 /// translated to the standard LLVM intrinsic names with dots when exported to
 /// LLVM IR (e.g., `llvm.nvvm.read.ptx.sreg.tid.x`).
+/// Escape-mode identifiers preserve literal underscores with `_u`.
 pub fn ensure_intrinsic_declared(
     ctx: &mut Context,
     llvm_block: Ptr<BasicBlock>,
     intrinsic_name: &str,
-    func_ty: pliron::r#type::TypePtr<dialect_llvm::types::FuncType>,
-) -> Result<(), anyhow::Error> {
+    func_ty: pliron::r#type::TypedHandle<llvm_export::types::FuncType>,
+) -> Result<Ptr<pliron::operation::Operation>, anyhow::Error> {
     // Navigate from block to parent function
     let func_op = llvm_block
         .deref(ctx)
@@ -325,25 +326,27 @@ pub fn ensure_intrinsic_declared(
         .map_err(|e| anyhow::anyhow!("Invalid intrinsic name '{}': {:?}", intrinsic_name, e))?;
 
     // Check if the intrinsic is already declared
-    let mut already_declared = false;
+    let mut existing_declaration = None;
     for existing_op in module_block.deref(ctx).iter(ctx) {
         if let Some(existing_func) =
             pliron::operation::Operation::get_op::<llvm::FuncOp>(existing_op, ctx)
             && existing_func.get_symbol_name(ctx) == sym_name
         {
-            already_declared = true;
+            existing_declaration = Some(existing_op);
             break;
         }
     }
 
     // If not declared, create a function declaration (no body)
-    if !already_declared {
-        let func_decl = llvm::FuncOp::new(ctx, sym_name, func_ty);
-        // Insert before the current function (keeps intrinsics at top of module)
-        func_decl.get_operation().insert_before(ctx, func_op);
+    if let Some(existing_declaration) = existing_declaration {
+        return Ok(existing_declaration);
     }
 
-    Ok(())
+    let func_decl = llvm::FuncOp::new(ctx, sym_name, func_ty);
+    let func_decl_op = func_decl.get_operation();
+    func_decl_op.insert_before(ctx, func_op);
+
+    Ok(func_decl_op)
 }
 
 // ============================================================================

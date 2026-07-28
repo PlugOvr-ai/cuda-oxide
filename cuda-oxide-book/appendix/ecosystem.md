@@ -87,6 +87,8 @@ projects mature, and we expect to keep doing so.
 ## Engaging with the project
 
 If you're building a Rust + GPU project — or evaluating which of the above
-fits your needs — we're happy to compare notes. The best way to reach the
-cuda-oxide team is via [GitHub Discussions](https://github.com/NVlabs/cuda-oxide/discussions)
+fits your needs — we're happy to compare notes. Join the community on
+[Discord](https://discord.gg/Fua7DeKnm) for questions, design discussions,
+and announcements, or reach the team via
+[GitHub Discussions](https://github.com/NVlabs/cuda-oxide/discussions)
 or by opening an issue on the repository.

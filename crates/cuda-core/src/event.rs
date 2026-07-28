@@ -108,6 +108,21 @@ impl CudaEvent {
         unsafe { cuda_bindings::cuEventSynchronize(self.cu_event).result() }
     }
 
+    /// Returns `true` when all work captured by this event has completed,
+    /// `false` when it is still in flight. Never blocks.
+    ///
+    /// Wraps `cuEventQuery`, mapping `CUDA_SUCCESS` to `Ok(true)` and
+    /// `CUDA_ERROR_NOT_READY` to `Ok(false)`. Any other code is a real
+    /// driver error.
+    pub fn query(&self) -> Result<bool, DriverError> {
+        self.ctx.bind_to_thread()?;
+        match unsafe { cuda_bindings::cuEventQuery(self.cu_event) } {
+            cuda_bindings::cudaError_enum_CUDA_SUCCESS => Ok(true),
+            cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_READY => Ok(false),
+            err => Err(DriverError(err)),
+        }
+    }
+
     /// Returns the elapsed time in milliseconds between `self` (start) and
     /// `end`.
     ///

@@ -6,18 +6,20 @@
 // Index-based loops are used intentionally for parallel array iteration patterns
 #![allow(clippy::needless_range_loop)]
 
-//! # `dialect-mir` → `dialect-llvm` Lowering
+//! # `dialect-mir` → LLVM dialect Lowering
 //!
 //! This crate implements the lowering pass that converts
-//! [`dialect-mir`][dialect_mir] operations into
-//! [`dialect-llvm`][dialect_llvm] operations, with GPU-specific operations
-//! lowered to inline PTX assembly or NVVM intrinsic calls.
+//! [`dialect-mir`][dialect_mir] operations into LLVM dialect operations
+//! (provided by `pliron-llvm`, re-exported via [`llvm_export`]), with
+//! GPU-specific operations lowered to inline PTX assembly or NVVM
+//! intrinsic calls.
 //!
 //! ## Overview
 //!
 //! `mir-lower` bridges cuda-oxide's Rust-semantic dialect (`dialect-mir`)
-//! to its LLVM-shaped dialect (`dialect-llvm`). After lowering,
-//! `dialect-llvm` is exported to textual LLVM IR and fed to `llc` for PTX.
+//! to the LLVM dialect. After lowering, ordinary PTX builds go directly to
+//! `llvm-export`. NVVM builds first pass through `nvvm-transforms`, which
+//! adjusts the LLVM module for the selected libNVVM dialect.
 //!
 //! ## Compilation Pipeline Position
 //!
@@ -31,17 +33,17 @@
 //!        │
 //!        ▼
 //! ┌──────────────┐
-//! │ mir-importer │  (Stable MIR → dialect-mir, then mem2reg)
+//! │ mir-importer │  (Stable MIR → dialect-mir, mem2reg, annotated unroll)
 //! └──────┬───────┘
 //!        │
 //!        ▼
 //! ┌──────────────┐
-//! │  mir-lower   │  ◄── THIS CRATE (dialect-mir → dialect-llvm)
+//! │  mir-lower   │  ◄── THIS CRATE (dialect-mir → LLVM dialect)
 //! └──────┬───────┘
 //!        │
 //!        ▼
 //! ┌──────────────┐
-//! │ dialect-llvm │  (exports to LLVM IR)
+//! │ llvm-export  │  (exports to LLVM IR)
 //! └──────┬───────┘
 //!        │
 //!        ▼
@@ -62,18 +64,18 @@
 //!
 //! - **[`conversion_interface`]**: The `MirToLlvmConversion` op interface
 //!   trait. Each `dialect-mir` / `dialect-nvvm` op implements this to
-//!   declare how it lowers to `dialect-llvm`.
+//!   declare how it lowers to the LLVM dialect.
 //!
 //! - **[`context`]**: CUDA-specific state maps (`SharedGlobalsMap`,
 //!   `DynamicSmemAlignmentMap`) used during conversion.
 //!
-//! - **[`helpers`]**: Utility functions for creating `dialect-llvm`
+//! - **[`helpers`]**: Utility functions for creating LLVM dialect
 //!   constants, declaring intrinsics, and navigating the IR hierarchy.
 //!
 //! ### Conversion Modules ([`convert`])
 //!
 //! - **[`convert::types`]**: Type conversion from `dialect-mir` types to
-//!   `dialect-llvm` types.
+//!   LLVM dialect types.
 //!
 //! - **[`convert::ops`]**: Operation converters organized by semantic category:
 //!   - `arithmetic` - Binary/unary math operations
@@ -104,7 +106,7 @@
 //!
 //! lower_mir_to_llvm(&mut ctx, module_op)?;
 //!
-//! // module_op now contains dialect-llvm operations
+//! // module_op now contains LLVM dialect operations
 //! ```
 //!
 //! ## GPU Intrinsic Lowering Strategy
@@ -126,9 +128,10 @@ pub mod conversion_interface;
 pub mod convert;
 pub mod helpers;
 pub mod lowering;
+pub mod scalarize_block_args;
 pub mod type_conversion_interface;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use pliron::{
     builtin::types::{IntegerType, Signedness},
@@ -136,11 +139,13 @@ use pliron::{
     irbuild::dialect_conversion::{
         DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
     },
+    irbuild::{listener::Recorder, rewriter::IRRewriter},
     location::Located,
     op::{Op, op_cast},
     operation::Operation,
+    opts::simplify_cfg::remove_blocks_inside_op,
     result::Result,
-    r#type::{TypeObj, type_impls},
+    r#type::{TypeHandle, Typed, type_impls},
 };
 
 use context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
@@ -152,7 +157,43 @@ use type_conversion_interface::MirConvertibleType;
 // DialectConversion driver
 // ============================================================================
 
-/// `dialect-mir` → `dialect-llvm` conversion driver.
+/// Backend whose intrinsic ABI the lowering pass must emit.
+///
+/// LLVM's NVPTX backend and NVIDIA's libNVVM accept overlapping but not
+/// identical intrinsic signatures. The pipeline chooses this once, before
+/// any typed MIR operation is lowered, so generated intrinsic conversions do
+/// not have to guess from environment variables or partially lowered IR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IntrinsicBackend {
+    /// Emit intrinsic forms consumed by LLVM's NVPTX backend (`llc`).
+    #[default]
+    LlvmNvptx,
+    /// Emit intrinsic forms consumed by NVIDIA's libNVVM compiler.
+    LibNvvm,
+}
+
+/// Options controlling the `dialect-mir` to LLVM dialect lowering pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoweringOptions {
+    /// Whether ordinary floating-point multiply/add or multiply/subtract
+    /// expressions may contract into fused operations.
+    ///
+    /// This does not affect explicit fused operations such as `f32::mul_add`.
+    pub allow_fma_contraction: bool,
+    /// Intrinsic ABI expected by the selected LLVM-to-device backend.
+    pub intrinsic_backend: IntrinsicBackend,
+}
+
+impl Default for LoweringOptions {
+    fn default() -> Self {
+        Self {
+            allow_fma_contraction: true,
+            intrinsic_backend: IntrinsicBackend::LlvmNvptx,
+        }
+    }
+}
+
+/// `dialect-mir` → LLVM dialect conversion driver.
 ///
 /// Implements pliron's `DialectConversion` trait. The `rewrite` method uses
 /// `op_cast`-based dispatch via the `MirToLlvmConversion` op interface,
@@ -165,7 +206,7 @@ pub struct MirToLlvmConversionDriver {
     pub shared_globals: SharedGlobalsMap,
     /// Device global deduplication across all functions.
     pub device_globals: DeviceGlobalsMap,
-    /// Per-kernel dynamic shared memory alignment tracking.
+    /// Per-owning-function dynamic shared memory alignment tracking.
     pub dynamic_smem_alignments: DynamicSmemAlignmentMap,
 }
 
@@ -175,12 +216,39 @@ fn is_mir_or_nvvm_op(ctx: &Context, op: Ptr<Operation>) -> bool {
     dialect == "mir" || dialect == "nvvm"
 }
 
+/// True for a `builtin.constant` whose result is a signed/unsigned (non-signless)
+/// integer. That is the only `builtin.constant` lowering must touch: `sccp` can
+/// materialise such a constant (it carries the MIR integer type, e.g. `ui32`), and
+/// lowering must normalise it to a signless LLVM integer like it does for
+/// `mir.constant`, else the LLVM module ends up with mismatched operand types
+/// (a signless op fed by a signed/unsigned constant). A *signless* builtin.constant
+/// is left alone (legal; the textual exporter emits it). Because the conversion
+/// emits a signless constant, this predicate is false for the result, so the
+/// DialectConversion worklist converges instead of looping.
+fn is_signed_builtin_constant(ctx: &Context, op: Ptr<Operation>) -> bool {
+    if Operation::get_opid(op, ctx) != pliron::builtin::ops::ConstantOp::get_opid_static() {
+        return false;
+    }
+    let res_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    res_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|it| it.signedness() != Signedness::Signless)
+}
+
 impl DialectConversion for MirToLlvmConversionDriver {
     fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
-        is_mir_or_nvvm_op(ctx, op)
+        // A signless `builtin.constant` is left alone: it is legal and the textual
+        // exporter emits it directly. But sccp can materialise a builtin.constant
+        // carrying a signed/unsigned MIR integer type; lowering must normalise that
+        // to signless (like `mir.constant`), or the LLVM module gets mismatched
+        // operand types. So mark ONLY a non-signless builtin.constant convertible.
+        // Its conversion emits a signless constant (no longer convertible), so this
+        // converges — it does NOT loop the way marking *every* builtin.constant did.
+        is_mir_or_nvvm_op(ctx, op) || is_signed_builtin_constant(ctx, op)
     }
 
-    fn can_convert_type(&self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+    fn can_convert_type(&self, ctx: &Context, ty: TypeHandle) -> bool {
         let ty_ref = ty.deref(ctx);
 
         // Signed/unsigned integers need signless normalisation (LLVM convention).
@@ -188,10 +256,10 @@ impl DialectConversion for MirToLlvmConversionDriver {
             return int_ty.signedness() != Signedness::Signless;
         }
 
-        type_impls::<dyn MirConvertibleType>(&**ty_ref)
+        type_impls::<dyn MirConvertibleType>(&*ty_ref)
     }
 
-    fn convert_type(&mut self, ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>> {
+    fn convert_type(&mut self, ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle> {
         convert_type(ctx, ty).map_err(|e| pliron::input_error_noloc!("{e}"))
     }
 
@@ -258,7 +326,7 @@ impl DialectConversion for MirToLlvmConversionDriver {
     }
 }
 
-/// Runs the `dialect-mir` → `dialect-llvm` lowering pass on the given module.
+/// Runs the `dialect-mir` → LLVM dialect lowering pass on the given module.
 ///
 /// This is the main entry point for the lowering pass. It uses pliron's
 /// `DialectConversion` framework to walk the IR, convert types, and
@@ -273,15 +341,50 @@ impl DialectConversion for MirToLlvmConversionDriver {
 ///
 /// `Ok(())` if all operations were successfully converted.
 pub fn lower_mir_to_llvm(ctx: &mut Context, module_op: Ptr<Operation>) -> Result<()> {
-    let mut conversion = MirToLlvmConversionDriver {
-        shared_globals: HashMap::new(),
-        device_globals: HashMap::new(),
-        dynamic_smem_alignments: HashMap::new(),
-    };
-    apply_dialect_conversion(ctx, &mut conversion, module_op)
+    lower_mir_to_llvm_with_options(ctx, module_op, LoweringOptions::default())
 }
 
-/// Register the `dialect-mir` → `dialect-llvm` lowering pass with a pliron context.
+/// Runs the `dialect-mir` → LLVM dialect lowering pass with explicit options.
+///
+/// Use this entry point when the caller needs compilation-wide floating-point
+/// policy such as disabling implicit FMA contraction.
+pub fn lower_mir_to_llvm_with_options(
+    ctx: &mut Context,
+    module_op: Ptr<Operation>,
+    options: LoweringOptions,
+) -> Result<()> {
+    context::set_lowering_options(ctx, options);
+    // Dynamic shared-memory operations may live in device helpers. Compute
+    // every kernel-to-helper requirement while the complete MIR call graph is
+    // still available; function conversion removes that graph incrementally.
+    lowering::propagate_kernel_dynamic_shared_alignments(ctx, module_op);
+    let mut conversion = MirToLlvmConversionDriver {
+        shared_globals: FxHashMap::default(),
+        device_globals: FxHashMap::default(),
+        dynamic_smem_alignments: FxHashMap::default(),
+    };
+    // pliron's DialectConversion now reports an IRStatus (Changed/Unchanged);
+    // lowering only cares about success, so discard it.
+    apply_dialect_conversion(ctx, &mut conversion, module_op)?;
+    // Conversions of diverging ops (e.g. `nvvm.assertfail`) erase everything
+    // after the noreturn call, including the block's terminator. A successor
+    // whose only predecessor was that terminator is now unreachable, and if it
+    // still carries block arguments it cannot be exported (a PHI needs one
+    // incoming value per predecessor). Erase every block the entry can no
+    // longer reach.
+    let mut rewriter = IRRewriter::<Recorder>::default();
+    remove_blocks_inside_op(module_op, ctx, &mut rewriter);
+    // mem2reg promotes enum/struct slots into whole-aggregate block arguments,
+    // which export as PHIs of first-class aggregates. LLVM's -O2 pipeline
+    // cannot split those (SROA only handles allocas), so e.g. an iterator
+    // loop merging `Option<(f32, f32)>` keeps a materialized discriminant and
+    // an extra branch per iteration. Split such arguments into scalar leaves
+    // so the exported IR carries scalar PHIs, as SROA would produce.
+    scalarize_block_args::scalarize_aggregate_block_args(ctx, module_op)?;
+    Ok(())
+}
+
+/// Register the `dialect-mir` → LLVM dialect lowering pass with a pliron context.
 ///
 /// This is a placeholder for future pass manager integration.
 /// Currently, the pass is invoked directly via [`lower_mir_to_llvm`].

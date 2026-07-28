@@ -17,8 +17,9 @@
 //! # The cooperative launch contract
 //!
 //! [`sync`] is **only valid in cooperative kernel launches**. The host must
-//! call [`cuda_core::launch_kernel_cooperative`] (or use
-//! `cuda_launch! { cooperative: true, ... }`); a normal launch deadlocks
+//! use `#[cooperative_launch]` on a `#[cuda_module]` kernel, call
+//! `cuda_core::launch_kernel_cooperative`, or use
+//! `unsafe { cuda_launch! { cooperative: true, ... } }`; a normal launch deadlocks
 //! because not every block is guaranteed to be co-resident on the GPU and
 //! the driver does not populate the per-launch grid workspace pointer.
 //!
@@ -50,30 +51,7 @@
 use crate::atomic::{AtomicOrdering, DeviceAtomicU32};
 use crate::thread;
 
-/// Read PTX `%envreg1`.
-///
-/// For cooperative kernel launches (`cuLaunchKernelEx` with
-/// `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`) the CUDA driver writes the **high**
-/// 32 bits of the per-launch grid workspace pointer here. The low half is
-/// in [`envreg2`].
-///
-/// (The driver-ABI convention follows the public CUDA toolkit header
-/// `cooperative_groups/details/driver_abi.h`, whose `load_env_reg64`
-/// template is `<HiReg, LoReg>` instantiated as `<1, 2>`.)
-///
-/// Mainly exposed so test kernels can confirm the driver populated the
-/// envregs as expected. Production code should call [`sync`] instead.
-#[inline(never)]
-pub fn envreg1() -> u32 {
-    unreachable!("grid::envreg1 called outside CUDA kernel context")
-}
-
-/// Read PTX `%envreg2` (low 32 bits of the grid workspace pointer for
-/// cooperative launches). See [`envreg1`] for the full convention.
-#[inline(never)]
-pub fn envreg2() -> u32 {
-    unreachable!("grid::envreg2 called outside CUDA kernel context")
-}
+include!("generated/grid_sreg.rs");
 
 /// Layout of the per-launch grid workspace populated by the CUDA driver.
 ///
@@ -100,12 +78,24 @@ fn bar_has_flipped(prev: u32, current: u32) -> bool {
 ///
 /// # Cooperative launch required
 ///
-/// The kernel must be launched with cooperative semantics. From the host:
+/// The kernel must be launched with cooperative semantics. From the host,
+/// either mark the kernel `#[cooperative_launch]` inside a `#[cuda_module]`
+/// (preferred), or use the unsafe lower-level paths:
 ///
 /// ```ignore
-/// cuda_launch!(stream, my_kernel<<<grid, block, 0, cooperative: true>>>(args));
+/// // SAFETY: args match my_kernel's signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: my_kernel,
+///         stream: stream,
+///         module: module,
+///         config: cfg,
+///         cooperative: true,
+///         args: [/* ... */]
+///     }
+/// }?;
 /// // or
-/// cuda_core::launch_kernel_cooperative(&func, grid, block, 0, &stream, &mut params)?;
+/// unsafe { cuda_core::launch_kernel_cooperative(&func, grid, block, 0, &stream, &mut params) }?;
 /// ```
 ///
 /// A non-cooperative launch will deadlock at the first `grid::sync()` call.

@@ -20,6 +20,7 @@
 //! | `*const T`, `*mut T`| `MirPtrType` (generic addrspace)    |
 //! | `[T]`, `&[T]`       | `MirSliceType`                      |
 //! | `struct S { .. }`   | `MirStructType`                     |
+//! | `union U { .. }`    | `MirUnionType`                      |
 //! | `enum E { .. }`     | `MirEnumType`                       |
 //! | Closures            | `MirStructType` (captures as fields)|
 //!
@@ -34,42 +35,161 @@
 //! | `TmaDescriptor`   | `[u64; 16]` (128-byte opaque blob)    |
 
 use crate::error::{TranslationErr, TranslationResult};
-use pliron::context::{Context, Ptr};
-use pliron::r#type::TypeObj;
+use pliron::context::Context;
+use pliron::r#type::TypeHandle;
 use pliron::{input_err_noloc, input_error_noloc};
 use rustc_public::CrateDef;
+use rustc_public_bridge::IndexedVal;
 
 // Re-export types from dialect_mir for convenience
 pub use dialect_mir::types::{
-    EnumVariant, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType, MirTupleType,
+    EnumEncoding, EnumVariant, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType,
+    MirTupleType, MirUnionType,
 };
 use rustc_public::mir::Mutability;
 
 /// Returns the signed 32-bit integer type.
 pub fn get_i32_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 32, pliron::builtin::types::Signedness::Signed)
 }
 
 /// Returns the boolean type (i1, signless).
 pub fn get_bool_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 1, pliron::builtin::types::Signedness::Signless)
 }
 
 /// Returns the `usize` type (u64 on 64-bit targets).
 pub fn get_usize_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 64, pliron::builtin::types::Signedness::Unsigned)
+}
+
+/// Returns the tupled-upvars types for a `RigidTy::Closure`.
+///
+/// rustc suffix-encodes closure substitutions as
+/// `[parent_args..., closure_kind, closure_sig, tupled_upvars]`, so the upvars
+/// tuple is the last generic arg, not a fixed index.
+fn closure_upvar_tys(substs: &rustc_public::ty::GenericArgs) -> Option<Vec<rustc_public::ty::Ty>> {
+    let rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty) = substs.0.last()? else {
+        return None;
+    };
+    let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Tuple(upvar_tys)) =
+        upvar_tuple_ty.kind()
+    else {
+        return None;
+    };
+    Some(upvar_tys)
+}
+
+/// Whether a fully monomorphized Rust type has at least one valid value.
+///
+/// Stable layout exposes `Empty` for an uninhabited enum itself, but aggregate
+/// wrappers can still have `Single` layout (for example `struct Wrap(!)`).
+/// Walk aggregate fields recursively so such wrappers cannot make an enum
+/// variant look inhabitable merely because its outer shape is `Single`.
+fn monomorphized_ty_is_inhabited(ty: &rustc_public::ty::Ty) -> TranslationResult<bool> {
+    if matches!(
+        ty.layout()
+            .map_err(|e| input_error_noloc!(TranslationErr::unsupported(format!(
+                "Failed to query inhabitedness layout for {:?}: {:?}",
+                ty, e
+            ))))?
+            .shape()
+            .variants,
+        rustc_public::abi::VariantsShape::Empty
+    ) {
+        return Ok(false);
+    }
+
+    use rustc_public::ty::{AdtKind, RigidTy, TyKind};
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Never) => Ok(false),
+        TyKind::RigidTy(RigidTy::Tuple(fields)) => {
+            for field in fields {
+                if !monomorphized_ty_is_inhabited(&field)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        TyKind::RigidTy(RigidTy::Array(element, count)) => {
+            let count = count.eval_target_usize().map_err(|e| {
+                input_error_noloc!(TranslationErr::unsupported(format!(
+                    "Failed to evaluate monomorphized array length: {:?}",
+                    e
+                )))
+            })?;
+            Ok(count == 0 || monomorphized_ty_is_inhabited(&element)?)
+        }
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => match def.kind() {
+            AdtKind::Struct => {
+                let Some(variant) = def.variants().into_iter().next() else {
+                    return Ok(true);
+                };
+                for field in variant.fields() {
+                    if !monomorphized_ty_is_inhabited(&field.ty_with_args(&args))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            AdtKind::Enum => {
+                for variant in def.variants() {
+                    let mut inhabited = true;
+                    for field in variant.fields() {
+                        if !monomorphized_ty_is_inhabited(&field.ty_with_args(&args))? {
+                            inhabited = false;
+                            break;
+                        }
+                    }
+                    if inhabited {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            // Match rustc's inhabitedness predicate: unions are currently
+            // always considered inhabited, independent of their fields.
+            AdtKind::Union => Ok(true),
+        },
+        // ABI univariant layout marks an aggregate uninhabited when any field
+        // layout is uninhabited. A closure is laid out from its captured
+        // upvars, so mirror that physical rule (this is deliberately about
+        // codegen layout, not the visibility-sensitive pattern predicate).
+        TyKind::RigidTy(RigidTy::Closure(_, args)) => {
+            let Some(fields) = closure_upvar_tys(&args) else {
+                return Ok(true);
+            };
+            for field in fields {
+                if !monomorphized_ty_is_inhabited(&field)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        // Pointers/references/functions, scalars and compiler-generated
+        // coroutine values are treated as inhabited unless their top-level
+        // stable layout was `Empty` above.
+        _ => Ok(true),
+    }
+}
+
+/// Returns the `isize` type (i64 on 64-bit targets).
+pub fn get_isize_type(
+    ctx: &mut Context,
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
+    pliron::builtin::types::IntegerType::get(ctx, 64, pliron::builtin::types::Signedness::Signed)
 }
 
 /// Returns the 32-bit floating point type.
 pub fn get_f32_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::FP32Type> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::FP32Type> {
     pliron::builtin::types::FP32Type::get(ctx)
 }
 
@@ -85,7 +205,7 @@ pub fn get_f32_type(
 /// - Lifetime/variance tracking (`PhantomData<&'a T>`)
 /// - Typestate patterns (`struct Allocated;`, `struct Deallocated;`)
 /// - Type-level markers for layout/configuration
-pub fn is_zst_type(ctx: &pliron::context::Context, ty: Ptr<TypeObj>) -> bool {
+pub fn is_zst_type(ctx: &pliron::context::Context, ty: TypeHandle) -> bool {
     let ty_ref = ty.deref(ctx);
 
     // Empty tuple - e.g., () or MirTupleType with no fields
@@ -96,6 +216,10 @@ pub fn is_zst_type(ctx: &pliron::context::Context, ty: Ptr<TypeObj>) -> bool {
     // Empty struct - structs with no fields (like PhantomData<T>)
     if let Some(struct_ty) = ty_ref.downcast_ref::<dialect_mir::types::MirStructType>() {
         return struct_ty.field_types().is_empty();
+    }
+
+    if let Some(union_ty) = ty_ref.downcast_ref::<MirUnionType>() {
+        return union_ty.total_size() == 0;
     }
 
     false
@@ -117,6 +241,14 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
         }
         // ADT - check if it has no fields (for structs)
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, _substs)) => {
+            if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
+                // A union can have declared fields and still own no bytes when
+                // every field is zero-sized. Source-level field count cannot
+                // answer this; use rustc's target layout.
+                return rust_ty
+                    .layout()
+                    .is_ok_and(|layout| layout.shape().size.bytes() == 0);
+            }
             let variants = adt_def.variants();
             // For structs (single variant), check if it has no fields
             if variants.len() == 1 {
@@ -127,15 +259,9 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
                 false
             }
         }
-        // Closures with no captures are ZST, closures with captures are not
+        // Closures with no captures are ZST, closures with captures are not.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, substs)) => {
-            // Check substs[2] which is the tuple of upvar types
-            if substs.0.len() >= 3
-                && let rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty) = &substs.0[2]
-                && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Tuple(
-                    upvar_tys,
-                )) = upvar_tuple_ty.kind()
-            {
+            if let Some(upvar_tys) = closure_upvar_tys(&substs) {
                 // ZST if no captures
                 return upvar_tys.is_empty();
             }
@@ -143,6 +269,45 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// If `ty` is a struct made unsized by a trailing slice field, return that
+/// slice's ELEMENT type. Returns `None` for every other type.
+///
+/// Rust allows the LAST field of a struct to be an unsized type such as
+/// `[T]`; the struct itself then becomes unsized and a reference to it is
+/// a fat pointer: (pointer to the struct's first byte, number of trailing
+/// elements). The motivating case is `core::array::iter::iter_inner::
+/// PolymorphicIter<[MaybeUninit<T>]>`, the type that backs
+/// `core::array::IntoIter` and therefore every `for x in arr` loop over a
+/// by-value array (issue #138).
+///
+/// The check recurses through nested structs because the unsized tail may
+/// itself sit at the end of an inner struct (`struct A { b: B }` with
+/// `struct B { t: [u32] }` makes `A` slice-tailed too).
+pub(super) fn slice_tail_element_ty(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, substs)) => {
+            let variants = adt_def.variants();
+            // Only structs (exactly one variant) can have an unsized tail.
+            if variants.len() != 1 {
+                return None;
+            }
+            let fields = variants[0].fields();
+            let last_field = fields.last()?;
+            let last_ty = last_field.ty_with_args(&substs);
+            match last_ty.kind() {
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Slice(elem)) => {
+                    Some(elem)
+                }
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(..)) => {
+                    slice_tail_element_ty(&last_ty)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -157,7 +322,7 @@ fn translate_pointer_like(
     ctx: &mut Context,
     pointee: &rustc_public::ty::Ty,
     is_mutable: bool,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     match pointee.kind() {
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Slice(elem_ty)) => {
             // `*const [T]` / `*mut [T]` have the same runtime layout as `&[T]`
@@ -168,6 +333,20 @@ fn translate_pointer_like(
             // interconvertible.
             let elem = translate_type(ctx, &elem_ty)?;
             Ok(MirSliceType::get(ctx, elem).into())
+        }
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
+            // `&str` / `*const str` is a fat pointer (data ptr + length),
+            // exactly like `&[u8]`. Without this arm it would fall through
+            // to the generic case below and become a THIN pointer to the
+            // slice struct: 8 bytes where Rust has 16, silently corrupting
+            // any local that holds one.
+            let u8_ty = pliron::builtin::types::IntegerType::get(
+                ctx,
+                8,
+                pliron::builtin::types::Signedness::Unsigned,
+            )
+            .into();
+            Ok(MirSliceType::get(ctx, u8_ty).into())
         }
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, substs))
             if adt_def.trimmed_name() == "SharedArray" =>
@@ -192,6 +371,26 @@ fn translate_pointer_like(
             .into();
             Ok(dialect_mir::types::MirPtrType::get_shared(ctx, u64_ty, is_mutable).into())
         }
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(..))
+            if slice_tail_element_ty(pointee).is_some() =>
+        {
+            // A reference to a struct whose last field is a slice (an
+            // "unsized tail"), e.g. the `PolymorphicIter<[MaybeUninit<T>]>`
+            // backing every `for x in arr` loop. Such a reference is a FAT
+            // pointer at runtime: (pointer to the struct, number of tail
+            // elements). Modelling it as a thin pointer would silently drop
+            // the element count, which feeds slice reborrows of the tail.
+            //
+            // We reuse `MirSliceType` as the fat-pair carrier with the
+            // translated STRUCT as its element type, so the existing
+            // fat-pointer machinery (function-boundary flattening into
+            // (ptr, len), `PtrMetadata` extraction, fat-value copies) all
+            // applies unchanged. Field access through the fat pointer
+            // extracts the data pointer (the struct's address) first; see
+            // the place-address walker in `rvalue.rs`.
+            let struct_model = translate_type(ctx, pointee)?;
+            Ok(MirSliceType::get(ctx, struct_model).into())
+        }
         _ => {
             let pointee_ty = translate_type(ctx, pointee)?;
             Ok(MirPtrType::get_generic(ctx, pointee_ty, is_mutable).into())
@@ -206,7 +405,7 @@ fn shared_array_element_type(
     ctx: &mut Context,
     substs: &rustc_public::ty::GenericArgs,
     label: &'static str,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     for arg in substs.0.iter() {
         if let rustc_public::ty::GenericArgKind::Type(t) = arg {
             return translate_type(ctx, t);
@@ -218,13 +417,44 @@ fn shared_array_element_type(
     )))
 }
 
+/// Translates the type of a call's destination place to its `dialect-mir`
+/// equivalent.
+///
+/// Call results are typed from the destination in the caller's monomorphized
+/// MIR, not from the callee's declared signature. A trait method's declared
+/// signature types its result against the trait, so it can contain an
+/// associated-type projection that is not yet resolved to a concrete type,
+/// for example `<&Foo as Mul>::Output` (issue #133). The destination local
+/// already carries the concrete type rustc resolved during monomorphization,
+/// and it is by construction the slot the call result is stored into, so the
+/// call result type and the destination slot always agree.
+pub fn translate_destination_type(
+    ctx: &mut Context,
+    body: &rustc_public::mir::Body,
+    destination: &rustc_public::mir::Place,
+    loc: &pliron::location::Location,
+) -> TranslationResult<TypeHandle> {
+    let dest_rust_ty = match destination.ty(body.locals()) {
+        Ok(t) => t,
+        Err(e) => {
+            return pliron::input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "failed to resolve destination type for call result: {e:?}"
+                ))
+            );
+        }
+    };
+    translate_type(ctx, &dest_rust_ty)
+}
+
 /// Translates a Rust type to its `dialect-mir` equivalent.
 ///
 /// See module documentation for the type mapping table.
 pub fn translate_type(
     ctx: &mut Context,
     rust_ty: &rustc_public::ty::Ty,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     let ty_kind = rust_ty.kind();
 
     match ty_kind {
@@ -346,7 +576,41 @@ pub fn translate_type(
             for subtype in subtypes.iter() {
                 translated_subtypes.push(translate_type(ctx, subtype)?);
             }
-            Ok(MirTupleType::get(ctx, translated_subtypes).into())
+            if translated_subtypes.is_empty() {
+                // The unit tuple is zero-sized: keep it layout-less so the
+                // synthetic unit tuples built for `!`, intrinsic results,
+                // and unit returns unify with it.
+                return Ok(MirTupleType::get(ctx, vec![]).into());
+            }
+            // rustc may reorder tuple fields in memory exactly like
+            // `#[repr(Rust)]` struct fields. Record the layout it chose,
+            // harvested the same way as the struct/union/closure arms, so
+            // byte-observing lowerings (enum slot maps, initialized
+            // globals) see the real field placement.
+            let (mem_to_decl, field_offsets, total_size, abi_align) =
+                if let Ok(layout) = rust_ty.layout() {
+                    let shape = layout.shape();
+                    let mem_order = shape.fields.fields_by_offset_order();
+                    let offsets: Vec<u64> = match &shape.fields {
+                        rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
+                            offsets.iter().map(|s| s.bytes() as u64).collect()
+                        }
+                        _ => vec![],
+                    };
+                    let size: u64 = shape.size.bytes() as u64;
+                    (mem_order, offsets, size, shape.abi_align)
+                } else {
+                    (vec![], vec![], 0u64, 0u64)
+                };
+            Ok(MirTupleType::get_with_layout(
+                ctx,
+                translated_subtypes,
+                mem_to_decl,
+                field_offsets,
+                total_size,
+                abi_align,
+            )
+            .into())
         }
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Array(elem_ty, len_const)) => {
             // Translate the element type
@@ -454,14 +718,60 @@ pub fn translate_type(
                     64,
                     pliron::builtin::types::Signedness::Unsigned,
                 );
-                Ok(dialect_llvm::types::ArrayType::get(ctx, i64_ty.into(), 16).into())
+                Ok(llvm_export::types::ArrayType::get(ctx, i64_ty.into(), 16).into())
             } else {
                 // Generic ADT handling for user-defined structs and enums
                 let variants = adt_def.variants();
 
-                if variants.len() == 1 {
-                    // Structs have exactly one variant
-                    let variant = &variants[0];
+                if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
+                    let variant = variants.first().ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Union {} has no field variant",
+                            trimmed_name
+                        )))
+                    })?;
+                    let fields = variant.fields();
+                    let mut field_names = Vec::with_capacity(fields.len());
+                    let mut field_types = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        field_names.push(field.name.to_string());
+                        field_types.push(translate_type(ctx, &field.ty_with_args(&substs))?);
+                    }
+
+                    let layout = rust_ty.layout().map_err(|e| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Failed to query union layout for {}: {:?}",
+                            trimmed_name, e
+                        )))
+                    })?;
+                    let shape = layout.shape();
+                    if let rustc_public::abi::FieldsShape::Arbitrary { offsets } = &shape.fields
+                        && offsets.iter().any(|offset| offset.bytes() != 0)
+                    {
+                        return input_err_noloc!(TranslationErr::unsupported(format!(
+                            "Union {} has a non-zero field offset in rustc's layout",
+                            trimmed_name
+                        )));
+                    }
+
+                    Ok(MirUnionType::get(
+                        ctx,
+                        trimmed_name.to_string(),
+                        field_names,
+                        field_types,
+                        shape.size.bytes() as u64,
+                        shape.abi_align,
+                    )
+                    .into())
+                } else if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Struct) {
+                    // Dispatch on the ADT kind, not variant count: a Rust enum
+                    // may legitimately have zero or one source variants.
+                    let variant = variants.first().ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Struct {} has no field variant",
+                            trimmed_name
+                        )))
+                    })?;
                     let fields = variant.fields();
 
                     // Extract field names and types (in declaration order)
@@ -474,12 +784,30 @@ pub fn translate_type(
 
                         // Get field type, instantiated with the ADT's generic args
                         let field_ty = field.ty_with_args(&substs);
-                        let translated_ty = translate_type(ctx, &field_ty)?;
+                        let translated_ty = if let rustc_public::ty::TyKind::RigidTy(
+                            rustc_public::ty::RigidTy::Slice(elem_ty),
+                        ) = field_ty.kind()
+                        {
+                            // A slice-typed field can only be the struct's
+                            // unsized tail (Rust allows `[T]` only as the
+                            // last field). The tail's elements live INLINE
+                            // after the sized prefix, so we record the
+                            // ELEMENT type here: the field's address (from
+                            // rustc's layout offset) is then a pointer to
+                            // the first element, which is exactly what a
+                            // reborrow of the tail needs. Recording the
+                            // generic `[T]` fat-pair type instead would make
+                            // field addressing produce a pointer to a
+                            // (ptr, len) pair that does not exist in memory.
+                            translate_type(ctx, &elem_ty)?
+                        } else {
+                            translate_type(ctx, &field_ty)?
+                        };
                         field_types.push(translated_ty);
                     }
 
                     // Query rustc for complete memory layout info
-                    let (mem_to_decl, field_offsets, total_size) =
+                    let (mem_to_decl, field_offsets, total_size, abi_align) =
                         if let Ok(layout) = rust_ty.layout() {
                             let shape = layout.shape();
 
@@ -496,10 +824,9 @@ pub fn translate_type(
 
                             // Total struct size (bytes)
                             let size: u64 = shape.size.bytes() as u64;
-
-                            (mem_order, offsets, size)
+                            (mem_order, offsets, size, shape.abi_align)
                         } else {
-                            (vec![], vec![], 0u64)
+                            (vec![], vec![], 0u64, 0u64)
                         };
 
                     // Create the struct type with full layout info
@@ -511,44 +838,313 @@ pub fn translate_type(
                         mem_to_decl,
                         field_offsets,
                         total_size,
+                        abi_align,
                     )
                     .into())
                 } else {
-                    // Enums have multiple variants
-                    // Determine discriminant type based on number of variants
-                    let discriminant_bits = if variants.len() <= 256 {
-                        8
-                    } else if variants.len() <= 65536 {
-                        16
-                    } else {
-                        32
-                    };
-                    let discriminant_ty = pliron::builtin::types::IntegerType::get(
-                        ctx,
-                        discriminant_bits,
-                        pliron::builtin::types::Signedness::Unsigned,
-                    );
+                    debug_assert!(matches!(adt_def.kind(), rustc_public::ty::AdtKind::Enum));
+                    // Enums may have zero, one, or multiple source variants.
+                    //
+                    // The discriminant ("tag") type comes from rustc's layout,
+                    // never from a guess: `#[repr(uN/iN)]` (width AND
+                    // signedness), `#[repr(usize/isize)]`, `#[repr(C)]`,
+                    // sparse discriminants (`enum E { A = 0, B = 1_000_000 }`
+                    // gets a u32 tag) and negative discriminants
+                    // (`enum E { N = -1, Z = 0 }` gets a SIGNED i8 tag, so a
+                    // later `e as i32` sign-extends instead of zero-extending)
+                    // all fall out of the single `TagEncoding::Direct` arm
+                    // below.
+                    let enum_name = trimmed_name.to_string();
+                    let layout_shape = rust_ty
+                        .layout()
+                        .map_err(|e| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Failed to query enum layout for {}: {:?}",
+                                enum_name, e
+                            )))
+                        })?
+                        .shape();
 
-                    // Translate each variant
+                    // Logical discriminant used by the MIR operation for
+                    // layouts that have no direct integer tag. This is not
+                    // part of the enum's storage; the physical carrier is
+                    // recorded separately below.
+                    let declared_discriminant =
+                        rust_ty.kind().discriminant_ty().ok_or_else(|| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Failed to resolve declared discriminant type for {}",
+                                enum_name
+                            )))
+                        })?;
+                    let logical_discriminant_ty = translate_type(ctx, &declared_discriminant)?;
+                    let total_size = layout_shape.size.bytes() as u64;
+                    let abi_align = layout_shape.abi_align;
+
+                    let layout_kind;
+                    let mut carrier_kind = dialect_mir::types::EnumCarrierKind::None;
+                    let mut carrier_width = 0u32;
+                    let mut carrier_address_space = 0u32;
+                    let mut tag_offset = 0u64;
+                    let mut niche_start = 0u128;
+                    let mut niche_variant_start = 0u32;
+                    let mut niche_variant_end = 0u32;
+                    let mut untagged_variant = 0u32;
+                    let mut single_variant = 0u32;
+                    let mut variant_inhabited = vec![false; variants.len()];
+
+                    let discriminant_ty: TypeHandle = match &layout_shape.variants {
+                        rustc_public::abi::VariantsShape::Multiple {
+                            tag,
+                            tag_encoding: rustc_public::abi::TagEncoding::Direct,
+                            tag_field,
+                            ..
+                        } => {
+                            let primitive = match tag {
+                                rustc_public::abi::Scalar::Initialized { value, .. }
+                                | rustc_public::abi::Scalar::Union { value } => *value,
+                            };
+                            let rustc_public::abi::Primitive::Int { length, signed } = primitive
+                            else {
+                                return input_err_noloc!(TranslationErr::unsupported(format!(
+                                    "Direct enum tag for {} is not an integer: {:?}",
+                                    enum_name, primitive
+                                )));
+                            };
+                            layout_kind = dialect_mir::types::EnumLayoutKind::Direct;
+                            carrier_kind = dialect_mir::types::EnumCarrierKind::Integer;
+                            carrier_width = length.bits() as u32;
+                            tag_offset = crate::translator::layout::enum_tag_offset(
+                                &layout_shape.fields,
+                                *tag_field,
+                                pliron::location::Location::Unknown,
+                            )? as u64;
+                            pliron::builtin::types::IntegerType::get(
+                                ctx,
+                                carrier_width,
+                                if signed {
+                                    pliron::builtin::types::Signedness::Signed
+                                } else {
+                                    pliron::builtin::types::Signedness::Unsigned
+                                },
+                            )
+                            .into()
+                        }
+                        rustc_public::abi::VariantsShape::Multiple {
+                            tag,
+                            tag_encoding:
+                                rustc_public::abi::TagEncoding::Niche {
+                                    untagged_variant: rustc_untagged,
+                                    niche_variants,
+                                    niche_start: rustc_niche_start,
+                                },
+                            tag_field,
+                            ..
+                        } => {
+                            let primitive = match tag {
+                                rustc_public::abi::Scalar::Initialized { value, .. }
+                                | rustc_public::abi::Scalar::Union { value } => *value,
+                            };
+                            layout_kind = dialect_mir::types::EnumLayoutKind::Niche;
+                            tag_offset = crate::translator::layout::enum_tag_offset(
+                                &layout_shape.fields,
+                                *tag_field,
+                                pliron::location::Location::Unknown,
+                            )? as u64;
+                            carrier_width = primitive
+                                .size(&rustc_public::target::MachineInfo::target())
+                                .bits() as u32;
+                            match primitive {
+                                rustc_public::abi::Primitive::Int { .. } => {
+                                    carrier_kind = dialect_mir::types::EnumCarrierKind::Integer;
+                                }
+                                rustc_public::abi::Primitive::Pointer(address_space) => {
+                                    carrier_kind = dialect_mir::types::EnumCarrierKind::Pointer;
+                                    carrier_address_space = address_space.0;
+                                    if carrier_address_space == 3 {
+                                        return input_err_noloc!(TranslationErr::unsupported(
+                                            format!(
+                                                "Niche pointer carrier for {} is in shared address space 3, whose width differs between PTX/legacy and modern NVVM; target-agnostic enum lowering cannot represent it",
+                                                enum_name
+                                            )
+                                        ));
+                                    }
+                                    if carrier_width != 64 {
+                                        return input_err_noloc!(TranslationErr::unsupported(
+                                            format!(
+                                                "Niche pointer carrier for {} is {} bits in address space {}; cuda-oxide requires 64-bit non-shared pointers",
+                                                enum_name, carrier_width, carrier_address_space
+                                            )
+                                        ));
+                                    }
+                                }
+                                rustc_public::abi::Primitive::Float { .. } => {
+                                    return input_err_noloc!(TranslationErr::unsupported(format!(
+                                        "Niche carrier for {} is a floating-point scalar",
+                                        enum_name
+                                    )));
+                                }
+                            }
+                            niche_start = *rustc_niche_start;
+                            niche_variant_start = niche_variants.start().to_index() as u32;
+                            niche_variant_end = niche_variants.end().to_index() as u32;
+                            untagged_variant = rustc_untagged.to_index() as u32;
+                            logical_discriminant_ty
+                        }
+                        rustc_public::abi::VariantsShape::Single { index } => {
+                            layout_kind = dialect_mir::types::EnumLayoutKind::Single;
+                            single_variant = index.to_index() as u32;
+                            logical_discriminant_ty
+                        }
+                        rustc_public::abi::VariantsShape::Empty => {
+                            layout_kind = dialect_mir::types::EnumLayoutKind::Empty;
+                            logical_discriminant_ty
+                        }
+                    };
+
+                    // Declared discriminant VALUES (not variant indices).
+                    // Stable MIR exposes negative values sign-extended in a
+                    // u128, so Direct, Single, and all-uninhabited Empty
+                    // layouts must mask them to the width rustc actually
+                    // uses. Empty may still have source variants; it merely
+                    // has no valid physical value. The dialect currently
+                    // stores discriminants in u64, so reject wider forms
+                    // explicitly rather than silently aliasing them (#306).
+                    let logical_width = discriminant_ty
+                        .deref(ctx)
+                        .downcast_ref::<pliron::builtin::types::IntegerType>()
+                        .map(pliron::builtin::types::IntegerType::width)
+                        .ok_or_else(|| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Enum {} has a non-integer logical discriminant",
+                                enum_name
+                            )))
+                        })?;
+                    let mut variant_discriminants = Vec::with_capacity(variants.len());
+                    for idx in 0..variants.len() {
+                        let variant_idx = rustc_public::ty::VariantIdx::to_val(idx);
+                        let discr = adt_def.discriminant_for_variant(variant_idx);
+                        let discr_val = match layout_kind {
+                            dialect_mir::types::EnumLayoutKind::Niche => {
+                                if discr.val != idx as u128 {
+                                    return input_err_noloc!(TranslationErr::unsupported(format!(
+                                        "Niche enum {} has declared discriminant {} for variant {}; rustc niche encoding requires discriminant == variant index",
+                                        enum_name, discr.val, idx
+                                    )));
+                                }
+                                idx as u64
+                            }
+                            dialect_mir::types::EnumLayoutKind::Direct
+                            | dialect_mir::types::EnumLayoutKind::Single
+                            | dialect_mir::types::EnumLayoutKind::Empty => {
+                                let width =
+                                    if layout_kind == dialect_mir::types::EnumLayoutKind::Direct {
+                                        carrier_width
+                                    } else {
+                                        logical_width
+                                    };
+                                if width > 64 {
+                                    return input_err_noloc!(TranslationErr::unsupported(format!(
+                                        "Enum {} uses a {}-bit discriminant; widths above 64 bits are not yet represented losslessly (issue #306)",
+                                        enum_name, width
+                                    )));
+                                }
+                                let mask = if width == 64 {
+                                    u128::from(u64::MAX)
+                                } else {
+                                    (1u128 << width) - 1
+                                };
+                                (discr.val & mask) as u64
+                            }
+                            _ => unreachable!("importer always records a known enum layout"),
+                        };
+                        variant_discriminants.push(discr_val);
+                    }
+
+                    // Translate each variant and record where every field
+                    // lives, using the same shared helper constant decoding
+                    // uses. Known Empty/Single layouts may have size zero.
+                    // Positions repeat across variants: variants share
+                    // bytes, since only one is alive at a time.
                     let mut enum_variants = Vec::with_capacity(variants.len());
-                    for variant in variants.iter() {
+                    for (variant_idx, variant) in variants.iter().enumerate() {
                         let fields = variant.fields();
                         let mut field_types = Vec::with_capacity(fields.len());
+                        let mut field_sizes = Vec::with_capacity(fields.len());
+                        let mut inhabited = true;
                         for field in fields {
                             let field_ty = field.ty_with_args(&substs);
+                            let field_layout = field_ty.layout().map_err(|e| {
+                                input_error_noloc!(TranslationErr::unsupported(format!(
+                                    "Failed to query layout of field in {} variant {}: {:?}",
+                                    enum_name, variant_idx, e
+                                )))
+                            })?;
+                            if !monomorphized_ty_is_inhabited(&field_ty)? {
+                                inhabited = false;
+                            }
+                            field_sizes.push(field_layout.shape().size.bytes() as u64);
                             let translated_ty = translate_type(ctx, &field_ty)?;
                             field_types.push(translated_ty);
                         }
-                        enum_variants
-                            .push(EnumVariant::new(variant.name().to_string(), field_types));
+                        if matches!(
+                            layout_kind,
+                            dialect_mir::types::EnumLayoutKind::Direct
+                                | dialect_mir::types::EnumLayoutKind::Niche
+                                | dialect_mir::types::EnumLayoutKind::Single
+                        ) {
+                            variant_inhabited[variant_idx] = inhabited;
+                        }
+                        let field_offsets: Vec<u64> = match &layout_shape.variants {
+                            rustc_public::abi::VariantsShape::Single { index }
+                                if index.to_index() != variant_idx =>
+                            {
+                                vec![0; field_types.len()]
+                            }
+                            rustc_public::abi::VariantsShape::Empty => {
+                                vec![0; field_types.len()]
+                            }
+                            _ => crate::translator::layout::enum_variant_field_offsets(
+                                &layout_shape,
+                                variant_idx,
+                                pliron::location::Location::Unknown,
+                            )?
+                            .into_iter()
+                            .map(|o| o as u64)
+                            .collect(),
+                        };
+                        enum_variants.push(EnumVariant::new_with_layout(
+                            variant.name().to_string(),
+                            field_types,
+                            field_offsets,
+                            field_sizes,
+                        ));
                     }
 
                     // Create the enum type
-                    Ok(MirEnumType::get(
+                    Ok(MirEnumType::get_with_encoding(
                         ctx,
-                        trimmed_name.to_string(),
-                        discriminant_ty.into(),
+                        enum_name,
+                        discriminant_ty,
+                        variant_discriminants,
                         enum_variants,
+                        EnumEncoding {
+                            tag_offset,
+                            total_size,
+                            abi_align,
+                            layout_kind,
+                            carrier_kind,
+                            carrier_width,
+                            carrier_address_space,
+                            niche_start,
+                            niche_variant_start,
+                            niche_variant_end,
+                            untagged_variant,
+                            single_variant,
+                            variant_inhabited: variant_inhabited
+                                .into_iter()
+                                .map(u8::from)
+                                .collect(),
+                        },
                     )
                     .into())
                 }
@@ -557,35 +1153,58 @@ pub fn translate_type(
         // Handle Closure types
         // Closures are represented as structs with fields for each captured variable (upvar).
         // The substs for a closure contain:
-        //   [0] Internal marker type (usually i8)
-        //   [1] Function signature
-        //   [2] Tuple of upvar types (the captured variables)
+        //   [parent_args..] Captured parent generics, when the closure appears in a generic item
+        //   [n - 3] Closure kind
+        //   [n - 2] Function signature
+        //   [n - 1] Tuple of upvar types (the captured variables)
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(
             closure_def,
             substs,
         )) => {
             let closure_name = format!("{:?}", closure_def.def_id());
 
-            // Extract upvar types from substs[2] (the tuple of captured types)
+            // Extract upvar types from the tupled-upvars generic arg.
             let mut field_names = Vec::new();
             let mut field_types = Vec::new();
 
-            if substs.0.len() >= 3
-                && let rustc_public::ty::GenericArgKind::Type(upvar_tuple_ty) = &substs.0[2]
-                && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Tuple(
-                    upvar_tys,
-                )) = upvar_tuple_ty.kind()
-            {
+            if let Some(upvar_tys) = closure_upvar_tys(&substs) {
                 for (i, upvar_ty) in upvar_tys.iter().enumerate() {
                     field_names.push(format!("capture_{}", i));
                     field_types.push(translate_type(ctx, upvar_ty)?);
                 }
             }
 
-            Ok(
-                dialect_mir::types::MirStructType::get(ctx, closure_name, field_names, field_types)
-                    .into(),
+            let (mem_to_decl, field_offsets, total_size, abi_align) =
+                if let Ok(layout) = rust_ty.layout() {
+                    let shape = layout.shape();
+                    let mem_to_decl = shape.fields.fields_by_offset_order();
+                    let field_offsets = match &shape.fields {
+                        rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
+                            offsets.iter().map(|offset| offset.bytes() as u64).collect()
+                        }
+                        _ => vec![],
+                    };
+                    (
+                        mem_to_decl,
+                        field_offsets,
+                        shape.size.bytes() as u64,
+                        shape.abi_align,
+                    )
+                } else {
+                    (vec![], vec![], 0, 0)
+                };
+
+            Ok(dialect_mir::types::MirStructType::get_with_full_layout(
+                ctx,
+                closure_name,
+                field_names,
+                field_types,
+                mem_to_decl,
+                field_offsets,
+                total_size,
+                abi_align,
             )
+            .into())
         }
         // Handle associated types like <SharedArray<f32, 256> as Index<usize>>::Output
         // or <Closure as FnOnce<(Args,)>>::Output
@@ -645,51 +1264,83 @@ pub fn translate_type(
                 }
             }
 
-            // For arithmetic trait outputs (Mul::Output, Add::Output, Sub::Output, etc.)
-            // When monomorphized with primitive types, these resolve to the self type.
-            // E.g., <f32 as Mul>::Output = f32, <i32 as Add>::Output = i32
+            // No guessing for other associated-type projections. An earlier
+            // version of this code assumed that arithmetic-trait outputs
+            // (`Mul::Output`, `Add::Output`, ...) always equal the self type.
+            // That assumption is wrong in general: `impl Mul for &Foo` with
+            // `type Output = Foo` (issue #133) has Output != Self, and so
+            // does any `impl Mul for Meters { type Output = SquareMeters }`.
+            // Guessing the self type there silently mistypes the value (a
+            // miscompile), so we fail loudly instead.
             //
-            // This handles: Mul, Add, Sub, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Neg, Not
-            // The def_name format can be either:
-            //   - "std::ops::Mul::Output" (from std re-export)
-            //   - "core::ops::Mul::Output" (from core directly)
-            let is_arith_output = (def_name.contains("std::ops::")
-                || def_name.contains("core::ops::"))
-                && (def_name.contains("Mul::Output")
-                    || def_name.contains("Add::Output")
-                    || def_name.contains("Sub::Output")
-                    || def_name.contains("Div::Output")
-                    || def_name.contains("Rem::Output")
-                    || def_name.contains("BitAnd::Output")
-                    || def_name.contains("BitOr::Output")
-                    || def_name.contains("BitXor::Output")
-                    || def_name.contains("Shl::Output")
-                    || def_name.contains("Shr::Output")
-                    || def_name.contains("Neg::Output")
-                    || def_name.contains("Not::Output"));
-
-            if is_arith_output {
-                // The self type is the first generic argument
-                let args = &alias_ty.args.0;
-                if let Some(rustc_public::ty::GenericArgKind::Type(self_ty)) = args.first() {
-                    // For primitive types implementing arithmetic traits, Output = Self
-                    if let rustc_public::ty::TyKind::RigidTy(
-                        rustc_public::ty::RigidTy::Int(_)
-                        | rustc_public::ty::RigidTy::Uint(_)
-                        | rustc_public::ty::RigidTy::Float(_)
-                        | rustc_public::ty::RigidTy::Bool
-                        | rustc_public::ty::RigidTy::Char,
-                    ) = self_ty.kind()
-                    {
-                        return translate_type(ctx, self_ty);
-                    }
-                }
-            }
-
+            // Projections should not normally reach this point at all: call
+            // results are typed from the caller's destination place (see
+            // `translate_destination_type`), which rustc has already
+            // normalized to a concrete type. Hitting this error means some
+            // code path handed the type translator an unnormalized type
+            // taken from a declared trait signature. Fix that path to use
+            // the normalized type (destination place, or the signature of
+            // the resolved `Instance`) rather than teaching this function
+            // to guess what the projection resolves to.
             input_err_noloc!(TranslationErr::unsupported(format!(
                 "Alias type not yet supported: {:?}",
                 alias_ty.def_id
             )))
+        }
+        // Pattern types (e.g. the storage of `NonZeroUsize` is `Pat<usize, 1..=usize::MAX>`).
+        //
+        // Layout assumption: a `Pat<T, P>` has the same size and alignment as
+        // its base `T`; the pattern only restricts the set of valid values
+        // (used by rustc for niche optimisation in enclosing enums). For
+        // memory layout, lowering it as the base type is sound, and the
+        // niche metadata that rustc relies on is consumed when we query
+        // `ty.layout()` on the enclosing ADT, not here.
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Pat(base_ty, _pat)) => {
+            translate_type(ctx, &base_ty)
+        }
+        // `str` is an unsized byte sequence (appears in dead panic-message
+        // branches). Translate as a `[u8]`-style slice.
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
+            let u8_ty = pliron::builtin::types::IntegerType::get(
+                ctx,
+                8,
+                pliron::builtin::types::Signedness::Unsigned,
+            )
+            .into();
+            Ok(MirSliceType::get(ctx, u8_ty).into())
+        }
+        // Function pointer type (e.g. `fmt` fn ptrs in dead panic-formatting
+        // branches): a thin opaque pointer.
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnPtr(_)) => {
+            let target = dialect_mir::types::MirStructType::get_with_full_layout(
+                ctx,
+                "FnPtrTarget".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
+            )
+            .into();
+            Ok(dialect_mir::types::MirPtrType::get_generic(ctx, target, false).into())
+        }
+        // Zero-sized function-item type. Appears only type-level (e.g. dead
+        // panic/formatting branches pulled in by `assert!` inside core fns like
+        // `f32::clamp`); never materialised as a value.
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) => {
+            let name = format!("FnDef_{:?}", fn_def.def_id());
+            Ok(dialect_mir::types::MirStructType::get_with_full_layout(
+                ctx,
+                name,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
+            )
+            .into())
         }
         _ => input_err_noloc!(TranslationErr::unsupported(format!(
             "Type translation not yet implemented for: {:?}",

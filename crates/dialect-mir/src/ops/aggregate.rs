@@ -27,6 +27,7 @@ use pliron_derive::pliron_op;
 use crate::attributes::FieldIndexAttr;
 use crate::types::{
     MirArrayType, MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType, MirTupleType,
+    MirUnionType,
 };
 
 // ============================================================================
@@ -109,7 +110,7 @@ impl Verify for MirExtractFieldOp {
                 return verify_err!(op.loc(), "MirExtractFieldOp index out of bounds for tuple");
             }
             let expected_ty = types[index];
-            // Types are Ptr<TypeObj>, can compare directly
+            // Types are TypeHandle, can compare directly
             if res_ty != expected_ty {
                 return verify_err!(
                     op.loc(),
@@ -199,6 +200,27 @@ impl Verify for MirExtractFieldOp {
                     op.loc(),
                     "MirExtractFieldOp result type mismatch for struct field '{}'. Expected: {}, Actual: {}",
                     struct_ty.field_names()[index],
+                    expected_ty.disp(ctx),
+                    res_ty.disp(ctx)
+                );
+            }
+        } else if let Some(union_ty) = operand_ty_obj.downcast_ref::<MirUnionType>() {
+            let field_count = union_ty.field_count();
+            if index >= field_count {
+                return verify_err!(
+                    op.loc(),
+                    "MirExtractFieldOp index {} out of bounds for union '{}' with {} fields",
+                    index,
+                    union_ty.name(),
+                    field_count
+                );
+            }
+            let expected_ty = union_ty.get_field_type(index).unwrap();
+            if res_ty != expected_ty {
+                return verify_err!(
+                    op.loc(),
+                    "MirExtractFieldOp result type mismatch for union field '{}'. Expected: {}, Actual: {}",
+                    union_ty.field_names()[index],
                     expected_ty.disp(ctx),
                     res_ty.disp(ctx)
                 );
@@ -365,6 +387,27 @@ impl Verify for MirInsertFieldOp {
                     op.loc(),
                     "MirInsertFieldOp field type mismatch for struct field '{}'. Expected: {}, Actual: {}",
                     struct_ty.field_names()[index],
+                    expected_ty.disp(ctx),
+                    new_value_ty.disp(ctx)
+                );
+            }
+        } else if let Some(union_ty) = aggregate_ty_obj.downcast_ref::<MirUnionType>() {
+            let field_count = union_ty.field_count();
+            if index >= field_count {
+                return verify_err!(
+                    op.loc(),
+                    "MirInsertFieldOp index {} out of bounds for union '{}' with {} fields",
+                    index,
+                    union_ty.name(),
+                    field_count
+                );
+            }
+            let expected_ty = union_ty.get_field_type(index).unwrap();
+            if new_value_ty != expected_ty {
+                return verify_err!(
+                    op.loc(),
+                    "MirInsertFieldOp field type mismatch for union field '{}'. Expected: {}, Actual: {}",
+                    union_ty.field_names()[index],
                     expected_ty.disp(ctx),
                     new_value_ty.disp(ctx)
                 );
@@ -582,6 +625,135 @@ impl Verify for MirConstructTupleOp {
 }
 
 // ============================================================================
+// MirConstructSliceOp
+// ============================================================================
+
+/// MIR construct slice operation.
+///
+/// Constructs a slice fat pointer (`&[T]` / `*const [T]` / `*mut [T]`) from
+/// a data pointer and a length.
+///
+/// # Why This Op Exists
+///
+/// Re-slicing in Rust (`&bytes[2..]`) goes through core's
+/// `slice::index::get_offset_len_noubcheck`, which calls the
+/// `aggregate_raw_ptr` intrinsic. Rustc lowers that intrinsic to
+/// `Rvalue::Aggregate(AggregateKind::RawPtr(..), [data_ptr, len])` in MIR.
+/// The same MIR shape is produced by `ptr::slice_from_raw_parts` and
+/// `ptr::from_raw_parts`. This op represents that fat-pointer construction
+/// in `dialect-mir`.
+///
+/// # Example
+///
+/// ```text
+/// Rust:         let tail: &[u8] = &bytes[2..];
+/// Rust MIR:     _tail = *const [u8] from (_ptr, _len)
+/// dialect-mir:  %tail = mir.construct_slice (%ptr, %len) : mir.slice<u8>
+/// ```
+///
+/// # Operands
+///
+/// ```text
+/// | Index | Name   | Type                       | Description              |
+/// |-------|--------|----------------------------|--------------------------|
+/// | 0     | `ptr`  | MirPtrType<T>              | Data pointer             |
+/// | 1     | `len`  | Integer type (usize)       | Number of elements       |
+/// ```
+///
+/// # Results
+///
+/// ```text
+/// | Name  | Type            |
+/// |-------|-----------------|
+/// | `res` | MirSliceType<T> |
+/// ```
+///
+/// # LLVM Lowering
+///
+/// `MirSliceType` lowers to the fat-pointer struct `{ ptr, i64 }`, so this
+/// op becomes `llvm.undef` + two `llvm.insertvalue` operations:
+/// ```text
+/// %u  = llvm.undef : { ptr, i64 }
+/// %t  = llvm.insertvalue %u, %ptr, [0]
+/// %s  = llvm.insertvalue %t, %len, [1]
+/// ```
+///
+/// # Verification
+///
+/// - Result type must be a slice type.
+/// - Operand 0 must be a pointer whose pointee is the slice element type.
+/// - Operand 1 must be an integer type.
+#[pliron_op(
+    name = "mir.construct_slice",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>, OneResultInterface]
+)]
+pub struct MirConstructSliceOp;
+
+impl MirConstructSliceOp {
+    /// Create a new MirConstructSliceOp wrapper.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MirConstructSliceOp { op }
+    }
+}
+
+impl Verify for MirConstructSliceOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = &*self.get_operation().deref(ctx);
+
+        // Result must be a slice type
+        let result = op.get_result(0);
+        let result_ty = result.get_type(ctx);
+        let result_ty_obj = result_ty.deref(ctx);
+
+        let slice_ty = match result_ty_obj.downcast_ref::<MirSliceType>() {
+            Some(st) => st,
+            None => {
+                return verify_err!(op.loc(), "MirConstructSliceOp result must be a slice type");
+            }
+        };
+
+        // Operand 0 must be a pointer to the slice element type
+        let ptr_operand = op.get_operand(0);
+        let ptr_ty = ptr_operand.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+        match ptr_ty_obj.downcast_ref::<MirPtrType>() {
+            Some(ptr_ty) => {
+                if ptr_ty.pointee != slice_ty.element_ty {
+                    return verify_err!(
+                        op.loc(),
+                        "MirConstructSliceOp data pointer pointee mismatch. Expected: {}, Actual: {}",
+                        slice_ty.element_ty.disp(ctx),
+                        ptr_ty.pointee.disp(ctx)
+                    );
+                }
+            }
+            None => {
+                return verify_err!(
+                    op.loc(),
+                    "MirConstructSliceOp operand 0 must be a pointer type, got: {}",
+                    ptr_ty.disp(ctx)
+                );
+            }
+        }
+
+        // Operand 1 must be an integer type (the length)
+        let len_operand = op.get_operand(1);
+        let len_ty = len_operand.get_type(ctx);
+        let len_ty_obj = len_ty.deref(ctx);
+        if len_ty_obj.downcast_ref::<IntegerType>().is_none() {
+            return verify_err!(
+                op.loc(),
+                "MirConstructSliceOp operand 1 (length) must be an integer type, got: {}",
+                len_ty.disp(ctx)
+            );
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // MirConstructArrayOp
 // ============================================================================
 
@@ -593,7 +765,7 @@ impl Verify for MirConstructTupleOp {
 ///
 /// Rust array literals like `[1.0, 2.0, 3.0, 4.0]` compile to
 /// `AggregateKind::Array` in rustc's MIR. This op represents that construct
-/// in `dialect-mir`, before lowering to `dialect-llvm`.
+/// in `dialect-mir`, before lowering to the LLVM dialect.
 ///
 /// # Example
 ///
@@ -904,27 +1076,28 @@ impl Verify for MirFieldAddrOp {
             }
         };
 
-        // Pointee must be a struct type
+        // Pointee must be a struct or union type.
         let pointee_ty = ptr_type.pointee;
         let pointee_ty_obj = pointee_ty.deref(ctx);
-        let struct_ty = match pointee_ty_obj.downcast_ref::<MirStructType>() {
-            Some(s) => s,
-            None => {
-                return verify_err!(
-                    op.loc(),
-                    "MirFieldAddrOp pointer must point to a struct type, got: {}",
-                    pointee_ty.disp(ctx)
-                );
-            }
-        };
 
         let index = match self.get_attr_field_index(ctx) {
             Some(attr) => attr.0 as usize,
             None => return verify_err!(op.loc(), "MirFieldAddrOp missing field_index attribute"),
         };
 
-        // Index must be valid
-        let field_types = struct_ty.field_types();
+        let field_types = if let Some(struct_ty) = pointee_ty_obj.downcast_ref::<MirStructType>() {
+            struct_ty.field_types()
+        } else if let Some(union_ty) = pointee_ty_obj.downcast_ref::<MirUnionType>() {
+            union_ty.field_types()
+        } else {
+            return verify_err!(
+                op.loc(),
+                "MirFieldAddrOp pointer must point to a struct or union type, got: {}",
+                pointee_ty.disp(ctx)
+            );
+        };
+
+        // Index must be valid.
         if index >= field_types.len() {
             return verify_err!(
                 op.loc(),
@@ -1114,6 +1287,7 @@ pub fn register(ctx: &mut Context) {
     MirInsertFieldOp::register(ctx);
     MirConstructStructOp::register(ctx);
     MirConstructTupleOp::register(ctx);
+    MirConstructSliceOp::register(ctx);
     MirConstructArrayOp::register(ctx);
     MirExtractArrayElementOp::register(ctx);
     MirFieldAddrOp::register(ctx);

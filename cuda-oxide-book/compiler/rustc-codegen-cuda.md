@@ -89,7 +89,7 @@ in a crowd. The exact prefix strings (and the helpers that match and strip
 them) live in the workspace-internal `reserved-oxide-symbols` crate; both the
 macro side and the collector side import from there so the contract stays in
 one place. The 8-hex-char `<hash>` makes accidental collisions effectively
-impossible: nobody writes `cuda_oxide_kernel_246e25db_foo` by accident.
+impossible: nobody writes `cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_foo` by accident.
 
 ### Step 3: If Device Code Found, Build and Compile
 
@@ -103,8 +103,8 @@ called from device code. More on this in {ref}`Device Function Collection
 
 **b) Generate device code.**
 `device_codegen::generate_device_code()` bridges the collected functions to
-stable MIR and runs the full cuda-oxide pipeline (`dialect-mir` -> `mem2reg`
--> `dialect-llvm` -> `.ll` -> PTX).
+stable MIR and runs the full cuda-oxide pipeline (`dialect-mir` -> `mem2reg` ->
+annotated loop unroll -> LLVM dialect -> `.ll` -> PTX).
 
 ### Step 4: Always Compile Host Code
 
@@ -213,10 +213,12 @@ name is used instead -- this is unique and already a valid identifier.
 Kernel entry points follow a separate path: `compute_kernel_export_name`
 takes the `#[kernel]` macro's base name and, for generic and closure-
 generic instantiations, appends `_TID_<hex32>` where `<hex32>` is
-rustc's 128-bit type-id hash of the tuple of generic arguments. The
-host launcher computes the same hash through the `core::intrinsics::type_id`
-intrinsic (wrapped by `cuda_host::type_id_u128`), so both sides agree
-byte-for-byte. Non-generic kernels keep their bare base name.
+rustc's 128-bit type-id hash of the concrete generated kernel function item.
+That `FnDef` contains ordered type and const arguments. The host launcher
+computes the same hash through the `core::intrinsics::type_id` intrinsic
+(wrapped by `cuda_host::type_id_u128_of_val`), so both sides agree
+byte-for-byte within one unified build. Non-generic kernels keep their bare
+base name.
 
 ```{note}
 This FQDN alignment strategy will be replaced by pliron's `Legaliser` when
@@ -396,7 +398,7 @@ quiet, production-oriented build.
 | :-------------------------- | :------------------------------------------------------------------------------------- |
 | `CUDA_OXIDE_VERBOSE`        | Print compilation progress (which kernels were found, pipeline stages, timing)         |
 | `CUDA_OXIDE_DUMP_MIR`       | Dump the `dialect-mir` module to stderr after import (and after `mem2reg`)             |
-| `CUDA_OXIDE_DUMP_LLVM`      | Dump the `dialect-llvm` module to stderr after lowering                                |
+| `CUDA_OXIDE_DUMP_LLVM`      | Dump the LLVM dialect module to stderr after lowering                                  |
 | `CUDA_OXIDE_PTX_DIR`        | Override the output directory for `.ptx` files (default: next to the host binary)      |
 | `CUDA_OXIDE_TARGET`         | Override the GPU target architecture (e.g., `sm_90a` for Hopper)                       |
 | `CUDA_OXIDE_SHOW_RUSTC_MIR` | Dump the raw rustc MIR before translation to pliron (useful for debugging import bugs) |

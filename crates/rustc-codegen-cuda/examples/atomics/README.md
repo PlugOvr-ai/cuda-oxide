@@ -8,30 +8,34 @@ fence-splitting workaround -- running end-to-end on real hardware.
 
 ## Prerequisites
 
-### LLVM 22 (`llc-22`)
+### LLVM 22
 
-Atomic operations require **llc-22 or newer** for correct syncscope
+Atomic operations require **LLVM 22 or newer** for correct syncscope
 generation. Without it, scopes (`.gpu`, `.cta`, `.sys`) will be missing
 from generated PTX.
 
-Install on Ubuntu/Debian:
+The pinned Rust toolchain (`nightly-2026-04-03`) ships LLVM 22 with NVPTX
+enabled via the `llvm-tools` component, so the default onboarding path
+already satisfies this requirement:
 
 ```bash
-# Add LLVM apt repo
-wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 22
+rustup component add llvm-tools  # already listed in rust-toolchain.toml
+```
 
-# Verify
+The pipeline auto-picks `<sysroot>/lib/rustlib/<host>/bin/llc` first.
+
+If you prefer a system LLVM 22 install (Ubuntu / Debian):
+
+```bash
+wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 22
 llc-22 --version  # Should show 22.x
 ```
 
-Then either:
+Resolution order: `$CUDA_OXIDE_LLC` → rustup `llc` → `llc-22` → `llc-21` →
+`llc` on `PATH`. To pin a specific binary:
 
 ```bash
-# Option A: set the env var (recommended)
-export CUDA_OXIDE_LLC=/usr/bin/llc-22
-
-# Option B: llc-22 is auto-discovered if on PATH
-#           (pipeline tries llc-22 first, then llc-21; LLVM 21 is the floor)
+export CUDA_OXIDE_LLC=/path/to/llc
 ```
 
 ### Hardware
@@ -47,7 +51,7 @@ cargo oxide run atomics
 # Or with explicit llc path:
 CUDA_OXIDE_LLC=/path/to/llc-22 cargo oxide run atomics
 
-# Verbose mode (shows which llc was selected):
+# Verbose mode (shows which llc was used):
 CUDA_OXIDE_VERBOSE=1 cargo oxide run atomics
 ```
 
@@ -260,12 +264,12 @@ dialect-nvvm  (ops/atomic.rs)                     ← NvvmAtomicRmwOp { kind: Ad
 mir-lower     (convert/intrinsics/atomic.rs)      ← Fence splitting + LlvmAtomicRmwOp
         │
         ▼
-dialect-llvm  (export.rs)                         ← Textual LLVM IR:
+llvm-export   (export/)                           ← Textual LLVM IR:
         │                                            fence syncscope("device") release
         │                                            atomicrmw add ptr %p, i32 %v ...
         │                                            fence syncscope("device") acquire
         ▼
-llc-22                                            ← PTX:
+llc                                               ← PTX:
                                                      fence.acq_rel.gpu
                                                      atom.add.u32 ...
                                                      fence.acq_rel.gpu

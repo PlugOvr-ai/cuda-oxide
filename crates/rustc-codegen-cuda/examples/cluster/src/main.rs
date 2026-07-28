@@ -25,6 +25,18 @@ use cuda_host::cuda_module;
 mod kernels {
     use super::*;
 
+    /// Keeps the generated cluster-grid helper path in the compiled module.
+    #[kernel]
+    pub fn compile_cluster_grid_helpers(mut output: DisjointSlice<u32>) {
+        if thread::threadIdx_x() == 0 && output.len() >= 2 {
+            // SAFETY: the length check covers both output slots.
+            unsafe {
+                *output.get_unchecked_mut(0) = cluster::cluster_idx();
+                *output.get_unchecked_mut(1) = cluster::num_clusters();
+            }
+        }
+    }
+
     /// Test kernel with compile-time cluster configuration.
     ///
     /// The `#[cluster_launch(4, 1, 1)]` attribute tells the compiler to emit:
@@ -87,7 +99,14 @@ mod kernels {
     // ============================================================================
 
     /// Test kernel for cluster_sync().
+    ///
+    /// `cluster_sync` only has meaning when the kernel actually runs as a
+    /// thread-block cluster, so this must carry `#[cluster_launch(...)]` like
+    /// the DSMEM tests below. Without it the grid launches as ordinary blocks,
+    /// every block is its own size-1 cluster, `block_rank()` is always 0, and
+    /// only `output[0]` is written.
     #[kernel]
+    #[cluster_launch(4, 1, 1)]
     pub fn test_cluster_sync(mut output: DisjointSlice<u32>) {
         static mut SHMEM: SharedArray<u32, 1> = SharedArray::UNINIT;
 
@@ -232,8 +251,9 @@ fn main() {
     println!("Launching test_cluster_compile_time via cuLaunchKernelEx");
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1\n");
 
-    module
-        .test_cluster_compile_time(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_compile_time(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (cluster_size, 1, 1),
@@ -242,7 +262,8 @@ fn main() {
             },
             &mut ct_output,
         )
-        .expect("Launch compile-time cluster kernel");
+    }
+    .expect("Launch compile-time cluster kernel");
     stream.synchronize().expect("Synchronize");
 
     let ct_results: Vec<u32> = ct_output.to_host_vec(&stream).unwrap();
@@ -289,8 +310,9 @@ fn main() {
     println!("Launching test_cluster_intrinsics...");
     println!("  Grid: 4x1x1 blocks, Block: 32 threads\n");
 
-    module
-        .test_cluster_intrinsics(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_intrinsics(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (n_blocks, 1, 1),
@@ -299,7 +321,8 @@ fn main() {
             },
             &mut output_dev,
         )
-        .expect("Launch kernel");
+    }
+    .expect("Launch kernel");
     stream.synchronize().expect("Synchronize");
 
     let output: Vec<u32> = output_dev.to_host_vec(&stream).unwrap();
@@ -333,8 +356,9 @@ fn main() {
     println!("Launching test_cluster_sync via cuLaunchKernelEx");
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1\n");
 
-    module
-        .test_cluster_sync(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_sync(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (cluster_size, 1, 1),
@@ -343,7 +367,8 @@ fn main() {
             },
             &mut sync_output,
         )
-        .expect("Launch sync kernel");
+    }
+    .expect("Launch sync kernel");
     stream.synchronize().expect("Synchronize");
 
     let sync_results: Vec<u32> = sync_output.to_host_vec(&stream).unwrap();
@@ -371,15 +396,18 @@ fn main() {
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1");
     println!("  Expected: Block 0 reads 1001, Block 1 reads 1002, ...\n");
 
-    let ring_result = module.test_dsmem_ring_exchange(
-        (stream).as_ref(),
-        LaunchConfig {
-            grid_dim: (cluster_size, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &mut ring_output,
-    );
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    let ring_result = unsafe {
+        module.test_dsmem_ring_exchange(
+            (stream).as_ref(),
+            LaunchConfig {
+                grid_dim: (cluster_size, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &mut ring_output,
+        )
+    };
 
     let (ring_pass, dsmem_context_error) = match ring_result {
         Ok(_) => match stream.synchronize() {
@@ -435,15 +463,18 @@ fn main() {
         println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1");
         println!("  Expected: Block 0 sums all blocks' values: 10+20+30+40 = 100\n");
 
-        let reduce_result = module.test_dsmem_reduction(
-            (stream).as_ref(),
-            LaunchConfig {
-                grid_dim: (cluster_size, 1, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            &mut reduce_output,
-        );
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        let reduce_result = unsafe {
+            module.test_dsmem_reduction(
+                (stream).as_ref(),
+                LaunchConfig {
+                    grid_dim: (cluster_size, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut reduce_output,
+            )
+        };
 
         match reduce_result {
             Ok(_) => match stream.synchronize() {

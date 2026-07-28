@@ -23,7 +23,7 @@
 //! │ arithmetic   │ Math, bitwise, and shift operations  │ 13  │
 //! │ comparison   │ Relational and equality comparisons  │ 6   │
 //! │ aggregate    │ Struct and tuple manipulation        │ 4   │
-//! │ enum_ops     │ Enum construction and inspection     │ 3   │
+//! │ enum_ops     │ Enum construction and inspection     │ 4   │
 //! │ cast         │ Type conversions                     │ 1   │
 //! │ storage      │ Variable lifetime markers            │ 2   │
 //! │ call         │ Function calls                       │ 1   │
@@ -48,7 +48,7 @@
 //! │ Arithmetic   │ 13  │ ✅ Good: operand types match, result type matches      │
 //! │ Comparison   │  6  │ ✅ Good: operand types match, result type matches      │
 //! │ Aggregate    │  4  │ ✅ Good: struct/tuple type checking, index bounds      │
-//! │ Enum         │  3  │ ✅ Good: discriminant type, payload type validation    │
+//! │ Enum         │  4  │ ✅ Good: discriminant type, payload type validation    │
 //! │ Cast         │  1  │ ✅ Full: cast_kind required, operand/result types checked per kind │
 //! │ Constants    │  2  │ ✅ Good: type attributes present and valid             │
 //! │ Storage      │  2  │ ✅ Basic: structural verification                      │
@@ -111,6 +111,7 @@ pub mod cast;
 pub mod comparison;
 pub mod constants;
 pub mod control_flow;
+pub mod debug;
 pub mod enum_ops;
 pub mod function;
 pub mod memory;
@@ -124,6 +125,7 @@ pub use cast::*;
 pub use comparison::*;
 pub use constants::*;
 pub use control_flow::*;
+pub use debug::*;
 pub use enum_ops::*;
 pub use function::*;
 pub use memory::*;
@@ -139,6 +141,7 @@ pub fn register(ctx: &mut Context) {
     comparison::register(ctx);
     aggregate::register(ctx);
     enum_ops::register(ctx);
+    debug::register(ctx);
     cast::register(ctx);
     storage::register(ctx);
     call::register(ctx);

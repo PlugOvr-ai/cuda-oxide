@@ -15,7 +15,7 @@
 //!
 //! Declare shared memory as `static mut` inside a kernel:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cuda_device::{kernel, thread, SharedArray};
 //!
 //! #[kernel]
@@ -64,7 +64,7 @@ use core::ops::{Index, IndexMut};
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 ///
 /// unsafe {
@@ -88,7 +88,7 @@ use core::ops::{Index, IndexMut};
 /// element type. For TMA (Tensor Memory Accelerator) destinations, use `ALIGN = 128`
 /// to meet the 128-byte alignment requirement:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Regular shared memory - natural alignment
 /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 ///
@@ -124,7 +124,7 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     /// Marker constant for uninitialized shared memory.
     ///
     /// Use this to initialize `static mut` declarations:
-    /// ```rust
+    /// ```rust,ignore
     /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
     /// ```
     pub const UNINIT: Self = Self {
@@ -163,7 +163,7 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // Use with map_shared_rank for DSMEM
     /// let remote_ptr = unsafe { cluster::map_shared_rank(SHMEM.as_ptr(), neighbor_rank) };
     /// ```
@@ -184,7 +184,7 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // Initialize first element
     /// unsafe { SHMEM.as_mut_ptr().write(value) };
     /// ```
@@ -254,6 +254,17 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 // DynamicSharedArray - Runtime-sized shared memory
 // ============================================================================
 
+/// Compile-time minimum alignment marker for a kernel's dynamic shared memory.
+///
+/// This is injected by `#[launch_contract]`. cuda-oxide removes the call before
+/// code generation, so it adds no kernel hot-path instructions. Kernel authors
+/// should use the attribute rather than calling this function directly.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __dynamic_shared_alignment<const ALIGN: usize>() {
+    // The MIR importer removes this marker after recording ALIGN.
+}
+
 /// Dynamic (runtime-sized) shared memory with configurable alignment.
 ///
 /// Unlike [`SharedArray`] which has a compile-time known size, `DynamicSharedArray`
@@ -273,7 +284,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 /// The `ALIGN` parameter controls the alignment of the `extern __shared__`
 /// declaration in PTX:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Default alignment (16 bytes, matches nvcc for char[])
 /// let smem: *mut f32 = DynamicSharedArray::<f32>::get();
 /// // PTX: .extern .shared .align 16 .b8 __dynamic_smem[];
@@ -294,7 +305,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::{kernel, DynamicSharedArray, DisjointSlice};
 ///
 /// #[kernel]
@@ -324,15 +335,18 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 ///
 /// Specify the shared memory size in the launch configuration:
 ///
-/// ```rust
-/// cuda_launch! {
-///     kernel: flexible_kernel,
-///     config: LaunchConfig {
-///         grid_dim: (blocks, 1, 1),
-///         block_dim: (256, 1, 1),
-///         shared_mem_bytes: 2048,  // 512 f32s total
-///     },
-///     // ...
+/// ```rust,ignore
+/// // SAFETY: argument list matches `flexible_kernel`'s signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: flexible_kernel,
+///         config: LaunchConfig {
+///             grid_dim: (blocks, 1, 1),
+///             block_dim: (256, 1, 1),
+///             shared_mem_bytes: 2048,  // 512 f32s total
+///         },
+///         // ...
+///     }
 /// }
 /// ```
 ///
@@ -342,7 +356,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 /// a kernel reference the **same** underlying memory. Use byte offsets to
 /// partition the memory for multiple arrays:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // First array: 256 f32s (1024 bytes) starting at offset 0
 /// let array_a: *mut f32 = DynamicSharedArray::<f32>::get();
 ///
@@ -385,7 +399,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let smem: *mut f32 = DynamicSharedArray::<f32>::get();
     /// unsafe {
     ///     *smem.add(tid) = value;
@@ -407,7 +421,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let raw: *mut u8 = DynamicSharedArray::<u8>::get_raw();
     /// // Cast to specific types as needed
     /// let floats = raw as *mut f32;
@@ -429,7 +443,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // First array at offset 0
     /// let array_a: *mut f32 = DynamicSharedArray::<f32>::get();
     ///
@@ -452,3 +466,5 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
         unreachable!("DynamicSharedArray::offset called outside CUDA kernel context")
     }
 }
+
+include!("generated/shared_sreg.rs");

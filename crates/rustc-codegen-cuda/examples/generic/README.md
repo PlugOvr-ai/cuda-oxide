@@ -8,6 +8,7 @@ Tests whether the collector correctly handles monomorphized generic kernels. Thi
 
 - Defines generic kernels `scale<T>` and `add<T>` with trait bounds
 - Host code calls `scale::<f32>` which triggers monomorphization
+- Defines a captured closure inside a generic kernel body
 - Verifies the monomorphized kernel executes correctly
 
 ## Key Concepts Demonstrated
@@ -37,13 +38,16 @@ pub fn add<T: Copy + Add<Output = T>>(a: &[T], b: &[T], mut c: DisjointSlice<T>)
 ```rust
 // Type parameter on the typed module method forces monomorphization.
 let module = kernels::load(&ctx)?;
-module.scale::<f32>(
-    &stream,
-    LaunchConfig::for_num_elems(N as u32),
-    factor,
-    &input_dev,
-    &mut output_dev,
-)?;
+// SAFETY: this is a 1D launch and both buffers contain N elements.
+unsafe {
+    module.scale::<f32>(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        factor,
+        &input_dev,
+        &mut output_dev,
+    )
+}?;
 ```
 
 ### How It Works
@@ -100,9 +104,10 @@ pub fn saxpy<T: Copy + Mul<Output = T> + Add<Output = T>>(
 }
 
 // Use with different types (fields abbreviated for clarity)
-// module.saxpy::<f32>(&stream, config, a, &x, &y, &mut out)?;
-// module.saxpy::<f64>(&stream, config, a, &x, &y, &mut out)?;
-// module.saxpy::<i32>(&stream, config, a, &x, &y, &mut out)?;
+// SAFETY: each raw config must be 1D and cover the supplied buffers.
+// unsafe { module.saxpy::<f32>(&stream, config, a, &x, &y, &mut out) }?;
+// unsafe { module.saxpy::<f64>(&stream, config, a, &x, &y, &mut out) }?;
+// unsafe { module.saxpy::<i32>(&stream, config, a, &x, &y, &mut out) }?;
 ```
 
 ### With Closures

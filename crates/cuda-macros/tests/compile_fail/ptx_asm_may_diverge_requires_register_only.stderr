@@ -1,0 +1,5 @@
+error: `options(may_diverge)` requires `register_only`
+  --> tests/compile_fail/ptx_asm_may_diverge_requires_register_only.rs:12:13
+   |
+12 |             "mov.u32 %0, %1;",
+   |             ^^^^^^^^^^^^^^^^^

@@ -134,7 +134,12 @@ pub trait DeviceOperation:
     Send + Sized + IntoFuture<Output = Result<<Self as DeviceOperation>::Output, DeviceError>>
 {
     /// The value produced when the operation completes successfully.
-    type Output: Send;
+    ///
+    /// The `'static` bound exists because a cancelled in-flight result is
+    /// parked in the [`reclaim`](crate::reclaim) limbo and dropped only
+    /// after the GPU work completes, which can be after any non-`'static`
+    /// borrow it carries would have expired.
+    type Output: Send + 'static;
 
     /// Submits GPU work to the stream in `context` and returns the result.
     ///
@@ -266,7 +271,7 @@ pub struct DeviceOperationArc<I: Send + Sync, DI: DeviceOperation<Output = I>> {
 unsafe impl<I: Send + Sync, DI: DeviceOperation<Output = I>> Send for DeviceOperationArc<I, DI> {}
 
 /// Executes the inner operation and wraps the result in [`Arc`].
-impl<I: Send + Sync, DI: DeviceOperation<Output = I>> DeviceOperation
+impl<I: Send + Sync + 'static, DI: DeviceOperation<Output = I>> DeviceOperation
     for DeviceOperationArc<I, DI>
 {
     type Output = Arc<I>;
@@ -280,7 +285,9 @@ impl<I: Send + Sync, DI: DeviceOperation<Output = I>> DeviceOperation
 }
 
 /// Schedules via the thread-local default policy.
-impl<I: Send + Sync, DI: DeviceOperation<Output = I>> IntoFuture for DeviceOperationArc<I, DI> {
+impl<I: Send + Sync + 'static, DI: DeviceOperation<Output = I>> IntoFuture
+    for DeviceOperationArc<I, DI>
+{
     type Output = Result<Arc<I>, DeviceError>;
     type IntoFuture = DeviceFuture<Arc<I>, DeviceOperationArc<I, DI>>;
     fn into_future(self) -> Self::IntoFuture {
@@ -321,7 +328,7 @@ where
 
 /// Executes the first operation, feeds its result to the closure, then
 /// executes the resulting second operation on the same stream.
-impl<I: Send, DI, O: Send, DO, F> DeviceOperation for AndThen<I, DI, O, DO, F>
+impl<I: Send, DI, O: Send + 'static, DO, F> DeviceOperation for AndThen<I, DI, O, DO, F>
 where
     DI: DeviceOperation<Output = I>,
     DO: DeviceOperation<Output = O>,
@@ -339,7 +346,7 @@ where
 }
 
 /// Schedules via the thread-local default policy.
-impl<I: Send, DI, O: Send, DO, F> IntoFuture for AndThen<I, DI, O, DO, F>
+impl<I: Send, DI, O: Send + 'static, DO, F> IntoFuture for AndThen<I, DI, O, DO, F>
 where
     DI: DeviceOperation<Output = I>,
     DO: DeviceOperation<Output = O>,
@@ -384,7 +391,7 @@ where
 
 /// Executes the first operation, then passes `(context, result)` to the
 /// closure and executes the resulting second operation.
-impl<I: Send, DI, O: Send, DO, F> DeviceOperation for AndThenWithContext<I, DI, O, DO, F>
+impl<I: Send, DI, O: Send + 'static, DO, F> DeviceOperation for AndThenWithContext<I, DI, O, DO, F>
 where
     DI: DeviceOperation<Output = I>,
     DO: DeviceOperation<Output = O>,
@@ -402,7 +409,7 @@ where
 }
 
 /// Schedules via the thread-local default policy.
-impl<I: Send, DI, O: Send, DO, F> IntoFuture for AndThenWithContext<I, DI, O, DO, F>
+impl<I: Send, DI, O: Send + 'static, DO, F> IntoFuture for AndThenWithContext<I, DI, O, DO, F>
 where
     DI: DeviceOperation<Output = I>,
     DO: DeviceOperation<Output = O>,
@@ -429,7 +436,7 @@ pub struct Value<T>(T);
 unsafe impl<T> Send for Value<T> {}
 
 /// Returns the wrapped value directly -- no GPU work is performed.
-impl<T: Send> DeviceOperation for Value<T> {
+impl<T: Send + 'static> DeviceOperation for Value<T> {
     type Output = T;
 
     unsafe fn execute(self, _context: &ExecutionContext) -> Result<T, DeviceError> {
@@ -438,7 +445,7 @@ impl<T: Send> DeviceOperation for Value<T> {
 }
 
 /// Schedules via the thread-local default policy.
-impl<T: Send> IntoFuture for Value<T> {
+impl<T: Send + 'static> IntoFuture for Value<T> {
     type Output = Result<T, DeviceError>;
     type IntoFuture = DeviceFuture<T, Value<T>>;
     fn into_future(self) -> Self::IntoFuture {
@@ -491,7 +498,7 @@ pub fn empty<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO>(
 unsafe impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> Send for Empty<O, DO, F> {}
 
 /// Invokes the closure to produce the inner operation, then executes it.
-impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> DeviceOperation
+impl<O: Send + 'static, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> DeviceOperation
     for Empty<O, DO, F>
 {
     type Output = O;
@@ -505,7 +512,9 @@ impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> DeviceOperatio
 }
 
 /// Schedules via the thread-local default policy.
-impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> IntoFuture for Empty<O, DO, F> {
+impl<O: Send + 'static, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> IntoFuture
+    for Empty<O, DO, F>
+{
     type Output = Result<O, DeviceError>;
     type IntoFuture = DeviceFuture<O, Empty<O, DO, F>>;
     fn into_future(self) -> Self::IntoFuture {
@@ -519,7 +528,7 @@ impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce() -> DO> IntoFuture for
 /// Pair combinator: executes two operations sequentially on the same stream
 /// and returns both results as a tuple.
 ///
-/// Constructed via [`_zip`] or the [`zip!`] macro.
+/// Constructed via `_zip` or the [`zip!`] macro.
 pub struct Zip<T1: Send, T2: Send, A: DeviceOperation<Output = T1>, B: DeviceOperation<Output = T2>>
 {
     phantom: PhantomData<(T1, T2)>,
@@ -550,8 +559,12 @@ fn _zip<T1: Send, T2: Send, A: DeviceOperation<Output = T1>, B: DeviceOperation<
 }
 
 /// Executes `a` then `b` on the same stream, returning `(T1, T2)`.
-impl<T1: Send, T2: Send, A: DeviceOperation<Output = T1>, B: DeviceOperation<Output = T2>>
-    DeviceOperation for Zip<T1, T2, A, B>
+impl<
+    T1: Send + 'static,
+    T2: Send + 'static,
+    A: DeviceOperation<Output = T1>,
+    B: DeviceOperation<Output = T2>,
+> DeviceOperation for Zip<T1, T2, A, B>
 {
     type Output = (T1, T2);
 
@@ -565,8 +578,12 @@ impl<T1: Send, T2: Send, A: DeviceOperation<Output = T1>, B: DeviceOperation<Out
 }
 
 /// Schedules via the thread-local default policy.
-impl<T1: Send, T2: Send, A: DeviceOperation<Output = T1>, B: DeviceOperation<Output = T2>>
-    IntoFuture for Zip<T1, T2, A, B>
+impl<
+    T1: Send + 'static,
+    T2: Send + 'static,
+    A: DeviceOperation<Output = T1>,
+    B: DeviceOperation<Output = T2>,
+> IntoFuture for Zip<T1, T2, A, B>
 {
     type Output = Result<(T1, T2), DeviceError>;
     type IntoFuture = DeviceFuture<(T1, T2), Zip<T1, T2, A, B>>;
@@ -588,8 +605,12 @@ pub trait Zippable<I, O: Send> {
 }
 
 /// Zips two operations into a pair.
-impl<T0: Send, T1: Send, DI0: DeviceOperation<Output = T0>, DI1: DeviceOperation<Output = T1>>
-    Zippable<(DI0, DI1), (T0, T1)> for (DI0, DI1)
+impl<
+    T0: Send + 'static,
+    T1: Send + 'static,
+    DI0: DeviceOperation<Output = T0>,
+    DI1: DeviceOperation<Output = T1>,
+> Zippable<(DI0, DI1), (T0, T1)> for (DI0, DI1)
 {
     fn zip(self) -> impl DeviceOperation<Output = (T0, T1)> {
         _zip(self.0, self.1)
@@ -598,9 +619,9 @@ impl<T0: Send, T1: Send, DI0: DeviceOperation<Output = T0>, DI1: DeviceOperation
 
 /// Zips three operations into a triple by nesting two binary zips.
 impl<
-    T0: Send,
-    T1: Send,
-    T2: Send,
+    T0: Send + 'static,
+    T1: Send + 'static,
+    T2: Send + 'static,
     DI0: DeviceOperation<Output = T0>,
     DI1: DeviceOperation<Output = T1>,
     DI2: DeviceOperation<Output = T2>,
@@ -649,7 +670,7 @@ pub struct StreamOperation<
 }
 
 /// Calls the closure with the context, then executes the resulting operation.
-impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce(&ExecutionContext) -> DO + Send>
+impl<O: Send + 'static, DO: DeviceOperation<Output = O>, F: FnOnce(&ExecutionContext) -> DO + Send>
     DeviceOperation for StreamOperation<O, DO, F>
 {
     type Output = O;
@@ -668,7 +689,7 @@ impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce(&ExecutionContext) -> D
 /// The closure is invoked at execution time with the stream and context,
 /// and must return a `DeviceOperation` that will be immediately executed.
 pub fn with_context<
-    O: Send,
+    O: Send + 'static,
     DO: DeviceOperation<Output = O>,
     F: FnOnce(&ExecutionContext) -> DO + Send,
 >(
@@ -678,8 +699,8 @@ pub fn with_context<
 }
 
 /// Schedules via the thread-local default policy.
-impl<O: Send, DO: DeviceOperation<Output = O>, F: FnOnce(&ExecutionContext) -> DO + Send> IntoFuture
-    for StreamOperation<O, DO, F>
+impl<O: Send + 'static, DO: DeviceOperation<Output = O>, F: FnOnce(&ExecutionContext) -> DO + Send>
+    IntoFuture for StreamOperation<O, DO, F>
 {
     type Output = Result<O, DeviceError>;
     type IntoFuture = DeviceFuture<O, StreamOperation<O, DO, F>>;
@@ -776,7 +797,7 @@ unsafe impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> Send
 
 /// Triggers the shared source operation (if not yet done) and returns the
 /// left element.
-impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
+impl<T1: Send + 'static, T2: Send + 'static, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
     for SelectLeft<T1, T2, DI>
 {
     type Output = T1;
@@ -790,7 +811,7 @@ impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
 }
 
 /// Schedules via the thread-local default policy.
-impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> IntoFuture
+impl<T1: Send + 'static, T2: Send + 'static, DI: DeviceOperation<Output = (T1, T2)>> IntoFuture
     for SelectLeft<T1, T2, DI>
 {
     type Output = Result<T1, DeviceError>;
@@ -822,7 +843,7 @@ unsafe impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> Send
 
 /// Triggers the shared source operation (if not yet done) and returns the
 /// right element.
-impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
+impl<T1: Send + 'static, T2: Send + 'static, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
     for SelectRight<T1, T2, DI>
 {
     type Output = T2;
@@ -836,7 +857,7 @@ impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> DeviceOperation
 }
 
 /// Schedules via the thread-local default policy.
-impl<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>> IntoFuture
+impl<T1: Send + 'static, T2: Send + 'static, DI: DeviceOperation<Output = (T1, T2)>> IntoFuture
     for SelectRight<T1, T2, DI>
 {
     type Output = Result<T2, DeviceError>;
@@ -871,7 +892,7 @@ fn _unzip<T1: Send, T2: Send, DI: DeviceOperation<Output = (T1, T2)>>(
 
 /// Trait enabling `.unzip()` on any [`DeviceOperation`] that produces a
 /// 2-tuple.
-pub trait Unzippable2<T0: Send, T1: Send>
+pub trait Unzippable2<T0: Send + 'static, T1: Send + 'static>
 where
     Self: DeviceOperation<Output = (T0, T1)>,
 {
@@ -888,7 +909,23 @@ where
 }
 
 /// Blanket impl: any operation producing `(T0, T1)` is unzippable.
-impl<T0: Send, T1: Send, DI: DeviceOperation<Output = (T0, T1)>> Unzippable2<T0, T1> for DI {}
+impl<T0: Send + 'static, T1: Send + 'static, DI: DeviceOperation<Output = (T0, T1)>>
+    Unzippable2<T0, T1> for DI
+{
+}
+
+/// Splits a tuple-producing [`DeviceOperation`] into per-element operations.
+///
+/// ```ignore
+/// let (left, right) = unzip!(pair_op);
+/// ```
+#[macro_export]
+macro_rules! unzip {
+    ($arg0:expr) => {
+        $arg0.unzip()
+    };
+}
+pub use unzip;
 
 #[cfg(test)]
 mod tests {
@@ -928,16 +965,3 @@ mod tests {
         assert_eq!(result, Err(operation_error));
     }
 }
-
-/// Splits a tuple-producing [`DeviceOperation`] into per-element operations.
-///
-/// ```ignore
-/// let (left, right) = unzip!(pair_op);
-/// ```
-#[macro_export]
-macro_rules! unzip {
-    ($arg0:expr) => {
-        $arg0.unzip()
-    };
-}
-pub use unzip;

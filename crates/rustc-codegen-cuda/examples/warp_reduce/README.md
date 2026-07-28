@@ -2,7 +2,12 @@
 
 ## Warp-Level Primitives - Shuffle Operations
 
-Demonstrates warp-level operations: `shuffle_xor`, `shuffle_down`, and `shuffle` (broadcast). These are the fastest way to communicate between threads without shared memory.
+Demonstrates warp-level `shuffle_xor`, `shuffle_down`, and `shuffle`
+(broadcast) operations without shared-memory storage.
+
+The i32/f32 synchronized shuffle leaves are generated as intrinsic records
+`i0050`-`i0057`. The friendly `cuda_device::warp` helpers and this example's
+output remain unchanged.
 
 ## What This Example Does
 
@@ -10,6 +15,10 @@ Demonstrates warp-level operations: `shuffle_xor`, `shuffle_down`, and `shuffle`
 2. **warp_reduce_sum_down**: Sequential reduction using `shuffle_down` - only lane 0 gets sum
 3. **warp_broadcast**: Broadcast lane 0's value to all lanes using `shuffle`
 4. **test_lane_id**: Verify `lane_id()` intrinsic
+5. **warp_reduce_sum_util / warp_reduce_max_util / warp_reduce_min_util**:
+   The packaged `warp::reduce_{sum,max,min}_f32` utilities - every lane
+   writes the reduced value it received, and the host checks all of them
+6. **warp_reduce_sum_f64_util**: The f64 flavor, `warp::reduce_sum_f64`
 
 ## Key Concepts Demonstrated
 
@@ -52,6 +61,22 @@ let lane = warp::lane_id();  // 0-31 within the warp
 let warp_id = warp::warp_id();  // Which warp in the block
 ```
 
+### Packaged Reduce Utilities
+
+The hand-rolled butterfly above is also available as one-call utilities,
+for both precisions:
+
+```rust
+let total = warp::reduce_sum_f32(val);      // every lane gets the sum
+let hi = warp::reduce_max_f32(val);         // every lane gets the max
+let lo = warp::reduce_min_f32(val);         // every lane gets the min
+let total_f64 = warp::reduce_sum_f64(val);  // f64 flavors too
+```
+
+They use the full-warp mask, so all 32 lanes must be converged and
+participate; calling them from divergent control flow or from a block
+with fewer than 32 threads is undefined.
+
 ## Build and Run
 
 ```bash
@@ -81,12 +106,21 @@ Warp sums: [496.0, 496.0, 496.0, 496.0, 496.0, 496.0, 496.0, 496.0]
 --- Test 4: Lane ID ---
 ✓ Lane IDs correct: 0-31 pattern for each warp
 
+--- Test 5: Reduce Utilities (f32) ---
+✓ reduce_sum_f32 correct: all 256 lanes hold 496
+✓ reduce_max_f32 correct: all 256 lanes hold 31
+✓ reduce_min_f32 correct: all 256 lanes hold 0
+
+--- Test 6: Reduce Utility (f64) ---
+✓ reduce_sum_f64 correct: all 256 lanes hold 496
+
 ✓ SUCCESS: All warp tests passed!
 ```
 
 ## Hardware Requirements
 
-- **Minimum GPU**: Kepler (sm_30) or newer
+- **Instruction floor**: PTX 6.0 and sm_30
+- **Project target**: Ampere or newer
 - **CUDA Driver**: 11.0+
 
 ## Shuffle Functions
@@ -100,16 +134,14 @@ Warp sums: [496.0, 496.0, 496.0, 496.0, 496.0, 496.0, 496.0, 496.0]
 
 ## Why Warp Operations?
 
-| Communication   | Latency     | Synchronization              |
-|-----------------|-------------|------------------------------|
-| Shuffle         | ~1 cycle    | Implicit (warp-synchronous)  |
-| Shared Memory   | ~20 cycles  | Requires sync_threads()      |
-| Global Memory   | ~400 cycles | Requires barriers            |
+Shuffles move register values directly between lanes without shared-memory
+storage. They still have a participation contract: every named, non-exited
+lane must execute the same synchronized shuffle with the same member mask.
+The full-warp helpers in this example use `u32::MAX`, so all 32 lanes must
+reach each call. A shuffle is not a general memory barrier.
 
-Shuffles are:
-- **Lock-step**: All 32 lanes execute together
-- **No synchronization needed**: Warps are SIMD units
-- **Register-to-register**: No memory accesses
+On `sm_6x` and earlier, named lanes must be converged and no lane outside the
+mask may be active. Ampere and newer use the synchronized forms shown here.
 
 ## Common Patterns
 
@@ -122,6 +154,9 @@ val = max(val, warp::shuffle_xor_f32(val, 4));
 val = max(val, warp::shuffle_xor_f32(val, 2));
 val = max(val, warp::shuffle_xor_f32(val, 1));
 ```
+
+This is exactly what `warp::reduce_max_f32(val)` packages; prefer the
+utility unless you need a non-standard offset schedule.
 
 ### Prefix Sum (Scan)
 
@@ -158,3 +193,11 @@ shfl.sync.idx.b32 %f_result, %f_val, 0, 0x1f, 0xffffffff;
 // Lane ID
 mov.u32 %r_lane, %laneid;
 ```
+
+Generated code owns the raw APIs, importer dispatch, dialect operations,
+typed lowering, and target metadata. LLVM receives a fixed clamp of 31 for
+`idx`, `bfly`, and `down`, and 0 for `up`. The generated probes cover both
+register and immediate lane/member-mask operands.
+
+The generated-intrinsics migration passed this example's compile-only gate
+with the same host output contract. No GPU run was available for that batch.

@@ -78,6 +78,16 @@ impl Verify for MirConstructEnumOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {
         let op = &*self.get_operation().deref(ctx);
 
+        // Diagnose malformed parsed/hand-built IR before indexing result 0;
+        // verifier interface ordering is not a safety guarantee.
+        if op.get_num_results() != 1 {
+            return verify_err!(
+                op.loc(),
+                "MirConstructEnumOp expects exactly one result, got {}",
+                op.get_num_results()
+            );
+        }
+
         // Result must be an enum type
         let result = op.get_result(0);
         let result_ty = result.get_type(ctx);
@@ -114,6 +124,13 @@ impl Verify for MirConstructEnumOp {
                 );
             }
         };
+        if enum_ty.variant_is_inhabited(variant_idx) == Some(false) {
+            return verify_err!(
+                op.loc(),
+                "MirConstructEnumOp cannot construct uninhabited variant {}",
+                variant_idx
+            );
+        }
 
         // Verify operand count matches variant field count
         let num_operands = op.get_num_operands();
@@ -196,6 +213,15 @@ impl Verify for MirGetDiscriminantOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {
         let op = &*self.get_operation().deref(ctx);
 
+        if op.get_num_operands() != 1 || op.get_num_results() != 1 {
+            return verify_err!(
+                op.loc(),
+                "MirGetDiscriminantOp expects exactly one operand and one result, got {} operand(s) and {} result(s)",
+                op.get_num_operands(),
+                op.get_num_results()
+            );
+        }
+
         // Operand must be an enum type
         let operand = op.get_operand(0);
         let operand_ty = operand.get_type(ctx);
@@ -210,6 +236,12 @@ impl Verify for MirGetDiscriminantOp {
                 );
             }
         };
+        if !enum_ty.variant_inhabited.iter().any(|value| *value != 0) {
+            return verify_err!(
+                op.loc(),
+                "MirGetDiscriminantOp cannot inspect an uninhabited enum"
+            );
+        }
 
         // Result must match the enum's discriminant type
         let result = op.get_result(0);
@@ -225,6 +257,123 @@ impl Verify for MirGetDiscriminantOp {
         }
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// MirSetDiscriminantOp
+// ============================================================================
+
+/// MIR set discriminant operation.
+///
+/// Selects an enum variant at the memory location pointed to by its operand.
+/// This is the device-side lowering of MIR's
+/// `StatementKind::SetDiscriminant`.
+///
+/// # Operands
+///
+/// ```text
+/// | Name            | Type                              |
+/// |-----------------|-----------------------------------|
+/// | `enum_ptr` | Pointer to MirEnumType |
+/// ```
+///
+/// # Attributes
+///
+/// ```text
+/// | Name                             | Type               | Description             |
+/// |----------------------------------|--------------------|-------------------------|
+/// | `set_discriminant_variant_index` | `VariantIndexAttr` | Variant to make active. |
+/// ```
+///
+/// # Results
+///
+/// None.
+///
+/// # Verification
+///
+/// - First operand must be a `MirPtrType` pointing to a `MirEnumType`.
+/// - The target variant must exist and be inhabited.
+#[pliron_op(
+    name = "mir.set_discriminant",
+    format,
+    interfaces = [NOpdsInterface<1>, OneOpdInterface, NResultsInterface<0>],
+    attributes = (set_discriminant_variant_index: VariantIndexAttr)
+)]
+pub struct MirSetDiscriminantOp;
+
+impl MirSetDiscriminantOp {
+    /// Create a new MirSetDiscriminantOp wrapper.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MirSetDiscriminantOp { op }
+    }
+}
+
+impl Verify for MirSetDiscriminantOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = &*self.get_operation().deref(ctx);
+
+        // Do not rely on interface-verifier ordering here: malformed parsed IR
+        // must produce a diagnostic rather than letting get_operand(0) panic.
+        if op.get_num_operands() != 1 {
+            return verify_err!(
+                op.loc(),
+                "MirSetDiscriminantOp expects exactly one operand, got {}",
+                op.get_num_operands()
+            );
+        }
+
+        // The operand must be a pointer to an enum type. Keep all checks in
+        // this borrow so returned references do not outlive the guard.
+        let ptr_operand = op.get_operand(0);
+        let ptr_ty = ptr_operand.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+
+        match ptr_ty_obj.downcast_ref::<crate::types::MirPtrType>() {
+            Some(ptr_type) => {
+                if !ptr_type.is_mutable {
+                    return verify_err!(
+                        op.loc(),
+                        "MirSetDiscriminantOp requires a mutable enum pointer"
+                    );
+                }
+                let pointee = ptr_type.pointee.deref(ctx);
+                match pointee.downcast_ref::<MirEnumType>() {
+                    Some(enum_ty) => {
+                        let Some(target) = self.get_attr_set_discriminant_variant_index(ctx) else {
+                            return verify_err!(
+                                op.loc(),
+                                "MirSetDiscriminantOp missing set_discriminant_variant_index"
+                            );
+                        };
+                        let target = target.0 as usize;
+                        if target >= enum_ty.variant_count() {
+                            return verify_err!(
+                                op.loc(),
+                                "MirSetDiscriminantOp target variant {} is out of bounds",
+                                target
+                            );
+                        }
+                        if enum_ty.variant_is_inhabited(target) != Some(true) {
+                            return verify_err!(
+                                op.loc(),
+                                "MirSetDiscriminantOp cannot select uninhabited variant {}",
+                                target
+                            );
+                        }
+                        Ok(())
+                    }
+                    None => verify_err!(
+                        op.loc(),
+                        "MirSetDiscriminantOp pointer must point to an enum type"
+                    ),
+                }
+            }
+            None => verify_err!(
+                op.loc(),
+                "MirSetDiscriminantOp first operand must be a pointer type"
+            ),
+        }
     }
 }
 
@@ -288,6 +437,15 @@ impl Verify for MirEnumPayloadOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {
         let op = &*self.get_operation().deref(ctx);
 
+        if op.get_num_operands() != 1 || op.get_num_results() != 1 {
+            return verify_err!(
+                op.loc(),
+                "MirEnumPayloadOp expects exactly one operand and one result, got {} operand(s) and {} result(s)",
+                op.get_num_operands(),
+                op.get_num_results()
+            );
+        }
+
         // Operand must be an enum type
         let operand = op.get_operand(0);
         let operand_ty = operand.get_type(ctx);
@@ -324,6 +482,13 @@ impl Verify for MirEnumPayloadOp {
                 );
             }
         };
+        if enum_ty.variant_is_inhabited(variant_idx) != Some(true) {
+            return verify_err!(
+                op.loc(),
+                "MirEnumPayloadOp cannot extract a field from uninhabited variant {}",
+                variant_idx
+            );
+        }
 
         // Get field index
         let field_idx = match self.get_attr_payload_field_index(ctx) {
@@ -369,5 +534,6 @@ impl Verify for MirEnumPayloadOp {
 pub fn register(ctx: &mut Context) {
     MirConstructEnumOp::register(ctx);
     MirGetDiscriminantOp::register(ctx);
+    MirSetDiscriminantOp::register(ctx);
     MirEnumPayloadOp::register(ctx);
 }

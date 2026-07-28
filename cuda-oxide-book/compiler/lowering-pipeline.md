@@ -1,11 +1,18 @@
 # The Lowering Pipeline
 
-The previous chapters built the IR from both ends: [MIR Importer](mir-importer.md)
-translated Stable MIR into `dialect-mir`, and
-[Pliron Dialects](mlir-dialects.md) described `dialect-mir`, `dialect-llvm`,
-and `dialect-nvvm`. This chapter is about the bridge between them -- the pass
-that takes Rust-flavored IR and turns it into something LLVM can actually
-compile.
+The previous chapters built and prepared the IR.
+[MIR Importer](mir-importer.md) translated Stable MIR into `dialect-mir`.
+[Compiler Optimizations](compiler-optimizations.md) explained how
+`mir-transforms` rewrites that IR in place, while
+[Pliron Dialects](mlir-dialects.md) described `dialect-mir`, the LLVM dialect,
+and `dialect-nvvm`.
+
+This chapter covers the next bridge: turning Rust-flavored IR into something
+LLVM can compile.
+
+For NVVM builds, a separate `nvvm-transforms` pass runs after this lowering.
+It keeps `mir-lower` focused on converting `dialect-mir` to the LLVM dialect,
+then adjusts that LLVM module for legacy or modern libNVVM before text export.
 
 If you know Rust types, you are about to find out how many of them LLVM has
 never heard of.
@@ -20,7 +27,7 @@ It has flat integer and float types, `getelementptr`, PHI nodes, and a general
 suspicion toward anything with more than one level of abstraction.
 
 **Lowering** is the process of replacing every `dialect-mir` operation with
-an equivalent sequence of `dialect-llvm` operations, one by one, until no
+an equivalent sequence of LLVM dialect operations, one by one, until no
 `dialect-mir` operations remain. Tuples become anonymous structs. Slices
 become pointer-length pairs. Checked addition becomes an LLVM overflow
 intrinsic followed by an extract. Every Rust concept gets flattened to
@@ -227,7 +234,7 @@ insertvalue/extractvalue chains.
 ## GPU Intrinsic Conversion
 
 `dialect-nvvm` operations -- thread indexing, warp shuffles, barriers, TMA
-bulk copies -- are not lowered to generic `dialect-llvm` operations. They are
+bulk copies -- are not lowered to generic LLVM dialect operations. They are
 lowered to either LLVM intrinsic calls or inline PTX assembly, depending on
 whether LLVM has a built-in intrinsic for the operation.
 
@@ -319,6 +326,166 @@ naming everything upfront.
 
 ---
 
+## Debug Locations
+
+rustc already knows where most MIR operations came from in the source program.
+cuda-oxide preserves that information as it lowers the kernel:
+
+```text
+rustc Span
+  ↓
+pliron Location
+  ↓
+LLVM !dbg metadata
+  ↓
+PTX .loc / DWARF
+  ↓
+cuda-gdb source line
+```
+
+The common case is a source line in the same file as the function:
+
+```llvm
+define ptx_kernel void @vecadd(...) !dbg !func {
+  %idx = call i64 @cuda_device____internal__index_1d(...), !dbg !loc
+}
+
+!loc = !DILocation(line: 39, column: 13, scope: !func)
+```
+
+That says: "this instruction belongs to line 39, column 13, inside this
+function." It is just enough for cuda-gdb to stop on the right Rust line.
+
+### Cross-file spans
+
+Some source spans point into helper files. For example, a kernel in
+`src/main.rs` may step into `cuda-device/src/thread.rs` when calling
+`thread::index_1d()`.
+
+The exporter must not attach `thread.rs:292` directly to the kernel's
+`src/main.rs` scope. That would tell the debugger "line 292 of main.rs", which
+is the kind of small lie that turns debugging into archaeology.
+
+Instead, cuda-oxide creates a file-specific debug scope:
+
+```text
+src/main.rs function scope
+  |
+  +-- cuda-device/src/thread.rs file scope
+        |
+        +-- line 292, column 19
+```
+
+In LLVM metadata this looks like:
+
+```llvm
+!thread_scope = !DILexicalBlockFile(scope: !kernel_scope, file: !thread_file, discriminator: 0)
+!loc = !DILocation(line: 292, column: 19, scope: !thread_scope)
+```
+
+When Pliron gives an explicit callsite location, the exporter also records
+where the helper code was reached from:
+
+```llvm
+!call = !DILocation(line: 39, column: 13, scope: !kernel_scope)
+!loc = !DILocation(line: 292, column: 19, scope: !thread_scope, inlinedAt: !call)
+```
+
+Read that as: "we are executing `thread.rs:292`, reached from `main.rs:39`."
+
+### Variables
+
+Full debug mode adds the first variable records on top of line locations:
+
+```llvm
+%tid_slot = alloca i32
+call void @llvm.dbg.declare(metadata ptr %tid_slot, metadata !tid, metadata !DIExpression())
+
+!tid = !DILocalVariable(name: "tid", scope: !func, file: !file, line: 31, type: !u32)
+```
+
+The model is the one every debug build uses:
+
+```text
+dbg.declare -> "this source variable lives at this address"
+```
+
+Because the address is stable for the variable's whole scope, cuda-gdb can read
+it at any breakpoint inside that scope. To keep those addresses real, full-debug
+is a `-G`-style build: it **skips** Pliron `mem2reg` (so the stack slots
+survive), **skips** LLVM `opt -O2`, and runs `llc` at `-O0`. Promoting a local
+to an SSA value would shrink its inspectable range to its register's liveness,
+which is exactly how an optimized build ends up showing in-scope locals as
+`<optimized out>`.
+
+The aggregate locals (structs, tuples, arrays) get a `DICompositeType` whose
+members carry rustc's real layout offsets, so `info locals` prints their fields:
+
+```text
+out = DisjointSlice {ptr: 0x..., len: 1}
+```
+
+Pliron `mem2reg` still has a promotion-aware salvage path: when it promotes a
+debug-tagged slot it emits a `mir.dbg_value` ("this source variable has this SSA
+value here") that lowers to `llvm.dbg.value`. That is the groundwork for a
+future *optimized* debug tier; the current `full` tier does not run `mem2reg`,
+so it relies on `dbg.declare` instead.
+
+### Variable scopes and inlining
+
+Variable metadata has one extra rule: `arg: 1` means "formal argument #1 of
+the function named by this debug scope." After MIR inlining, two variables in
+one kernel body can both honestly be `arg: 1`:
+
+```text
+caller kernel:  data  -> arg #1 of caller
+inlined helper: self  -> arg #1 of helper
+```
+
+So cuda-oxide carries rustc's MIR source-scope table alongside each translated
+function. A local debug record stores only the source-scope id it came from;
+the LLVM exporter turns that id into the right DWARF shape:
+
+```text
+kernel DISubprogram
+  |
+  +-- helper DISubprogram
+        |
+        +-- DILocation(..., inlinedAt: kernel callsite)
+```
+
+This is why `data` and `self` can both keep `arg: 1` without LLVM rejecting the
+module as contradictory.
+
+The current placement is conservative. If `mem2reg` creates a block argument
+that acts like a PHI value, cuda-oxide records the variable at the promoted
+load/store source point. It does not yet add an eager block-entry debug record
+just because the compiler created a join value:
+
+```text
+then -> merge(10)
+else -> merge(20)
+
+merge(%x):
+  ... old load site becomes dbg.value(%x, "x") ...
+```
+
+That is correct but not maximally precise. A future pass can make `x` visible
+earlier in the merge block once the source location and lexical scope rules are
+clear.
+
+One more compiler-maintainer detail: `mir.dbg_value` is debug-only, but inside
+Pliron today it still has a normal operand use. cuda-oxide therefore does not
+run Pliron DCE after this debug salvage point. If we add that later, DCE needs
+to treat debug uses as non-semantic, the same way LLVM treats `dbg.value`.
+
+PHI nodes generated by the exporter normally do not get `!dbg`: they are SSA
+bookkeeping, not source operations the user wrote. Later variable metadata can
+refer to PHI values through `dbg.value`, but the PHI itself should not become a
+surprise stop in cuda-gdb.
+
+---
+
 ## Symbol Name Sanitization
 
 Function names flow through several stages, each applying its own constraints:
@@ -328,8 +495,8 @@ rustc_public (FQDN)            helper_fn::cuda_oxide_device_<hash>_vecadd
   ↓ body.rs (:: → __)
 dialect-mir                    helper_fn__cuda_oxide_device_<hash>_vecadd
   ↓ call.rs (:: → __)
-dialect-llvm                   helper_fn__cuda_oxide_device_<hash>_vecadd
-  ↓ export.rs (strip prefix)
+LLVM dialect                   helper_fn__cuda_oxide_device_<hash>_vecadd
+  ↓ llvm-export (strip prefix)
 Textual LLVM IR                @vecadd
   ↓ llc
 PTX                            vecadd
@@ -364,7 +531,7 @@ collision detection systematically.
 
 ## PTX Generation
 
-After `dialect-llvm` is exported to a textual `.ll` file, the final step is
+After the LLVM dialect is exported to a textual `.ll` file, the final step is
 invoking `llc` -- LLVM's static compiler -- to produce PTX assembly:
 
 ```bash
@@ -373,19 +540,25 @@ llc -march=nvptx64 -mcpu=sm_90 kernel.ll -o kernel.ptx
 
 ### Target Selection
 
-The pipeline probes for `llc` on `PATH` in the order below. LLVM 21 is the
-minimum — earlier releases reject the TMA / tcgen05 / WGMMA intrinsic
-signatures that cuda-oxide emits.
+The pipeline probes for `llc` in the order below. LLVM 21 is the minimum —
+earlier releases reject the TMA / tcgen05 / WGMMA intrinsic signatures
+that cuda-oxide emits.
 
-| Priority | llc Version | Target                   | PTX Version |
-| :------- | :---------- | :----------------------- | :---------- |
-| 1st      | `llc-22`    | `sm_100a` (Blackwell DC) | PTX 8.x     |
-| 2nd      | `llc-21`    | `sm_100` / `sm_120`      | PTX 8.x     |
+| Priority | Source                                                    | Notes                                                                 |
+| :------- | :-------------------------------------------------------- | :-------------------------------------------------------------------- |
+| 1st      | `$CUDA_OXIDE_LLC` (if set)                                | Caller-supplied override; whatever binary you point it at.            |
+| 2nd      | Rust toolchain's `llvm-tools` llc                         | `<sysroot>/lib/rustlib/<host>/bin/llc` (auto-installed via `rustup`). |
+| 3rd      | `llc-22` on `PATH`                                        | Distro / `apt.llvm.org` install of LLVM 22.                           |
+| 4th      | `llc-21` on `PATH`                                        | Distro / `apt.llvm.org` install of LLVM 21.                           |
+| 5th      | `llc` on `PATH`                                           | Reporting fallback only; rejected at runtime if older than LLVM 21.   |
 
-If neither is available the pipeline fails with a clear error. You can opt
-into a specific (possibly older) binary by setting
-`CUDA_OXIDE_LLC=/path/to/llc`, but simple kernels are the only thing
-guaranteed to compile on LLVM 20 and below.
+The pinned Rust toolchain (`nightly-2026-04-03`) ships LLVM 22 with NVPTX
+enabled, so `rustup component add llvm-tools` is the recommended onboarding
+path. The PATH probes for `llc-22` / `llc-21` are kept as a fallback for
+users with an existing LLVM install. If none of the probes succeed the
+pipeline fails with a clear error. You can opt into a specific (possibly
+older) binary by setting `CUDA_OXIDE_LLC=/path/to/llc`, but simple kernels
+are the only thing guaranteed to compile on LLVM 20 and below.
 
 If the selected target does not match the physical GPU, the CUDA driver
 JIT-compiles the PTX at load time. First launch costs roughly 30ms while the
@@ -406,6 +579,12 @@ only) > backend feature-based default. `cargo oxide build` and
 `cargo oxide pipeline` deliberately skip the host-CC step so they remain
 usable for cross-compilation.
 
+If the lowered module calls CUDA libdevice, cuda-oxide switches from `llc` to
+the NVVM path automatically. It resolves the target with the same precedence
+before choosing typed- or opaque-pointer NVVM IR. Explicit NVVM/LTOIR commands
+still require `--arch`; the feature-based fallback applies only when an
+ordinary build discovers that libdevice is needed.
+
 ```{note}
 Why LLVM 21? The 2-D bulk TMA load intrinsic used by `tma_copy`,
 `gemm_sol`, and `tcgen05_matmul` gained a 10-operand form with `addrspace(7)`
@@ -414,6 +593,29 @@ and a `cta_group` parameter in LLVM 21. Older `llc` versions reject it with
 intrinsic emitters per LLVM version, we set 21 as the minimum.
 ```
 
+## Atomic operations in legacy NVVM IR
+
+An “LLVM-level atomic” is an atomic instruction in the NVVM input. It is not a
+statement about whether the GPU has atomic hardware. CUDA 12's LLVM 7 NVVM
+dialect accepts only a subset:
+
+| LLVM construct | CUDA 12 NVVM IR | cuda-oxide legacy path today |
+|:----------------|:----------------|:-----------------------------|
+| Atomic load or store | Not supported as an LLVM atomic instruction | Rejected; it needs another lowering |
+| `fence` | LLVM `fence` is unsupported; an NVVM memory-barrier operation is required | Rejected pending an exact ordering/scope mapping |
+| `cmpxchg` | `i32`/`i64`, plus `i128` on `compute_90+`; global/shared pointers or generic pointers known to refer there | Rejected pending type, address-space, alignment, and ordering validation |
+| `atomicrmw` | Integer `xchg`, `add`, `sub`, `and`, `or`, `xor`, `max`, `min`, `umax`, and `umin` on `i32`/`i64`; `i128 xchg` on `compute_90+`; the same address-space restriction | Rejected pending the same validation |
+| NVVM atomic intrinsics | Provide selected additional operations, including floating-point atomic add | Relaxed, device-scoped `atomicrmw fadd` on `f32`/`f64` in generic/global/shared address spaces is lowered to the exact legacy intrinsic; other atomic RMW operations remain rejected |
+
+The normal LLVM-to-PTX path keeps its existing atomic support. The limitation
+above applies only to the legacy NVVM legalizer. cuda-oxide rejects these
+operations until it can prove that their type, address space, ordering, and
+scope are preserved. The legacy specification also accepts but ignores
+`cmpxchg`'s `weak` marker and failure ordering.
+
+For the exact accepted types and operations, see the
+[CUDA 12.4 NVVM IR specification](https://docs.nvidia.com/cuda/archive/12.4.0/nvvm-ir-spec/index.html).
+
 ---
 
 ## Putting It All Together
@@ -421,7 +623,7 @@ intrinsic emitters per LLVM version, we set 21 as the minimum.
 Here is the full sequence of events when `lower_mir_to_llvm` processes a module:
 
 ```text
-1. Register `dialect-llvm` types and operations
+1. LLVM dialect types and operations are registered automatically (link-time)
 2. For each MirFuncOp in the module:
    a. Create `llvm.func` with flattened type signature
    b. inline_region: move `dialect-mir` blocks into the LLVM function
@@ -429,9 +631,9 @@ Here is the full sequence of events when `lower_mir_to_llvm` processes a module:
    d. Run DialectConversion:
       ├── Walk every `dialect-mir`/`dialect-nvvm` op (def-before-use order)
       ├── Invoke MirToLlvmConversion::rewrite for each op
-      ├── Converter emits `dialect-llvm` op(s) via DialectConversionRewriter
+      ├── Converter emits LLVM dialect op(s) via DialectConversionRewriter
       └── Framework patches block arg types automatically
-3. Export `dialect-llvm` to textual LLVM IR (.ll) (with PHI node conversion)
+3. Export the LLVM dialect to textual LLVM IR (.ll) (with PHI node conversion)
 4. Invoke llc to produce .ptx
 ```
 

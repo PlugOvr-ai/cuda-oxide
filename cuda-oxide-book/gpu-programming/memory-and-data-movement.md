@@ -113,7 +113,7 @@ let results = c_dev.to_host_vec(&stream).unwrap();
 
 | Method                            | Direction     | Description                    |
 |:--------------------------------- |:--------------|:-------------------------------|
-| `from_host(&stream, &[T])`        | Host → Device | Allocate + async copy          |
+| `from_host(&stream, &[T])`        | Host → Device | Allocate + blocking copy       |
 | `zeroed(&stream, len)`            | --            | Allocate + zero-fill           |
 | `to_host_vec(&stream)`            | Device → Host | Async copy + return `Vec<T>`   |
 | `copy_to_host(&stream, &mut [T])` | Device → Host | Copy into existing slice       |
@@ -222,7 +222,8 @@ prevents two threads from writing to the same location.
 
 cuda-oxide provides `DisjointSlice<T, IndexSpace>` as a safe alternative. It
 wraps a mutable slice and only allows writes through a `ThreadIndex` whose
-`IndexSpace` matches its own, ensuring each thread accesses a unique element:
+`IndexSpace` matches its own. Combined with matching prepared launch geometry,
+this ensures each thread accesses a unique element:
 
 ```rust
 use cuda_device::{kernel, DisjointSlice};
@@ -263,6 +264,17 @@ hardware**: every thread in a block receives a unique `threadIdx` from the GPU's
 warp scheduler. For 1D grid launches (where only the x dimension is used), the
 global index derived from `blockIdx.x * blockDim.x + threadIdx.x` is unique
 across the entire grid.
+
+That last statement is conditional: `index_1d()` ignores Y and Z. A 2D grid
+would repeat the same X-derived index for every Y coordinate.
+
+```text
+PreparedLaunch(domain=1) -> Y/Z inactive -> safe DisjointSlice writes
+raw LaunchConfig         -> caller proves Y/Z inactive -> unsafe launch
+```
+
+The witness proves the device-side index space; the prepared launch proves the
+host-side geometry. Both are needed for a fully safe launch.
 
 The witness is also `!Send + !Sync + !Copy + !Clone`, and its `'kernel`
 lifetime is borrowed from a stack-local scope the macros inject -- so a
@@ -426,7 +438,8 @@ without a special CUDA allocator:
 ```rust
 let factor = 5i32;                           // ordinary stack variable
 let scale = |x: i32| x * factor;            // captures &factor (non-move)
-cuda_launch! { kernel: scale, args: [...] }  // GPU reads &factor via HMM
+// SAFETY: args match the kernel's signature; &factor stays alive via HMM.
+unsafe { cuda_launch! { kernel: scale, args: [...] } }  // GPU reads &factor via HMM
 ```
 
 Unlike Unified Memory, HMM requires no special allocation API -- the pointer is

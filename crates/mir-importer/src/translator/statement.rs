@@ -14,34 +14,48 @@
 //! | `Assign(_l, rv)`    | Rvalue → ops; result stored into `_l`'s alloca slot  |
 //! | `*ptr = val`        | `mir.store`                                          |
 //! | `s.field = val`     | `mir.field_addr` + `mir.store` through the slot      |
+//! | `SetDiscriminant`   | `mir.set_discriminant` (enum tag write)              |
 //! | `StorageLive`       | `mir.storage_live` (lifetime marker)                 |
 //! | `StorageDead`       | `mir.storage_dead` (lifetime marker)                 |
 //! | `Nop`               | Skipped                                              |
 //!
 //! # Projections
 //!
-//! Handles up to 2-level projections:
+//! 1- and 2-level projections have dedicated arms:
 //! - `*ptr` → Store through pointer
 //! - `s.field` → Field-address from the slot, then `mir.store`
 //! - `(*ptr).field` → Load pointer, compute field address, store
 //! - `s.outer.inner` → Chained field-address from the slot, then store
+//! - `(*ptr)[i]` → Element address from the unified place-address walker
+//!   (handles both `&mut [T; N]` and fat `&mut [T]` bases), then store
+//!
+//! Deeper chains (e.g. `(*iter).alive.start` from the `for x in arr`
+//! loop machinery) are handled generically: the full projection list is
+//! walked to a destination address with the same place-address walker
+//! that `Rvalue::Ref` uses, then a single `mir.store` writes through it.
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
+use crate::translator::location::span_to_location;
 use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
-use dialect_mir::ops::{MirStorageDeadOp, MirStorageLiveOp, MirStoreOp};
+use dialect_mir::ops::{
+    MirMemcpyOp, MirSetDiscriminantOp, MirStorageDeadOp, MirStorageLiveOp, MirStoreOp,
+};
+use dialect_mir::types::MirEnumType;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::printable::Printable;
 use pliron::r#type::Typed;
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
+use pliron::{input_err, input_error};
 use rustc_public::mir;
+use rustc_public_bridge::IndexedVal;
 use std::num::NonZeroUsize;
 
 /// Translates a MIR statement to one or more `dialect-mir` operations.
@@ -58,14 +72,38 @@ pub fn translate_statement(
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
 ) -> TranslationResult<Option<Ptr<Operation>>> {
-    // Use Debug representation of the span as location
-    let loc = Location::Named {
-        name: format!("{:?}", stmt.span),
-        child_loc: Box::new(Location::Unknown),
-    };
+    let loc = span_to_location(ctx, stmt.span);
 
     match &stmt.kind {
         mir::StatementKind::Assign(place, rvalue) => {
+            // Fast paths: array initializers assigned to an addressable local.
+            // Store each element directly into the alloca storage instead of
+            // building an SSA aggregate (insertvalue chain) and then storing it.
+            if value_map.get_slot(place.local).is_some() {
+                match rvalue {
+                    mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) => {
+                        return translate_array_agg_into_alloca(
+                            ctx, body, place, operands, value_map, block_ptr, prev_op, loc,
+                        );
+                    }
+                    mir::Rvalue::Repeat(operand, count) => {
+                        let n = count.eval_target_usize().map_err(|e| {
+                            input_error!(
+                                loc.clone(),
+                                TranslationErr::unsupported(format!(
+                                    "Failed to evaluate Repeat count: {:?}",
+                                    e
+                                ))
+                            )
+                        })? as usize;
+                        return translate_repeat_into_alloca(
+                            ctx, body, place, operand, n, value_map, block_ptr, prev_op, loc,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
             // Translate the Rvalue to get the value being assigned
             let (rvalue_op_opt, result_value, last_inserted) = rvalue::translate_rvalue(
                 ctx,
@@ -607,6 +645,99 @@ pub fn translate_statement(
 
                         Ok(Some(store_op))
                     }
+                    (
+                        mir::ProjectionElem::Deref,
+                        mir::ProjectionElem::Index(_) | mir::ProjectionElem::ConstantIndex { .. },
+                    ) => {
+                        // `(*ptr)[i] = value`, e.g. `a[i] = v` where `a` is
+                        // `&mut [T; N]` (thin pointer to an array) or
+                        // `&mut [T]` (fat slice pointer). The shared
+                        // walk-and-store path loads the pointer for the
+                        // `Deref` (extracting the thin data pointer when the
+                        // pointee is slice-shaped) and applies the index, so
+                        // the store writes to the ORIGINAL storage.
+                        store_through_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            result_value,
+                            rvalue_op_opt,
+                            last_inserted,
+                            prev_op,
+                            block_ptr,
+                            loc,
+                        )
+                    }
+                    (
+                        mir::ProjectionElem::Index(_outer_index_local),
+                        mir::ProjectionElem::Index(_inner_index_local),
+                    ) => {
+                        // `_local[i][j] = value` for nested arrays. The shared
+                        // walk-and-store path already handles chained runtime
+                        // indexes, so delegate to it instead of re-deriving the
+                        // address here. That keeps this 2-level arm from drifting
+                        // from the (Deref, Index) arm above and the N-projection
+                        // fallback below, which use the same helper. The store
+                        // target of an assignment is always a mutable place, so
+                        // the helper's mutable-address request is correct here.
+                        store_through_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            result_value,
+                            rvalue_op_opt,
+                            last_inserted,
+                            prev_op,
+                            block_ptr,
+                            loc,
+                        )
+                    }
+                    (
+                        mir::ProjectionElem::Field(_, _),
+                        mir::ProjectionElem::ConstantIndex { .. } | mir::ProjectionElem::Index(_),
+                    ) => {
+                        // `_local.field[const]` or `_local.field[i]`: step into a
+                        // struct field, then index into the resulting array. The
+                        // walk-and-store helper resolves the full address chain.
+                        store_through_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            result_value,
+                            rvalue_op_opt,
+                            last_inserted,
+                            prev_op,
+                            block_ptr,
+                            loc,
+                        )
+                    }
+                    (
+                        mir::ProjectionElem::Index(_) | mir::ProjectionElem::ConstantIndex { .. },
+                        mir::ProjectionElem::Field(_, _),
+                    ) => {
+                        // `_local[i].field` or `_local[const].field`: index into
+                        // an array/slice element, then step into a struct field.
+                        // The walk-and-store helper resolves the full address
+                        // chain, mirroring the (Field, Index) and (Index, Index)
+                        // arms above. The store target of an assignment is always
+                        // a mutable place, so the helper's mutable-address request
+                        // is correct here.
+                        store_through_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            result_value,
+                            rvalue_op_opt,
+                            last_inserted,
+                            prev_op,
+                            block_ptr,
+                            loc,
+                        )
+                    }
                     _ => input_err!(
                         loc,
                         TranslationErr::unsupported(format!(
@@ -616,12 +747,24 @@ pub fn translate_statement(
                     ),
                 }
             } else {
-                input_err!(
+                // 3+ projections, e.g. `(*iter).alive.start = value` from the
+                // inlined `IndexRange::next_unchecked` inside
+                // `core::array::IntoIter`'s `next` (the `for x in arr` loop
+                // machinery, issue #138). Instead of enumerating every
+                // combination by hand like the 1- and 2-level arms above, walk
+                // the full projection chain to a destination address with the
+                // same walker that `Rvalue::Ref` uses, then store through it.
+                store_through_place_address(
+                    ctx,
+                    body,
+                    value_map,
+                    place,
+                    result_value,
+                    rvalue_op_opt,
+                    last_inserted,
+                    prev_op,
+                    block_ptr,
                     loc,
-                    TranslationErr::unsupported(format!(
-                        "Complex places ({} projections) not yet implemented",
-                        place.projection.len()
-                    ))
                 )
             }
         }
@@ -680,29 +823,252 @@ pub fn translate_statement(
         // `Assume` is an optimisation hint with no observable effect; safe to skip.
         mir::StatementKind::Intrinsic(mir::NonDivergingIntrinsic::Assume(_)) => Ok(prev_op),
 
+        mir::StatementKind::Intrinsic(mir::NonDivergingIntrinsic::CopyNonOverlapping(copy)) => {
+            let (dst, last_op) = rvalue::translate_operand(
+                ctx,
+                body,
+                &copy.dst,
+                value_map,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )?;
+            let (src, last_op) = rvalue::translate_operand(
+                ctx,
+                body,
+                &copy.src,
+                value_map,
+                block_ptr,
+                last_op,
+                loc.clone(),
+            )?;
+            let (count, last_op) = rvalue::translate_operand(
+                ctx,
+                body,
+                &copy.count,
+                value_map,
+                block_ptr,
+                last_op,
+                loc.clone(),
+            )?;
+
+            let memcpy_op = Operation::new(
+                ctx,
+                MirMemcpyOp::get_concrete_op_info(),
+                vec![],
+                vec![dst, src, count],
+                vec![],
+                0,
+            );
+            memcpy_op.deref_mut(ctx).set_loc(loc);
+            if let Some(prev) = last_op {
+                memcpy_op.insert_after(ctx, prev);
+            } else {
+                memcpy_op.insert_at_front(block_ptr, ctx);
+            }
+            Ok(Some(memcpy_op))
+        }
+
         // Statements with observable runtime effect that are not yet lowered.
         // Returning a hard error here converts what was previously a silent
         // miscompile (the catch-all `Ok(prev_op)`) into a clear build failure.
-        // `Intrinsic(CopyNonOverlapping)` is the user-visible memcpy emitted by
-        // `core::ptr::copy_nonoverlapping`; `SetDiscriminant` mutates an enum's
-        // discriminant. Both must be implemented before they can be accepted.
-        mir::StatementKind::Intrinsic(mir::NonDivergingIntrinsic::CopyNonOverlapping(_)) => {
-            input_err!(
-                loc,
-                TranslationErr::unsupported(
-                    "core::ptr::copy_nonoverlapping is not yet supported on the device; \
-                     until it is lowered, the call would be silently dropped from the PTX",
+        // `SetDiscriminant` mutates an enum's discriminant in place.
+        mir::StatementKind::SetDiscriminant {
+            place,
+            variant_index,
+        } => {
+            let place_ty = place.ty(body.locals()).map_err(|e| {
+                input_error!(
+                    loc.clone(),
+                    TranslationErr::unsupported(format!(
+                        "Failed to resolve place type for SetDiscriminant: {:?}",
+                        e
+                    ))
                 )
-            )
+            })?;
+            let variant_idx = variant_index.to_index();
+            let enum_mir_ty = types::translate_type(ctx, &place_ty)?;
+            let (layout_kind, single_variant) = {
+                let enum_ty_obj = enum_mir_ty.deref(ctx);
+                let Some(enum_ty) = enum_ty_obj.downcast_ref::<MirEnumType>() else {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "SetDiscriminant place type is not a supported enum: {}",
+                            enum_mir_ty.disp(ctx)
+                        ))
+                    );
+                };
+                if variant_idx >= enum_ty.variant_count() {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "SetDiscriminant variant index {} out of bounds for enum '{}'",
+                            variant_idx,
+                            enum_ty.name()
+                        ))
+                    );
+                }
+                if enum_ty.variant_is_inhabited(variant_idx) != Some(true) {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "SetDiscriminant cannot select uninhabited variant {}",
+                            variant_idx
+                        ))
+                    );
+                }
+                (enum_ty.layout_kind, enum_ty.single_variant as usize)
+            };
+
+            match layout_kind {
+                dialect_mir::types::EnumLayoutKind::Single if variant_idx == single_variant => {
+                    return Ok(prev_op);
+                }
+                dialect_mir::types::EnumLayoutKind::Direct
+                | dialect_mir::types::EnumLayoutKind::Niche => {}
+                other => {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "SetDiscriminant cannot lower enum layout kind {:?}",
+                            other
+                        ))
+                    );
+                }
+            }
+
+            // Get the address of the enum place.
+            let (enum_ptr, addr_prev) = match rvalue::translate_place_address(
+                ctx,
+                body,
+                value_map,
+                place,
+                /* is_mutable */ true,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )? {
+                Some(pair) => pair,
+                None => {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(
+                            "SetDiscriminant place has no addressable slot".to_string()
+                        )
+                    );
+                }
+            };
+
+            // The pointer type is determined by the place address walker;
+            // MirSetDiscriminantOp's verifier will catch any type mismatch.
+            let set_op = Operation::new(
+                ctx,
+                MirSetDiscriminantOp::get_concrete_op_info(),
+                vec![],
+                vec![enum_ptr],
+                vec![],
+                0,
+            );
+            set_op.deref_mut(ctx).set_loc(loc.clone());
+
+            MirSetDiscriminantOp::new(set_op).set_attr_set_discriminant_variant_index(
+                ctx,
+                dialect_mir::attributes::VariantIndexAttr(variant_idx as u32),
+            );
+
+            let insert_after = addr_prev.or(prev_op);
+            if let Some(prev) = insert_after {
+                set_op.insert_after(ctx, prev);
+            } else {
+                set_op.insert_at_front(block_ptr, ctx);
+            }
+
+            Ok(Some(set_op))
         }
-        mir::StatementKind::SetDiscriminant { .. } => input_err!(
-            loc,
-            TranslationErr::unsupported(
-                "SetDiscriminant statements are not yet supported on the device; \
-                 until they are lowered, enum discriminant writes would be silently dropped",
-            )
-        ),
     }
+}
+
+/// Shared walk-and-store path for projected assignments: insert the pending
+/// rvalue op (if any), walk the FULL projection chain of `place` to a
+/// mutable destination address with the same place-address walker that
+/// `Rvalue::Ref` uses (`rvalue::translate_place_address`), then write
+/// `result_value` through it with a single `mir.store`.
+///
+/// Used by the dedicated `(*ptr)[i] = value` arm (thin `&mut [T; N]` and
+/// fat `&mut [T]` bases, issue #58) and by the generic fallback for 3+
+/// projection chains such as `(*iter).alive.start = value` from the
+/// `for x in arr` loop machinery (issue #138).
+///
+/// A punt from the walker is reported as an unsupported construct: the
+/// destination is written through, so falling back to a value copy would
+/// silently lose the write.
+#[allow(clippy::too_many_arguments)]
+fn store_through_place_address(
+    ctx: &mut Context,
+    body: &mir::Body,
+    value_map: &ValueMap,
+    place: &mir::Place,
+    result_value: Value,
+    rvalue_op_opt: Option<Ptr<Operation>>,
+    last_inserted: Option<Ptr<Operation>>,
+    prev_op: Option<Ptr<Operation>>,
+    block_ptr: Ptr<BasicBlock>,
+    loc: Location,
+) -> TranslationResult<Option<Ptr<Operation>>> {
+    let mut current_prev = prev_op;
+    if let Some(rvalue_op) = rvalue_op_opt {
+        if let Some(prev) = last_inserted {
+            rvalue_op.insert_after(ctx, prev);
+        } else if let Some(prev) = prev_op {
+            rvalue_op.insert_after(ctx, prev);
+        } else {
+            rvalue_op.insert_at_front(block_ptr, ctx);
+        }
+        current_prev = Some(rvalue_op);
+    } else if let Some(prev) = last_inserted {
+        current_prev = Some(prev);
+    }
+
+    // The destination is written through, so request a mutable address.
+    let walked = rvalue::translate_place_address(
+        ctx,
+        body,
+        value_map,
+        place,
+        /* is_mutable */ true,
+        block_ptr,
+        current_prev,
+        loc.clone(),
+    )?;
+    let Some((dest_addr, addr_prev)) = walked else {
+        // The walker punted (a projection it cannot turn into an address,
+        // or the local has no slot). Reject loudly instead of copying.
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "cannot compute the destination address for the assignment \
+                 (projections {:?})",
+                place.projection
+            ))
+        );
+    };
+    let current_prev = addr_prev.or(current_prev);
+
+    let store_op = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![dest_addr, result_value],
+        vec![],
+        0,
+    );
+    store_op.deref_mut(ctx).set_loc(loc);
+    match current_prev {
+        Some(prev) => store_op.insert_after(ctx, prev),
+        None => store_op.insert_at_front(block_ptr, ctx),
+    }
+    Ok(Some(store_op))
 }
 
 /// Extract the element type and address space from a pointer that points
@@ -716,7 +1082,7 @@ fn slot_array_element_ty(
     ctx: &pliron::context::Context,
     arr_ptr: Value,
     loc: &Location,
-) -> TranslationResult<(pliron::context::Ptr<pliron::r#type::TypeObj>, u32)> {
+) -> TranslationResult<(pliron::r#type::TypeHandle, u32)> {
     let arr_ptr_ty = arr_ptr.get_type(ctx);
     let arr_ptr_ty_ref = arr_ptr_ty.deref(ctx);
     let mir_ptr_ty = arr_ptr_ty_ref
@@ -752,7 +1118,7 @@ fn emit_array_element_store(
     array_ptr: Value,
     index: Value,
     value: Value,
-    element_ty: pliron::context::Ptr<pliron::r#type::TypeObj>,
+    element_ty: pliron::r#type::TypeHandle,
     address_space: u32,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -814,4 +1180,128 @@ fn pointer_address_space(ctx: &pliron::context::Context, ptr: Value) -> u32 {
         .downcast_ref::<dialect_mir::types::MirPtrType>()
         .map(|p| p.address_space)
         .unwrap_or(0)
+}
+
+/// Assign an array aggregate element-by-element into addressable storage.
+///
+/// Handles `Rvalue::Repeat(operand, N)` assigned to an addressable local.
+///
+/// Translates the operand once and stores N copies directly into the alloca
+/// via ConstantIndex projections. Avoids building a full SSA aggregate and the
+/// resulting `insertvalue` chain in LLVM IR.
+fn translate_repeat_into_alloca(
+    ctx: &mut Context,
+    body: &mir::Body,
+    dest_place: &mir::Place,
+    operand: &mir::Operand,
+    count: usize,
+    value_map: &mut ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<Ptr<Operation>>> {
+    let (elem_val, after_operand) = rvalue::translate_operand(
+        ctx,
+        body,
+        operand,
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let mut current_prev = after_operand.or(prev_op);
+
+    for i in 0..count {
+        let elem_place = mir::Place {
+            local: dest_place.local,
+            projection: dest_place
+                .projection
+                .iter()
+                .cloned()
+                .chain(std::iter::once(mir::ProjectionElem::ConstantIndex {
+                    offset: i as u64,
+                    min_length: count as u64,
+                    from_end: false,
+                }))
+                .collect(),
+        };
+
+        let after_store = store_through_place_address(
+            ctx,
+            body,
+            value_map,
+            &elem_place,
+            elem_val,
+            None,
+            current_prev,
+            current_prev,
+            block_ptr,
+            loc.clone(),
+        )?;
+        current_prev = after_store.or(current_prev);
+    }
+
+    Ok(current_prev)
+}
+
+/// When the destination has an alloca slot and the RHS is
+/// `Rvalue::Aggregate(Array, operands)`, building a full SSA aggregate
+/// (`MirConstructArrayOp`) followed by a single large store produces a chain
+/// of `insertvalue` instructions in LLVM IR. This helper skips the aggregate
+/// entirely and stores each element directly to its computed address.
+fn translate_array_agg_into_alloca(
+    ctx: &mut Context,
+    body: &mir::Body,
+    dest_place: &mir::Place,
+    operands: &[mir::Operand],
+    value_map: &mut ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<Ptr<Operation>>> {
+    let mut current_prev = prev_op;
+
+    for (i, operand) in operands.iter().enumerate() {
+        let (elem_val, after_operand) = rvalue::translate_operand(
+            ctx,
+            body,
+            operand,
+            value_map,
+            block_ptr,
+            current_prev,
+            loc.clone(),
+        )?;
+        current_prev = after_operand.or(current_prev);
+
+        // Extend the destination place with a ConstantIndex for this element.
+        let elem_place = mir::Place {
+            local: dest_place.local,
+            projection: dest_place
+                .projection
+                .iter()
+                .cloned()
+                .chain(std::iter::once(mir::ProjectionElem::ConstantIndex {
+                    offset: i as u64,
+                    min_length: operands.len() as u64,
+                    from_end: false,
+                }))
+                .collect(),
+        };
+
+        let after_store = store_through_place_address(
+            ctx,
+            body,
+            value_map,
+            &elem_place,
+            elem_val,
+            None,
+            current_prev,
+            current_prev,
+            block_ptr,
+            loc.clone(),
+        )?;
+        current_prev = after_store.or(current_prev);
+    }
+
+    Ok(current_prev)
 }

@@ -12,7 +12,7 @@
 //! 2. **`core::sync::atomic::*`** — standard library atomics (via `std::intrinsics::atomic_*`)
 //!
 //! Both front-ends emit the same NVVM ops and share the entire lowering pipeline
-//! (mir-lower fence splitting → `dialect-llvm` → export → llc → PTX).
+//! (mir-lower fence splitting → LLVM dialect → export → llc → PTX).
 //!
 //! # cuda_device Path — Type Resolution
 //!
@@ -36,15 +36,15 @@
 //! | Method       | Integer RMW Kind   | Float RMW Kind |
 //! |--------------|--------------------|----------------|
 //! | `fetch_add`  | `Add`              | `FAdd`         |
-//! | `fetch_sub`  | `Sub`              | —              |
+//! | `fetch_sub`  | `Sub`              | `FAdd(-x)`     |
 //! | `fetch_and`  | `And`              | —              |
 //! | `fetch_or`   | `Or`               | —              |
 //! | `fetch_xor`  | `Xor`              | —              |
-//! | `fetch_min`  | `Min` / `UMin` [*] | —              |
-//! | `fetch_max`  | `Max` / `UMax` [*] | —              |
+//! | `fetch_min`  | `Min` / `UMin` `[*]` | —            |
+//! | `fetch_max`  | `Max` / `UMax` `[*]` | —            |
 //! | `swap`       | `Xchg`             | `Xchg`         |
 //!
-//! [*] `fetch_min`/`fetch_max` use signed (`Min`/`Max`) for `I32`/`I64`,
+//! `[*]` `fetch_min`/`fetch_max` use signed (`Min`/`Max`) for `I32`/`I64`,
 //!     unsigned (`UMin`/`UMax`) for `U32`/`U64`.
 //!
 //! # core::sync::atomic Path
@@ -64,23 +64,26 @@
 
 use super::super::helpers::emit_store_result_and_goto;
 use crate::error::{TranslationErr, TranslationResult};
-use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
+use crate::translator::{rvalue, types};
 
 use dialect_nvvm::ops::atomic::{
     AtomicOrdering, AtomicRmwKind, AtomicScope, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
     NvvmAtomicRmwOp, NvvmAtomicStoreOp,
 };
 
+use dialect_mir::ops::{MirConstructTupleOp, MirEqOp, MirNegOp};
+use dialect_mir::types::MirFP16Type;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::r#type::Typed;
+use pliron::{input_err, input_error_noloc};
 use rustc_public::mir;
-use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
+use rustc_public::ty::{GenericArgKind, RigidTy, TyConst, TyConstKind, TyKind};
 // =============================================================================
 // Type info — extracted from the atomic type name in the call path
 // =============================================================================
@@ -97,9 +100,12 @@ pub struct AtomicTypeInfo {
 
 impl AtomicTypeInfo {
     /// Get the pliron result type for this atomic's element.
-    fn element_type(&self, ctx: &mut Context) -> Ptr<pliron::r#type::TypeObj> {
+    fn element_type(&self, ctx: &mut Context) -> pliron::r#type::TypeHandle {
         if self.is_float {
             match self.bit_width {
+                // Rust `f16` is represented by dialect-mir's own `mir.fp16` (apfloat::Half);
+                // f32/f64 reuse the pliron builtin float types.
+                16 => MirFP16Type::get(ctx).into(),
                 32 => FP32Type::get(ctx).into(),
                 64 => FP64Type::get(ctx).into(),
                 _ => unreachable!("unsupported float atomic width: {}", self.bit_width),
@@ -110,7 +116,7 @@ impl AtomicTypeInfo {
             } else {
                 Signedness::Unsigned
             };
-            IntegerType::get(ctx, self.bit_width, signedness).to_ptr()
+            IntegerType::get(ctx, self.bit_width, signedness).to_handle()
         }
     }
 }
@@ -136,6 +142,7 @@ fn parse_atomic_type_name(type_name: &str) -> Option<AtomicTypeInfo> {
         "I32" => (32, false, true),
         "U64" => (64, false, false),
         "I64" => (64, false, true),
+        "F16" => (16, true, false),
         "F32" => (32, true, false),
         "F64" => (64, true, false),
         _ => return None,
@@ -177,7 +184,8 @@ fn parse_atomic_path(path: &str) -> Option<(AtomicTypeInfo, &str)> {
 /// - Unsigned types (U32, U64) → `UMin`/`UMax`
 /// - Signed types (I32, I64) → `Min`/`Max`
 ///
-/// For `fetch_add` on float types → `FAdd` (hardware `atom.add.f32/f64`).
+/// For float `fetch_add`, use `FAdd`; float `fetch_sub` is handled as
+/// `FAdd(-x)` at emission time so LLVM can use native PTX add atomics.
 fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKind> {
     match method {
         "fetch_add" => {
@@ -187,7 +195,13 @@ fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKi
                 Some(AtomicRmwKind::Add)
             }
         }
-        "fetch_sub" => Some(AtomicRmwKind::Sub),
+        "fetch_sub" => {
+            if info.is_float {
+                Some(AtomicRmwKind::FAdd)
+            } else {
+                Some(AtomicRmwKind::Sub)
+            }
+        }
         "fetch_and" => Some(AtomicRmwKind::And),
         "fetch_or" => Some(AtomicRmwKind::Or),
         "fetch_xor" => Some(AtomicRmwKind::Xor),
@@ -296,6 +310,7 @@ pub fn dispatch(
         "fetch_add" | "fetch_sub" | "fetch_and" | "fetch_or" | "fetch_xor" | "fetch_min"
         | "fetch_max" | "swap" => {
             let rmw_kind = method_to_rmw_kind(method, &type_info).unwrap();
+            let negate_value = type_info.is_float && method == "fetch_sub";
             Ok(Some(emit_atomic_rmw(
                 ctx,
                 body,
@@ -309,6 +324,7 @@ pub fn dispatch(
                 loc,
                 &type_info,
                 rmw_kind,
+                negate_value,
             )?))
         }
 
@@ -511,6 +527,7 @@ fn emit_atomic_rmw(
     loc: Location,
     type_info: &AtomicTypeInfo,
     rmw_kind: AtomicRmwKind,
+    negate_value: bool,
 ) -> TranslationResult<Ptr<Operation>> {
     if args.len() != 3 {
         return input_err!(
@@ -546,6 +563,26 @@ fn emit_atomic_rmw(
         last_op,
         loc.clone(),
     )?;
+
+    let (val, last_op) = if negate_value {
+        let neg_op = Operation::new(
+            ctx,
+            MirNegOp::get_concrete_op_info(),
+            vec![val.get_type(ctx)],
+            vec![val],
+            vec![],
+            0,
+        );
+        neg_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = last_op {
+            neg_op.insert_after(ctx, prev);
+        } else {
+            neg_op.insert_at_front(block_ptr, ctx);
+        }
+        (neg_op.deref(ctx).get_result(0), Some(neg_op))
+    } else {
+        (val, last_op)
+    };
 
     let nvvm_op = NvvmAtomicRmwOp::build(
         ctx,
@@ -710,15 +747,15 @@ fn parse_core_intrinsic_op(path: &str) -> Option<&str> {
 /// |            2 | **Acquire**                         | **Release**           |
 /// |            3 | AcqRel                              | AcqRel                |
 /// |            4 | SeqCst                              | SeqCst                |
-fn intrinsic_ordering_from_discriminant(discr: u64) -> AtomicOrdering {
-    match discr {
+fn intrinsic_ordering_from_discriminant(discr: u64) -> Option<AtomicOrdering> {
+    Some(match discr {
         0 => AtomicOrdering::Relaxed,
         1 => AtomicOrdering::Release, // std has Release=1, unlike cuda_device Acquire=1
         2 => AtomicOrdering::Acquire, // std has Acquire=2, unlike cuda_device Release=2
         3 => AtomicOrdering::AcqRel,
         4 => AtomicOrdering::SeqCst,
-        _ => AtomicOrdering::SeqCst, // Conservative fallback
-    }
+        _ => return None,
+    })
 }
 
 /// Build `AtomicTypeInfo` from a rustc type, with system scope.
@@ -733,8 +770,6 @@ fn type_info_from_mir_ty(ty: &rustc_public::ty::Ty) -> Option<AtomicTypeInfo> {
                 UintTy::U16 => 16,
                 UintTy::U32 => 32,
                 UintTy::U64 => 64,
-                // 128-bit: PTX .b128 requires sm_90+ (Hopper); accepted here and
-                // gated downstream by the architecture check.
                 UintTy::U128 => 128,
                 // usize is target-dependent (32-bit on nvptx, 64-bit on nvptx64).
                 // We only target nvptx64 today; making this configurable via
@@ -750,8 +785,6 @@ fn type_info_from_mir_ty(ty: &rustc_public::ty::Ty) -> Option<AtomicTypeInfo> {
                 IntTy::I16 => 16,
                 IntTy::I32 => 32,
                 IntTy::I64 => 64,
-                // 128-bit: PTX .b128 requires sm_90+ (Hopper); accepted here and
-                // gated downstream by the architecture check.
                 IntTy::I128 => 128,
                 // isize is target-dependent (32-bit on nvptx, 64-bit on nvptx64).
                 // We only target nvptx64 today; making this configurable via
@@ -817,21 +850,26 @@ fn intrinsic_op_to_rmw_kind(op: &str, info: &AtomicTypeInfo) -> Option<AtomicRmw
     }
 }
 
-/// Extract the ordering from the const generic argument of a core atomic intrinsic.
-///
-/// The ordering is the 3rd generic arg (index 2) and is a const of type
-/// `std::intrinsics::AtomicOrdering`.
-fn extract_ordering_from_generics(substs: &rustc_public::ty::GenericArgs) -> AtomicOrdering {
-    if let Some(GenericArgKind::Const(c)) = substs.0.get(2) {
-        let discr = match c.kind() {
-            TyConstKind::Value(_, alloc) => alloc.read_uint().unwrap_or(4) as u64,
-            _ => c.eval_target_usize().unwrap_or(4),
-        };
-        intrinsic_ordering_from_discriminant(discr)
-    } else {
-        // Fallback: SeqCst (conservative)
-        AtomicOrdering::SeqCst
-    }
+fn extract_core_ordering(c: &TyConst) -> Option<AtomicOrdering> {
+    let discr = match c.kind() {
+        TyConstKind::Value(_, alloc) => u64::try_from(alloc.read_uint().ok()?).ok()?,
+        _ => c.eval_target_usize().ok()?,
+    };
+    intrinsic_ordering_from_discriminant(discr)
+}
+
+/// Extract ordering consts without assuming how many type generics precede them.
+fn extract_orderings_from_generics(
+    substs: &rustc_public::ty::GenericArgs,
+) -> Option<Vec<AtomicOrdering>> {
+    substs
+        .0
+        .iter()
+        .filter_map(|arg| match arg {
+            GenericArgKind::Const(c) => Some(extract_core_ordering(c)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Extract the element type from the first generic type arg.
@@ -868,7 +906,10 @@ pub fn dispatch_core_intrinsic(
     let op_name = parse_core_intrinsic_op(path).unwrap_or("");
 
     // Extract generic args from the func operand
-    let (type_info, ordering) = extract_core_intrinsic_generics(func, &loc)?;
+    let is_cmpxchg = op_name == "cxchg" || op_name == "cxchgweak";
+    let expected_orderings = if is_cmpxchg { 2 } else { 1 };
+    let (type_info, orderings) = extract_core_intrinsic_generics(func, &loc, expected_orderings)?;
+    let ordering = orderings[0].clone();
 
     // Route by operation name
     if op_name == "load" {
@@ -901,7 +942,7 @@ pub fn dispatch_core_intrinsic(
             &type_info,
             ordering,
         )
-    } else if op_name == "cxchg" || op_name == "cxchgweak" {
+    } else if is_cmpxchg {
         emit_core_atomic_cmpxchg(
             ctx,
             body,
@@ -915,6 +956,7 @@ pub fn dispatch_core_intrinsic(
             loc,
             &type_info,
             ordering,
+            orderings[1].clone(),
         )
     } else if let Some(rmw_kind) = intrinsic_op_to_rmw_kind(op_name, &type_info) {
         emit_core_atomic_rmw(
@@ -944,30 +986,37 @@ pub fn dispatch_core_intrinsic(
 fn extract_core_intrinsic_generics(
     func: &mir::Operand,
     loc: &Location,
-) -> TranslationResult<(AtomicTypeInfo, AtomicOrdering)> {
+    expected_orderings: usize,
+) -> TranslationResult<(AtomicTypeInfo, Vec<AtomicOrdering>)> {
     if let mir::Operand::Constant(const_op) = func
         && let TyKind::RigidTy(RigidTy::FnDef(_, substs)) = const_op.const_.ty().kind()
     {
         if let Some(type_info) = extract_type_info_from_generics(&substs) {
-            // PTX has no 8-bit atomics; 16-bit is partial (sm_70+). Reject both for now.
-            if type_info.bit_width == 8 {
+            if !core_atomic_width_is_supported(type_info.bit_width) {
                 return input_err!(
                     loc.clone(),
-                    TranslationErr::unsupported(
-                        "8-bit atomics are not supported by PTX; use 32-bit or 64-bit"
-                    )
+                    TranslationErr::unsupported(format!(
+                        "{}-bit core atomics are not supported; use 32-bit or 64-bit",
+                        type_info.bit_width
+                    ))
                 );
             }
-            if type_info.bit_width == 16 {
+            let Some(orderings) = extract_orderings_from_generics(&substs) else {
                 return input_err!(
                     loc.clone(),
-                    TranslationErr::unsupported(
-                        "16-bit atomics are not yet supported; use 32-bit or 64-bit"
-                    )
+                    TranslationErr::unsupported("could not evaluate core atomic ordering generics")
+                );
+            };
+            if orderings.len() != expected_orderings {
+                return input_err!(
+                    loc.clone(),
+                    TranslationErr::unsupported(format!(
+                        "core atomic intrinsic requires {expected_orderings} ordering generic(s), found {}",
+                        orderings.len()
+                    ))
                 );
             }
-            let ordering = extract_ordering_from_generics(&substs);
-            return Ok((type_info, ordering));
+            return Ok((type_info, orderings));
         }
         return input_err!(
             loc.clone(),
@@ -982,6 +1031,10 @@ fn extract_core_intrinsic_generics(
             "core atomic intrinsic: could not extract generics from func operand"
         )
     )
+}
+
+fn core_atomic_width_is_supported(bit_width: u32) -> bool {
+    matches!(bit_width, 32 | 64)
 }
 
 // =============================================================================
@@ -1203,7 +1256,7 @@ fn emit_core_atomic_rmw(
 
 /// Emit a core atomic compare-and-exchange.
 ///
-/// MIR args: `[ptr, old, new]` -- 3 args, ordering from const generic.
+/// MIR args: `[ptr, old, new]` -- 3 args, orderings from const generics.
 /// Returns `(old_val, bool)` tuple (LLVM cmpxchg semantics).
 #[allow(clippy::too_many_arguments)]
 fn emit_core_atomic_cmpxchg(
@@ -1219,11 +1272,8 @@ fn emit_core_atomic_cmpxchg(
     loc: Location,
     type_info: &AtomicTypeInfo,
     success_ordering: AtomicOrdering,
+    failure_ordering: AtomicOrdering,
 ) -> TranslationResult<Ptr<Operation>> {
-    // For cmpxchg, use Monotonic as failure ordering (conservative but correct;
-    // the actual failure ordering would need a 4th const generic which core
-    // intrinsics encode separately -- for now Monotonic is safe).
-    let failure_ordering = AtomicOrdering::Relaxed;
     let result_ty = type_info.element_type(ctx);
 
     // Get the pointer (arg 0)
@@ -1279,16 +1329,91 @@ fn emit_core_atomic_cmpxchg(
     }
 
     let result_value = op_ptr.deref(ctx).get_result(0);
+    let bool_ty = types::get_bool_type(ctx).to_handle();
+    let success_op = Operation::new(
+        ctx,
+        MirEqOp::get_concrete_op_info(),
+        vec![bool_ty],
+        vec![result_value, cmp_val],
+        vec![],
+        0,
+    );
+    success_op.deref_mut(ctx).set_loc(loc.clone());
+    success_op.insert_after(ctx, op_ptr);
+
+    let success_value = success_op.deref(ctx).get_result(0);
+    // The destination place is typed `(T, bool)` in MIR; translate that
+    // rustc type so the constructed tuple uniques with the destination's
+    // layout-carrying tuple type.
+    let dest_tuple_ty = destination.ty(body.locals()).map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Failed to query atomic cmpxchg destination type: {:?}",
+            e
+        )))
+    })?;
+    let tuple_ty = crate::translator::types::translate_type(ctx, &dest_tuple_ty)?;
+    let tuple_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![tuple_ty],
+        vec![result_value, success_value],
+        vec![],
+        0,
+    );
+    tuple_op.deref_mut(ctx).set_loc(loc.clone());
+    tuple_op.insert_after(ctx, success_op);
+
+    let tuple_value = tuple_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
         ctx,
         destination,
-        result_value,
+        tuple_value,
         target,
         block_ptr,
-        op_ptr,
+        tuple_op,
         value_map,
         block_map,
         loc,
         "core atomic cmpxchg call without target block",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{core_atomic_width_is_supported, intrinsic_ordering_from_discriminant};
+    use dialect_nvvm::ops::AtomicOrdering;
+
+    #[test]
+    fn core_atomics_accept_only_current_backend_widths() {
+        assert!(core_atomic_width_is_supported(32));
+        assert!(core_atomic_width_is_supported(64));
+        for width in [8, 16, 128] {
+            assert!(!core_atomic_width_is_supported(width));
+        }
+    }
+
+    #[test]
+    fn core_atomic_ordering_discriminants_match_rustc() {
+        assert_eq!(
+            intrinsic_ordering_from_discriminant(0),
+            Some(AtomicOrdering::Relaxed)
+        );
+        assert_eq!(
+            intrinsic_ordering_from_discriminant(1),
+            Some(AtomicOrdering::Release)
+        );
+        assert_eq!(
+            intrinsic_ordering_from_discriminant(2),
+            Some(AtomicOrdering::Acquire)
+        );
+        assert_eq!(
+            intrinsic_ordering_from_discriminant(3),
+            Some(AtomicOrdering::AcqRel)
+        );
+        assert_eq!(
+            intrinsic_ordering_from_discriminant(4),
+            Some(AtomicOrdering::SeqCst)
+        );
+        assert_eq!(intrinsic_ordering_from_discriminant(5), None);
+    }
 }

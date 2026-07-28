@@ -39,8 +39,12 @@
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
-    mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
+    Barrier, fence_mbarrier_init_release_cluster,
+    fence_proxy_async_generic_acquire_shared_cluster_cluster,
+    fence_proxy_async_generic_release_shared_cta_cluster, fence_proxy_async_shared_cta,
+    mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx,
+    mbarrier_arrive_expect_tx_cluster, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
+    mbarrier_try_wait_parity_cluster,
 };
 use cuda_device::clc::{
     clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel, clc_try_cancel_multicast,
@@ -63,6 +67,148 @@ use cuda_host::cuda_module;
 use half::f16;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+
+// =============================================================================
+// LIVE cuBLASLt BASELINE (replaces the previous hardcoded B200 constants)
+// =============================================================================
+
+/// Live cublasLt FP16 GEMM baseline used to compute "% of SoL" in benchmark
+/// reports.
+///
+/// The baseline is measured by `bench/cublaslt_bench` (a tiny C program that
+/// calls `cublasLtMatmul` with the same shapes/dtypes gemm_sol uses). On
+/// first access we invoke that binary, parse the FP16 section of its output,
+/// and cache the result. If the binary is missing or fails, the per-phase
+/// reports omit the "% of SoL" column rather than printing a misleading
+/// number against a baseline measured on different silicon.
+mod cublas_baseline {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    static BASELINE: OnceLock<Option<HashMap<usize, f64>>> = OnceLock::new();
+
+    /// FP16-input / FP32-compute cublasLtMatmul TFLOPS for an M×M×M GEMM on
+    /// the host GPU, or `None` if the bench could not be measured.
+    pub fn fp16_tflops(m: usize) -> Option<f64> {
+        BASELINE.get_or_init(load).as_ref()?.get(&m).copied()
+    }
+
+    /// Pre-warm the baseline so the ~25s measurement runs at startup, not in
+    /// the middle of a benchmark print.
+    pub fn warmup() {
+        let _ = BASELINE.get_or_init(load);
+    }
+
+    fn bench_binary() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bench")
+            .join("cublaslt_bench")
+    }
+
+    fn load() -> Option<HashMap<usize, f64>> {
+        let bin = bench_binary();
+        if !bin.exists() {
+            eprintln!(
+                "ℹ️  No live cublasLt baseline at {} — % of SoL column will be omitted.",
+                bin.display()
+            );
+            eprintln!(
+                "    Build it once with: cd {} && bash build.sh",
+                bin.parent().unwrap_or(Path::new(".")).display(),
+            );
+            return None;
+        }
+
+        eprintln!("ℹ️  Measuring cublasLt FP16 baseline on host GPU (one-shot, ~25s)...");
+        let out = match std::process::Command::new(&bin).output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("⚠️  Failed to run {}: {e}", bin.display());
+                return None;
+            }
+        };
+        if !out.status.success() {
+            eprintln!(
+                "⚠️  {} exited with status {}: {}",
+                bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let map = parse_fp16(&stdout);
+        if map.is_empty() {
+            eprintln!("⚠️  Could not parse FP16 rows from cublaslt_bench output:\n{stdout}");
+            None
+        } else {
+            let mut sizes: Vec<(usize, f64)> = map.iter().map(|(m, t)| (*m, *t)).collect();
+            sizes.sort_by_key(|(m, _)| *m);
+            let pretty = sizes
+                .iter()
+                .map(|(m, t)| format!("{m}={:.1}", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("✓ cublasLt FP16 baseline (TFLOPS): {pretty}");
+            Some(map)
+        }
+    }
+
+    /// Extract `(M, TFLOPS)` pairs from the `--- FP16 ---` section of
+    /// `cublaslt_bench` output. Lines look like:
+    ///
+    /// ```text
+    /// FP16 FP32 compute   16384x16384x16384   20.5993 ms     427.0 TFLOPS
+    /// ```
+    fn parse_fp16(s: &str) -> HashMap<usize, f64> {
+        let mut map = HashMap::new();
+        let mut in_fp16 = false;
+        for line in s.lines() {
+            let l = line.trim_start();
+            if l.starts_with("--- FP16") {
+                in_fp16 = true;
+                continue;
+            }
+            if l.starts_with("--- BF16") {
+                in_fp16 = false;
+                continue;
+            }
+            if !in_fp16 || !l.starts_with("FP16 ") {
+                continue;
+            }
+            // ["FP16", "FP32", "compute", "MxNxK", "X.XXXX", "ms", "Y.Y", "TFLOPS"]
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            let size = toks.get(3).copied().unwrap_or("");
+            let m: Option<usize> = size.split('x').next().and_then(|s| s.trim().parse().ok());
+            // TFLOPS value is the second-to-last token (last is the literal "TFLOPS")
+            let tf: Option<f64> = toks.iter().rev().nth(1).and_then(|s| s.parse().ok());
+            if let (Some(m), Some(tf)) = (m, tf) {
+                map.insert(m, tf);
+            }
+        }
+        map
+    }
+}
+
+/// Print the "vs cuBLAS" line for a benchmark phase, using the live baseline
+/// from `bench/cublaslt_bench` if available, otherwise an explanatory
+/// placeholder. Replaces the previous hardcoded `match m { ... }` blocks
+/// that compared every host GPU against B200's cublasLt SoL.
+fn print_cublas_comparison(tflops: f64, m: usize) {
+    match cublas_baseline::fp16_tflops(m) {
+        Some(sol) => {
+            let pct = (tflops / sol) * 100.0;
+            println!(
+                "  vs cuBLAS:   {:.2}% of live cublasLt SoL ({:.0} TFLOPS)",
+                pct, sol
+            );
+        }
+        None => {
+            println!("  vs cuBLAS:   (no live cublasLt baseline; see bench/build.sh)");
+        }
+    }
+}
 
 // =============================================================================
 // KERNEL
@@ -332,7 +478,7 @@ mod kernels {
             //   lane_id % 8  → which row within an 8-row group (0..7)
             //   lanes  0..7  → first  8×8 matrix (col_offset + 0..7)
             //   lanes  8..15 → second 8×8 matrix (col_offset + 8..15), offset by 16 bytes
-            //   lanes 16..31 → don't participate in stmatrix (hardware ignores them)
+            //   lanes 16..31 → address operand ignored; fragment registers still participate
             const TILE_N: usize = 128;
             let warp_row_base = (warp_id * 32) as usize;
             let row_stride_bytes = TILE_N * 2; // 128 bf16 = 256 bytes per row
@@ -1828,9 +1974,10 @@ mod kernels {
     ///   │    (blockIdx.x)       │      │ [CTA8..CTA11]       │
     ///   │                       │      │ [CTA12..CTA15]      │
     ///   │ 2. CLC work-stealing: │      │ ...                 │
-    ///   │    arrive_expect_tx   │      │                     │
+    ///   │    lane 0: arm + issue│      │                     │
     ///   │    clc_try_cancel ────┼─────▶│ steal [CTA4..CTA7]  │
-    ///   │    wait CLC_BAR       │      │ (removed from queue)│
+    ///   │    lane 0: wait/decode│      │ (removed from queue)│
+    ///   │    warp: shuffle result│     │                     │
     ///   │                       │      └─────────────────────┘
     ///   │ 3. Process all 4 tiles│
     ///   │    from stolen cluster│      Each CTA independently steals
@@ -1850,6 +1997,8 @@ mod kernels {
     ///   steal pending work via `clc_try_cancel` instead of `atomicAdd` on a global counter.
     /// - **Cluster-aware stealing**: `clc_try_cancel` returns the first ctaid of a stolen
     ///   cluster. Each CTA serially processes all `CLUSTER_SIZE` tiles from that cluster.
+    /// - **Single-lane response ownership**: lane 0 waits for and decodes the async CLC
+    ///   response, then broadcasts the result to its warp so every lane takes the same path.
     /// - **Column-major tile rasterization**: linear ctaid maps to (row, col) for L2 locality.
     /// - **No `tile_counter` parameter**: hardware manages the pending queue, zero contention.
     ///
@@ -1992,6 +2141,11 @@ mod kernels {
                     if is_lane0 {
                         let k_base = (k_idx * 64) as i32;
                         if stage == 0 {
+                            mbarrier_arrive_expect_tx(
+                                &raw const TMA_BAR0,
+                                1,
+                                A_TILE_BYTES + B_TILE_BYTES,
+                            );
                             cp_async_bulk_tensor_2d_g2s(
                                 &raw mut SMEM_A0 as *mut u8,
                                 a_tma,
@@ -2006,12 +2160,12 @@ mod kernels {
                                 n_offset,
                                 &raw mut TMA_BAR0,
                             );
+                        } else {
                             mbarrier_arrive_expect_tx(
-                                &raw const TMA_BAR0,
+                                &raw const TMA_BAR1,
                                 1,
                                 A_TILE_BYTES + B_TILE_BYTES,
                             );
-                        } else {
                             cp_async_bulk_tensor_2d_g2s(
                                 &raw mut SMEM_A1 as *mut u8,
                                 a_tma,
@@ -2025,11 +2179,6 @@ mod kernels {
                                 k_base,
                                 n_offset,
                                 &raw mut TMA_BAR1,
-                            );
-                            mbarrier_arrive_expect_tx(
-                                &raw const TMA_BAR1,
-                                1,
-                                A_TILE_BYTES + B_TILE_BYTES,
                             );
                         }
                     }
@@ -2047,18 +2196,29 @@ mod kernels {
                 loop {
                     let clc_parity = clc_iter & 1;
 
+                    // CLC writes the response through the async proxy. Keep all
+                    // response access in lane 0, then broadcast registers to the
+                    // warp so no lane can observe stale shared memory.
+                    let mut is_canceled = 0u32;
+                    let mut first_stolen = 0u32;
                     if is_lane0 {
+                        fence_proxy_async_shared_cta();
                         mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
                         clc_try_cancel(resp_ptr as *mut u8, &raw mut CLC_BAR);
-                    }
 
-                    if is_lane0 {
                         while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
+
+                        let resp_lo = *resp_ptr;
+                        let resp_hi = *resp_ptr.add(1);
+                        is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        if is_canceled != 0 {
+                            first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                        }
+                        fence_proxy_async_shared_cta();
                     }
 
-                    let resp_lo = *resp_ptr;
-                    let resp_hi = *resp_ptr.add(1);
-                    let is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                    is_canceled = warp::shuffle_sync(u32::MAX, is_canceled, 0);
+                    first_stolen = warp::shuffle_sync(u32::MAX, first_stolen, 0);
 
                     if is_canceled == 0 {
                         if is_lane0 {
@@ -2067,8 +2227,6 @@ mod kernels {
                         }
                         break;
                     }
-
-                    let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
 
                     let mut ci: u32 = 0;
                     while ci < CLUSTER_SIZE {
@@ -2100,6 +2258,11 @@ mod kernels {
                             if is_lane0 {
                                 let k_base = (k_idx * 64) as i32;
                                 if stage == 0 {
+                                    mbarrier_arrive_expect_tx(
+                                        &raw const TMA_BAR0,
+                                        1,
+                                        A_TILE_BYTES + B_TILE_BYTES,
+                                    );
                                     cp_async_bulk_tensor_2d_g2s(
                                         &raw mut SMEM_A0 as *mut u8,
                                         a_tma,
@@ -2114,12 +2277,12 @@ mod kernels {
                                         n_off,
                                         &raw mut TMA_BAR0,
                                     );
+                                } else {
                                     mbarrier_arrive_expect_tx(
-                                        &raw const TMA_BAR0,
+                                        &raw const TMA_BAR1,
                                         1,
                                         A_TILE_BYTES + B_TILE_BYTES,
                                     );
-                                } else {
                                     cp_async_bulk_tensor_2d_g2s(
                                         &raw mut SMEM_A1 as *mut u8,
                                         a_tma,
@@ -2133,11 +2296,6 @@ mod kernels {
                                         k_base,
                                         n_off,
                                         &raw mut TMA_BAR1,
-                                    );
-                                    mbarrier_arrive_expect_tx(
-                                        &raw const TMA_BAR1,
-                                        1,
-                                        A_TILE_BYTES + B_TILE_BYTES,
                                     );
                                 }
                             }
@@ -2376,6 +2534,7 @@ mod kernels {
 
             // ── Cleanup ──
             thread::sync_threads();
+            cluster::cluster_sync();
             if warp_id == 0 {
                 tcgen05_dealloc(tmem_addr, 512);
             }
@@ -2397,29 +2556,22 @@ mod kernels {
     /// Phase 4C: CLC + TMA multicast for B tiles.
     ///
     /// ```text
-    ///   Cluster of 4 CTAs sharing an SM:
+    ///   Cluster of 4 CTAs co-scheduled across SMs:
     ///
-    ///   CTA 0 (rank 0)              CTA 1 (rank 1)         CTA 2, CTA 3 (similar)
-    ///   ┌──────────────────┐        ┌──────────────────┐
-    ///   │ Warp 4 (TMA):    │        │ Warp 4 (TMA):    │
-    ///   │                  │        │                  │
-    ///   │ Each K-iter:     │        │ Each K-iter:     │
-    ///   │  arrive MCAST_BAR│        │  arrive MCAST_BAR│─ ─▶ rank 0's MCAST_BAR
-    ///   │  wait MCAST_BAR  │◄─ ─ ─ ─│                  │    (cluster-wide arrive
-    ///   │  (all 4 arrived) │        │                  │     via mbarrier_arrive_cluster)
-    ///   │                  │        │                  │
-    ///   │  arm TMA_BAR with│        │  arm TMA_BAR with│
-    ///   │  arrive_expect_tx│        │  arrive_expect_tx│   ← CRITICAL: must arm
-    ///   │                  │        │                  │     BEFORE multicast lands
-    ///   │  TMA A → own SMEM│        │  TMA A → own SMEM│
-    ///   │  TMA B multicast │════════│══▶ B lands in    │
-    ///   │  to ALL CTAs     │════════│══▶ all 4 SMEM    │
-    ///   │                  │        │  + deposits TX   │
-    ///   │                  │        │  on all TMA_BARs │
-    ///   └──────────────────┘        └──────────────────┘
+    ///   Every CTA (warp 4)                    CTA 0 / rank 0
+    ///   ┌──────────────────────────┐          ┌──────────────────────────┐
+    ///   │ wait MMA_BAR            │          │                          │
+    ///   │ arm local TMA_BAR       │          │                          │
+    ///   │ TMA A → own SMEM        │          │                          │
+    ///   │ arrive rank-0 MCAST_BAR ├─────────▶│ cluster-acquire wait     │
+    ///   │                          │          │ for all four CTAs        │
+    ///   │                          │          │ TMA B multicast ────────┼──▶ all CTA SMEM
+    ///   └──────────────────────────┘          └──────────────────────────┘
     ///
     ///   CLC work-stealing (clc_try_cancel_multicast):
-    ///     Rank 0 steals a cluster → response multicast to all CTAs
+    ///     Every CTA arms its local CLC_BAR and arrives at CLC_READY
+    ///     Rank 0 waits for all CTAs, then multicasts one cancellation response
+    ///     Lane 0 in each CTA decodes and warp-broadcasts the result
     ///     Each CTA derives: my_tile = first_stolen + my_rank
     /// ```
     ///
@@ -2431,10 +2583,9 @@ mod kernels {
     /// must signal they've consumed the previous B data from that stage. Each non-rank-0
     /// CTA arrives at rank 0's MCAST_BAR via `mbarrier_arrive_cluster`.
     ///
-    /// Critical ordering: `arrive_expect_tx` BEFORE TMA loads. With multicast, rank 0's
-    /// TMA deposits bytes into all CTAs simultaneously. If a slower CTA hasn't armed its
-    /// barrier yet, the bytes land on an un-armed barrier — the TX count was never set,
-    /// so the barrier either completes prematurely or never completes.
+    /// Critical ordering: each CTA arms its local `TMA_BAR` before issuing its A load
+    /// and before advertising readiness through `MCAST_BAR`. Rank 0 uses a cluster-acquire
+    /// wait before issuing B multicast, so remote B bytes cannot reach an unarmed barrier.
     ///
     /// Grid launch: grid_dim = (total_tiles, 1, 1), cluster_dim = (4, 1, 1)
     #[kernel]
@@ -2476,6 +2627,7 @@ mod kernels {
             // CLC: 16-byte response buffer + mbarrier
             static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
             static mut CLC_BAR: Barrier = Barrier::UNINIT;
+            static mut CLC_READY: Barrier = Barrier::UNINIT;
 
             // TMA multicast: cluster-wide consumer barriers.
             // Rank 0's TMA warp waits on these before multicasting B to ensure
@@ -2513,9 +2665,11 @@ mod kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 128);
                 mbarrier_init(&raw mut TILE_READY, 1);
                 mbarrier_init(&raw mut CLC_BAR, 1);
+                mbarrier_init(&raw mut CLC_READY, CLUSTER_SIZE);
                 // MCAST_BARs: all 4 cluster CTAs must arrive before rank 0 can reuse B buffer
                 mbarrier_init(&raw mut MCAST_BAR0, CLUSTER_SIZE);
                 mbarrier_init(&raw mut MCAST_BAR1, CLUSTER_SIZE);
+                fence_mbarrier_init_release_cluster();
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -2526,6 +2680,7 @@ mod kernels {
             // shared memory, for use with mbarrier_arrive_cluster (cross-CTA barrier arrive).
             let rank0_mcast_bar0_addr = cluster::map_shared_rank(&raw const MCAST_BAR0, 0) as u64;
             let rank0_mcast_bar1_addr = cluster::map_shared_rank(&raw const MCAST_BAR1, 0) as u64;
+            let rank0_clc_ready_addr = cluster::map_shared_rank(&raw const CLC_READY, 0) as u64;
 
             // Pre-arrive MMA_BARs so TMA can proceed on the first K-iteration
             if tid == 0 {
@@ -2552,9 +2707,9 @@ mod kernels {
 
             cluster::cluster_sync();
 
-            // NOTE: No pre-arrive for MCAST_BARs. The first use of each stage
-            // (global_k=0 for stage 0, global_k=1 for stage 1) skips the wait
-            // because the buffers are empty — nothing to protect from overwrite.
+            // No synthetic pre-arrive is needed for MCAST_BARs. On the first use
+            // of each stage, every CTA arms its local TMA_BAR, arrives at rank 0's
+            // MCAST_BAR, and rank 0 performs the normal cluster-acquire wait.
 
             // ════════════════════════════════════════════════════════════════════
             // TMA Producer (warp 4): CLC tile scheduling + TMA multicast
@@ -2591,28 +2746,10 @@ mod kernels {
                         while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                     }
 
-                    // Signal rank 0's MCAST_BAR: this CTA has consumed B from this stage.
+                    // Arm the local completion barrier and issue the per-CTA A
+                    // copy before advertising that this CTA is ready for B multicast.
+                    let k_base = (k_idx * 64) as i32;
                     if is_lane0 {
-                        fence_proxy_async_shared_cta();
-                        if stage == 0 {
-                            mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
-                        } else {
-                            mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
-                        }
-                    }
-
-                    // Rank 0: wait for ALL cluster CTAs to signal consumption via MCAST_BAR.
-                    let mcast_parity = (global_k >> 1) & 1;
-                    if is_rank0 {
-                        if stage == 0 {
-                            while !mbarrier_try_wait_parity(&raw const MCAST_BAR0, mcast_parity) {}
-                        } else {
-                            while !mbarrier_try_wait_parity(&raw const MCAST_BAR1, mcast_parity) {}
-                        }
-                    }
-
-                    if is_lane0 {
-                        let k_base = (k_idx * 64) as i32;
                         if stage == 0 {
                             mbarrier_arrive_expect_tx(
                                 &raw const TMA_BAR0,
@@ -2626,19 +2763,9 @@ mod kernels {
                                 m_offset,
                                 &raw mut TMA_BAR0,
                             );
-                            if is_rank0 {
-                                cp_async_bulk_tensor_2d_g2s_multicast(
-                                    &raw mut SMEM_B0 as *mut u8,
-                                    b_tma,
-                                    k_base,
-                                    n_offset,
-                                    &raw mut TMA_BAR0,
-                                    CTA_MASK_ALL,
-                                );
-                            }
+                            fence_proxy_async_shared_cta();
+                            mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
                         } else {
-                            // Arm expected bytes before issuing copies so remote multicast
-                            // bytes cannot land on an un-armed barrier in slower CTAs.
                             mbarrier_arrive_expect_tx(
                                 &raw const TMA_BAR1,
                                 1,
@@ -2651,16 +2778,46 @@ mod kernels {
                                 m_offset,
                                 &raw mut TMA_BAR1,
                             );
-                            if is_rank0 {
-                                cp_async_bulk_tensor_2d_g2s_multicast(
-                                    &raw mut SMEM_B1 as *mut u8,
-                                    b_tma,
-                                    k_base,
-                                    n_offset,
-                                    &raw mut TMA_BAR1,
-                                    CTA_MASK_ALL,
-                                );
-                            }
+                            fence_proxy_async_shared_cta();
+                            mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
+                        }
+                    }
+
+                    // Remote arrivals require a cluster-acquire wait at rank 0.
+                    let mcast_parity = (global_k >> 1) & 1;
+                    if is_rank0 {
+                        if stage == 0 {
+                            while !mbarrier_try_wait_parity_cluster(
+                                &raw const MCAST_BAR0,
+                                mcast_parity,
+                            ) {}
+                        } else {
+                            while !mbarrier_try_wait_parity_cluster(
+                                &raw const MCAST_BAR1,
+                                mcast_parity,
+                            ) {}
+                        }
+                    }
+
+                    if is_rank0 && is_lane0 {
+                        if stage == 0 {
+                            cp_async_bulk_tensor_2d_g2s_multicast(
+                                &raw mut SMEM_B0 as *mut u8,
+                                b_tma,
+                                k_base,
+                                n_offset,
+                                &raw mut TMA_BAR0,
+                                CTA_MASK_ALL,
+                            );
+                        } else {
+                            cp_async_bulk_tensor_2d_g2s_multicast(
+                                &raw mut SMEM_B1 as *mut u8,
+                                b_tma,
+                                k_base,
+                                n_offset,
+                                &raw mut TMA_BAR1,
+                                CTA_MASK_ALL,
+                            );
                         }
                     }
 
@@ -2677,18 +2834,39 @@ mod kernels {
                     loop {
                         let clc_parity = clc_iter & 1;
 
+                        // Arm every CTA-local completion barrier before rank 0 can
+                        // multicast the next response. CLC_READY also proves that
+                        // every CTA is still alive and has released its prior read.
+                        let mut is_canceled = 0u32;
+                        let mut first_stolen = 0u32;
                         if is_lane0 {
-                            mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
+                            mbarrier_arrive_expect_tx_cluster(&raw const CLC_BAR, 1, 16);
+                            mbarrier_arrive_cluster(rank0_clc_ready_addr);
+
                             if is_rank0 {
+                                while !mbarrier_try_wait_parity_cluster(
+                                    &raw const CLC_READY,
+                                    clc_parity,
+                                ) {}
+                                fence_proxy_async_generic_acquire_shared_cluster_cluster();
                                 clc_try_cancel_multicast(resp_ptr as *mut u8, &raw mut CLC_BAR);
                             }
+
+                            while !mbarrier_try_wait_parity_cluster(&raw const CLC_BAR, clc_parity)
+                            {
+                            }
+
+                            let resp_lo = *resp_ptr;
+                            let resp_hi = *resp_ptr.add(1);
+                            is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                            if is_canceled != 0 {
+                                first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                            }
+                            fence_proxy_async_generic_release_shared_cta_cluster();
                         }
 
-                        while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
-
-                        let resp_lo = *resp_ptr;
-                        let resp_hi = *resp_ptr.add(1);
-                        let is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        is_canceled = warp::shuffle_sync(u32::MAX, is_canceled, 0);
+                        first_stolen = warp::shuffle_sync(u32::MAX, first_stolen, 0);
 
                         if is_canceled == 0 {
                             if is_lane0 {
@@ -2697,8 +2875,6 @@ mod kernels {
                             }
                             break;
                         }
-
-                        let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
                         let my_ctaid = first_stolen + my_rank;
                         let tile_m = my_ctaid % tiles_m;
                         let tile_n = my_ctaid / tiles_m;
@@ -2725,34 +2901,10 @@ mod kernels {
                                 while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                             }
 
-                            // Signal rank 0's MCAST_BAR: this CTA consumed B from this stage.
+                            // Arm the local barrier and start A before advertising
+                            // readiness for the cluster-wide B multicast.
+                            let k_base = (k_idx * 64) as i32;
                             if is_lane0 {
-                                fence_proxy_async_shared_cta();
-                                if stage == 0 {
-                                    mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
-                                } else {
-                                    mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
-                                }
-                            }
-
-                            // Rank 0: wait for ALL cluster CTAs before multicasting B.
-                            let mcast_parity = (global_k >> 1) & 1;
-                            if is_rank0 {
-                                if stage == 0 {
-                                    while !mbarrier_try_wait_parity(
-                                        &raw const MCAST_BAR0,
-                                        mcast_parity,
-                                    ) {}
-                                } else {
-                                    while !mbarrier_try_wait_parity(
-                                        &raw const MCAST_BAR1,
-                                        mcast_parity,
-                                    ) {}
-                                }
-                            }
-
-                            if is_lane0 {
-                                let k_base = (k_idx * 64) as i32;
                                 if stage == 0 {
                                     mbarrier_arrive_expect_tx(
                                         &raw const TMA_BAR0,
@@ -2766,19 +2918,9 @@ mod kernels {
                                         m_off,
                                         &raw mut TMA_BAR0,
                                     );
-                                    if is_rank0 {
-                                        cp_async_bulk_tensor_2d_g2s_multicast(
-                                            &raw mut SMEM_B0 as *mut u8,
-                                            b_tma,
-                                            k_base,
-                                            n_off,
-                                            &raw mut TMA_BAR0,
-                                            CTA_MASK_ALL,
-                                        );
-                                    }
+                                    fence_proxy_async_shared_cta();
+                                    mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
                                 } else {
-                                    // Same ordering as the first tile: arm barrier before any
-                                    // local or remote TMA bytes can arrive on this stage.
                                     mbarrier_arrive_expect_tx(
                                         &raw const TMA_BAR1,
                                         1,
@@ -2791,16 +2933,45 @@ mod kernels {
                                         m_off,
                                         &raw mut TMA_BAR1,
                                     );
-                                    if is_rank0 {
-                                        cp_async_bulk_tensor_2d_g2s_multicast(
-                                            &raw mut SMEM_B1 as *mut u8,
-                                            b_tma,
-                                            k_base,
-                                            n_off,
-                                            &raw mut TMA_BAR1,
-                                            CTA_MASK_ALL,
-                                        );
-                                    }
+                                    fence_proxy_async_shared_cta();
+                                    mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
+                                }
+                            }
+
+                            let mcast_parity = (global_k >> 1) & 1;
+                            if is_rank0 {
+                                if stage == 0 {
+                                    while !mbarrier_try_wait_parity_cluster(
+                                        &raw const MCAST_BAR0,
+                                        mcast_parity,
+                                    ) {}
+                                } else {
+                                    while !mbarrier_try_wait_parity_cluster(
+                                        &raw const MCAST_BAR1,
+                                        mcast_parity,
+                                    ) {}
+                                }
+                            }
+
+                            if is_rank0 && is_lane0 {
+                                if stage == 0 {
+                                    cp_async_bulk_tensor_2d_g2s_multicast(
+                                        &raw mut SMEM_B0 as *mut u8,
+                                        b_tma,
+                                        k_base,
+                                        n_off,
+                                        &raw mut TMA_BAR0,
+                                        CTA_MASK_ALL,
+                                    );
+                                } else {
+                                    cp_async_bulk_tensor_2d_g2s_multicast(
+                                        &raw mut SMEM_B1 as *mut u8,
+                                        b_tma,
+                                        k_base,
+                                        n_off,
+                                        &raw mut TMA_BAR1,
+                                        CTA_MASK_ALL,
+                                    );
                                 }
                             }
 
@@ -3036,6 +3207,7 @@ mod kernels {
 
             // ── Cleanup ──
             thread::sync_threads();
+            cluster::cluster_sync();
             if warp_id == 0 {
                 tcgen05_dealloc(tmem_addr, 512);
             }
@@ -3050,6 +3222,7 @@ mod kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
                 mbarrier_inval(&raw mut CLC_BAR);
+                mbarrier_inval(&raw mut CLC_READY);
                 mbarrier_inval(&raw mut MCAST_BAR0);
                 mbarrier_inval(&raw mut MCAST_BAR1);
             }
@@ -3082,6 +3255,12 @@ mod kernels {
     /// CLC work-stealing: rank 0 issues clc_try_cancel_multicast; both CTAs receive the
     /// response via CLC_BAR. Tile indices are derived by dividing the CLC first_ctaid_x
     /// by the cluster size (2), NOT using raw CTA IDs.
+    ///
+    /// # Shape contract
+    ///
+    /// `k` must be a multiple of 256. With a K tile size of 64, this makes `k_iters`
+    /// a multiple of four, so every output tile starts on pipeline stage 0. The MMA
+    /// consumer relies on that reset to keep its unrolled stage selection constant.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn gemm_sol_clc_multicast_4_stage_pipeline(
@@ -3140,6 +3319,10 @@ mod kernels {
             // memory barrier address, redirecting TMA completions to the leader CTA's
             // barrier.
             const PEER_BIT_MASK: u32 = 0xFEFFFFF8;
+            // L2 cache-blocking: visit tiles in vertical N-bands SWIZZLE_G wide so
+            // tiles done near-in-time share A-rows + a small set of B-cols in L2.
+            // This is the dominant data-movement lever at large sizes (~+88% @16384).
+            const SWIZZLE_G: u32 = 8;
 
             let n = n as u32;
             let k = k as u32;
@@ -3207,8 +3390,37 @@ mod kernels {
                 // correct (each CTA computed its own rank's 128 rows at the wrong tile).
                 let cluster_base_id = thread::blockIdx_x() - my_rank;
                 let tile_idx = cluster_base_id / 2;
-                let first_tile_m = tile_idx % tiles_m;
-                let first_tile_n = tile_idx / tiles_m;
+                // L2 CACHE-BLOCKING SWIZZLE (CUTLASS-style tile ordering).
+                //
+                // Change the order in which output tiles are assigned to clusters. Split
+                // the N direction into bands of at most SWIZZLE_G columns, visit every M
+                // row in one band, and then move to the next band.
+                //
+                // For SWIZZLE_G = 3, the first band is visited in this order:
+                //
+                //   tile_idx:  0      1      2      3      4      5
+                //   C tile:   (0,0)  (0,1)  (0,2)  (1,0)  (1,1)  (1,2)  ...
+                //
+                // Within each M row, these tiles reuse the same A tile while reading
+                // neighboring B tiles. The same small set of B tiles is then revisited for
+                // the next M row, so the data is more likely to still be in the L2 cache.
+                //
+                // This changes only the visit order. The mapping from tile_idx to
+                // (tile_m, tile_n) is one-to-one, and TILE_INFO tells the epilogue where to
+                // write C. Every output tile is still computed exactly once with the same
+                // result.
+                let tiles_n = _tiles_n;
+                let group_tiles = SWIZZLE_G * tiles_m;
+                let group = tile_idx / group_tiles;
+                let in_group = tile_idx % group_tiles;
+                let n_start = group * SWIZZLE_G;
+                let band_w = if SWIZZLE_G < tiles_n - n_start {
+                    SWIZZLE_G
+                } else {
+                    tiles_n - n_start
+                };
+                let first_tile_m = in_group / band_w;
+                let first_tile_n = n_start + in_group % band_w;
 
                 if is_lane0 {
                     *(&raw mut TILE_INFO as *mut u32).add(0) = first_tile_m;
@@ -3335,8 +3547,19 @@ mod kernels {
                     // pair. Divide by 2 to get the tile index.
                     let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
                     let tile_idx = first_stolen / 2;
-                    let tile_m = tile_idx % tiles_m;
-                    let tile_n = tile_idx / tiles_m;
+                    // Same cache-blocking swizzle as the initial tile (see above).
+                    let tiles_n = _tiles_n;
+                    let group_tiles = SWIZZLE_G * tiles_m;
+                    let group = tile_idx / group_tiles;
+                    let in_group = tile_idx % group_tiles;
+                    let n_start = group * SWIZZLE_G;
+                    let band_w = if SWIZZLE_G < tiles_n - n_start {
+                        SWIZZLE_G
+                    } else {
+                        tiles_n - n_start
+                    };
+                    let tile_m = in_group / band_w;
+                    let tile_n = n_start + in_group % band_w;
 
                     if is_lane0 {
                         *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
@@ -3460,9 +3683,14 @@ mod kernels {
 
                     let tile_k_base = tile_iter * k_iters;
                     let mut k_idx: u32 = 0;
+                    // Unroll one full pipeline cycle. The launch contract guarantees
+                    // k_iters % 4 == 0, so the producer's global stage and this local
+                    // stage agree at every tile boundary. Keeping this expression
+                    // loop-local lets the unroll pass fold each stage match.
+                    #[unroll(4)]
                     while k_idx < k_iters {
                         let global_k = tile_k_base + k_idx;
-                        let stage = global_k & 3;
+                        let stage = k_idx & 3;
                         let tma_parity = (global_k >> 2) & 1;
 
                         let (smem_a_base, smem_b_base, tma_bar_const, mma_bar_mut): (
@@ -3561,9 +3789,7 @@ mod kernels {
                     tile_iter += 1;
                 }
 
-                if elect_one_cta {
-                    tcgen05_relinquish_alloc_permit_cg2();
-                }
+                tcgen05_relinquish_alloc_permit_cg2();
             }
 
             if warp_id < 4 {
@@ -3735,6 +3961,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (major, minor) = ctx.compute_capability()?;
     println!("GPU: sm_{}{}", major, minor);
 
+    // Optional phase filter for isolating CLC kernels while debugging. The normal
+    // no-variable path below still runs the complete benchmark suite.
+    let phase_filter = std::env::var("GEMM_SOL_PHASE").ok();
+
+    // Run the cublasLt baseline once up front so the ~25s measurement isn't
+    // sandwiched between benchmark prints. Skipped silently if the bench
+    // binary isn't built (the per-phase reports will omit the % SoL column).
+    if phase_filter.is_none() {
+        cublas_baseline::warmup();
+    }
+
     if major < 10 {
         println!("\nWARNING: tcgen05 requires sm_100+ (Blackwell)");
         return verify_ptx_only();
@@ -3773,8 +4010,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (16384, 16384, 16384),
     ];
 
-    // NOTE: Phases 1-4C temporarily skipped while developing Phase 4D.
-    // Uncomment to run all phases.
+    if let Some(phase) = phase_filter.as_deref() {
+        match phase {
+            "4b-correctness" => {
+                run_correctness_test_clc(&stream, &module, 4096, 4096, 4096)?;
+            }
+            "4b" => {
+                run_correctness_test_clc(&stream, &module, 4096, 4096, 4096)?;
+                for (m, n, k) in sizes {
+                    run_benchmark_clc(&stream, &module, m, n, k)?;
+                }
+            }
+            "4c-correctness" => {
+                run_correctness_test_clc_multicast(&stream, &module, 4096, 4096, 4096)?;
+            }
+            "4c" => {
+                run_correctness_test_clc_multicast(&stream, &module, 4096, 4096, 4096)?;
+                for (m, n, k) in sizes {
+                    run_benchmark_clc_multicast(&stream, &module, m, n, k)?;
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "unknown GEMM_SOL_PHASE={phase:?}; expected 4b, 4b-correctness, 4c, or 4c-correctness"
+                )
+                .into());
+            }
+        }
+        return Ok(());
+    }
+
+    // Run the complete suite by default. GEMM_SOL_PHASE above can isolate a CLC
+    // phase for targeted correctness and repeated-launch testing.
     if true {
         // ── Phase 1: K-loop + grid tiling ──
         println!("\n\n═══════════════════════════════════════════════════════");
@@ -3899,7 +4166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-    } // end if false — re-enable after Phase 4D is working
+    } // end all phases
 
     println!("\n═══════════════════════════════════════════════════════");
     println!("  GEMM SoL — All Phases Complete");
@@ -4209,15 +4476,9 @@ fn run_benchmark(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!("  BENCHMARK: gemm_sol {}x{}x{} f16 -> bf16", m, n, k);
@@ -4234,10 +4495,7 @@ fn run_benchmark(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -4486,15 +4744,9 @@ fn run_benchmark_swizzled(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -4515,10 +4767,7 @@ fn run_benchmark_swizzled(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -4764,15 +5013,9 @@ fn run_benchmark_pipelined(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -4793,10 +5036,7 @@ fn run_benchmark_pipelined(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5041,15 +5281,9 @@ fn run_benchmark_warp_spec(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -5070,10 +5304,7 @@ fn run_benchmark_warp_spec(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5373,15 +5604,9 @@ fn run_benchmark_persistent(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -5400,10 +5625,7 @@ fn run_benchmark_persistent(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5682,15 +5904,9 @@ fn run_benchmark_clc(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!("  BENCHMARK: gemm_sol_clc {}x{}x{} f16 -> bf16", m, n, k);
@@ -5706,10 +5922,7 @@ fn run_benchmark_clc(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5988,12 +6201,7 @@ fn run_benchmark_clc_multicast(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS comparison is printed by print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -6012,10 +6220,7 @@ fn run_benchmark_clc_multicast(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -6028,7 +6233,7 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
     n: usize,
     k: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(64));
+    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(256));
 
     println!("Matrix: {}x{}x{} (f16 -> bf16)", m, n, k);
     println!("CLC + cta_group::2 + 4-stage SMEM pipeline.");
@@ -6226,7 +6431,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     const WARMUP: usize = 10;
     const ITERS: usize = 100;
 
-    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(64));
+    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(256));
 
     let dev_a = DeviceBuffer::<u16>::zeroed(stream, m * k)?;
     let dev_b = DeviceBuffer::<u16>::zeroed(stream, n * k)?;
@@ -6311,12 +6516,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS comparison is printed by print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -6335,10 +6535,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())

@@ -1,17 +1,13 @@
 ---
 name: cargo-deny
 
+# Runs as a job of the top-level CI workflow (.github/workflows/ci.yml) on
+# push/pull_request, plus a standalone weekly security scan via schedule.
+# Concurrency for the CI path is governed by CI's own group.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: "0 6 * * 1"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read

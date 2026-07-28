@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Warpgroup Matrix Multiply-Accumulate (WGMMA) operations for Hopper+ GPUs.
+//! Warpgroup Matrix Multiply-Accumulate (WGMMA) operations for Hopper `sm_90a`.
 //!
 //! WGMMA provides tensor core operations that operate at the warpgroup level
 //! (4 warps = 128 threads) for high-throughput matrix multiplication.
@@ -33,112 +33,26 @@
 //! # Requirements
 //!
 //! - **PTX ISA**: 8.0+
-//! - **Architecture**: sm_90+ (Hopper)
+//! - **Architecture**: `sm_90a` (Hopper)
 //! - **Execution**: Warpgroup-synchronous (128 threads must execute together)
 
+use dialect_mir::types::{MirPtrType, address_space};
 use pliron::{
-    builtin::op_interfaces::{NOpdsInterface, NResultsInterface},
+    builtin::{
+        op_interfaces::{NOpdsInterface, NResultsInterface},
+        types::{IntegerType, Signedness},
+    },
+    common_traits::Verify,
     context::Context,
     context::Ptr,
+    location::Located,
     op::Op,
     operation::Operation,
+    result::Error,
+    r#type::Typed,
+    verify_err,
 };
 use pliron_derive::pliron_op;
-
-// =============================================================================
-// Synchronization Operations
-// =============================================================================
-
-/// WGMMA fence for memory synchronization before MMA operations.
-///
-/// Ensures that shared memory writes are visible to the tensor core unit
-/// before issuing WGMMA operations.
-///
-/// Corresponds to `llvm.nvvm.wgmma.fence.sync.aligned`.
-///
-/// PTX: `wgmma.fence.sync.aligned;`
-///
-/// # Operands
-///
-/// - None
-///
-/// # Results
-///
-/// - None
-#[pliron_op(
-    name = "nvvm.wgmma_fence_sync_aligned",
-    format,
-    verifier = "succ",
-    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
-)]
-pub struct WgmmaFenceSyncAlignedOp;
-
-impl WgmmaFenceSyncAlignedOp {
-    /// Wrap an existing operation pointer.
-    pub fn new(op: Ptr<Operation>) -> Self {
-        WgmmaFenceSyncAlignedOp { op }
-    }
-}
-
-/// WGMMA commit group - commits pending WGMMA operations.
-///
-/// Groups pending WGMMA operations for collective waiting.
-///
-/// Corresponds to `llvm.nvvm.wgmma.commit_group.sync.aligned`.
-///
-/// PTX: `wgmma.commit_group.sync.aligned;`
-///
-/// # Operands
-///
-/// - None
-///
-/// # Results
-///
-/// - None
-#[pliron_op(
-    name = "nvvm.wgmma_commit_group_sync_aligned",
-    format,
-    verifier = "succ",
-    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
-)]
-pub struct WgmmaCommitGroupSyncAlignedOp;
-
-impl WgmmaCommitGroupSyncAlignedOp {
-    /// Wrap an existing operation pointer.
-    pub fn new(op: Ptr<Operation>) -> Self {
-        WgmmaCommitGroupSyncAlignedOp { op }
-    }
-}
-
-/// WGMMA wait group - waits for N groups to complete.
-///
-/// Blocks until at most N WGMMA groups are still pending.
-///
-/// Corresponds to `llvm.nvvm.wgmma.wait_group.sync.aligned`.
-///
-/// PTX: `wgmma.wait_group.sync.aligned N;`
-///
-/// # Operands
-///
-/// - `N` (i64): maximum pending groups (0-7)
-///
-/// # Results
-///
-/// - None
-#[pliron_op(
-    name = "nvvm.wgmma_wait_group_sync_aligned",
-    format,
-    verifier = "succ",
-    interfaces = [NOpdsInterface<1>, NResultsInterface<0>],
-)]
-pub struct WgmmaWaitGroupSyncAlignedOp;
-
-impl WgmmaWaitGroupSyncAlignedOp {
-    /// Wrap an existing operation pointer.
-    pub fn new(op: Ptr<Operation>) -> Self {
-        WgmmaWaitGroupSyncAlignedOp { op }
-    }
-}
 
 // =============================================================================
 // Descriptor Operations
@@ -146,10 +60,10 @@ impl WgmmaWaitGroupSyncAlignedOp {
 
 /// Create a shared memory descriptor for WGMMA.
 ///
-/// Converts a generic pointer to shared memory into a 64-bit WGMMA descriptor
-/// that encodes base address, stride information, and swizzle mode.
-///
-/// Uses inline PTX: `cvta.shared.u32` + bit manipulation
+/// Converts a generic pointer into the fixed-layout descriptor used by the
+/// current WGMMA lowering. It converts with `cvta.to.shared.u64`, shifts the
+/// address right by 4, masks it with `0x3fff`, and ORs
+/// `0xC000000800080000`.
 ///
 /// # Operands
 ///
@@ -157,11 +71,10 @@ impl WgmmaWaitGroupSyncAlignedOp {
 ///
 /// # Results
 ///
-/// - `desc` (i64): 64-bit WGMMA descriptor
+/// - `desc` (u64): 64-bit WGMMA descriptor
 #[pliron_op(
     name = "nvvm.wgmma_make_smem_desc",
     format,
-    verifier = "succ",
     interfaces = [NOpdsInterface<1>, NResultsInterface<1>],
 )]
 pub struct WgmmaMakeSmemDescOp;
@@ -170,6 +83,55 @@ impl WgmmaMakeSmemDescOp {
     /// Wrap an existing operation pointer.
     pub fn new(op: Ptr<Operation>) -> Self {
         WgmmaMakeSmemDescOp { op }
+    }
+}
+
+fn is_u32(ctx: &Context, ty: pliron::r#type::TypeHandle) -> bool {
+    ty.deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|integer| {
+            integer.width() == 32 && integer.signedness() == Signedness::Unsigned
+        })
+}
+
+fn is_u64(ctx: &Context, ty: pliron::r#type::TypeHandle) -> bool {
+    ty.deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|integer| {
+            integer.width() == 64 && integer.signedness() == Signedness::Unsigned
+        })
+}
+
+impl Verify for WgmmaMakeSmemDescOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = self.get_operation().deref(ctx);
+        if op.get_num_operands() != 1 || op.get_num_results() != 1 {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_make_smem_desc requires one operand and one result"
+            );
+        }
+        let pointer_ty = op.get_operand(0).get_type(ctx);
+        let pointer_ty_obj = pointer_ty.deref(ctx);
+        let Some(pointer_ty) = pointer_ty_obj.downcast_ref::<MirPtrType>() else {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_make_smem_desc operand must be a MIR pointer"
+            );
+        };
+        if !matches!(
+            pointer_ty.address_space,
+            address_space::GENERIC | address_space::SHARED
+        ) {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_make_smem_desc operand must point to generic or shared memory"
+            );
+        }
+        if !is_u64(ctx, op.get_result(0).get_type(ctx)) {
+            return verify_err!(op.loc(), "nvvm.wgmma_make_smem_desc result must be u64");
+        }
+        Ok(())
     }
 }
 
@@ -189,8 +151,8 @@ impl WgmmaMakeSmemDescOp {
 /// # Operands
 ///
 /// - `acc_ptr` (ptr): pointer to accumulator array (32 f32 values, read-modify-write)
-/// - `desc_a` (i64): SMEM descriptor for matrix A
-/// - `desc_b` (i64): SMEM descriptor for matrix B
+/// - `desc_a` (u64): SMEM descriptor for matrix A
+/// - `desc_b` (u64): SMEM descriptor for matrix B
 ///
 /// # Results
 ///
@@ -198,7 +160,6 @@ impl WgmmaMakeSmemDescOp {
 #[pliron_op(
     name = "nvvm.wgmma_mma_m64n64k16_f32_bf16",
     format,
-    verifier = "succ",
     interfaces = [NOpdsInterface<3>, NResultsInterface<0>],
 )]
 pub struct WgmmaMmaM64N64K16F32Bf16Op;
@@ -207,6 +168,38 @@ impl WgmmaMmaM64N64K16F32Bf16Op {
     /// Wrap an existing operation pointer.
     pub fn new(op: Ptr<Operation>) -> Self {
         WgmmaMmaM64N64K16F32Bf16Op { op }
+    }
+}
+
+impl Verify for WgmmaMmaM64N64K16F32Bf16Op {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = self.get_operation().deref(ctx);
+        if op.get_num_operands() != 3 || op.get_num_results() != 0 {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_mma_m64n64k16_f32_bf16 requires three operands and no results"
+            );
+        }
+        let accumulator_ty = op.get_operand(0).get_type(ctx);
+        if accumulator_ty
+            .deref(ctx)
+            .downcast_ref::<MirPtrType>()
+            .is_none()
+        {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_mma_m64n64k16_f32_bf16 accumulator must be a MIR pointer"
+            );
+        }
+        if !is_u64(ctx, op.get_operand(1).get_type(ctx))
+            || !is_u64(ctx, op.get_operand(2).get_type(ctx))
+        {
+            return verify_err!(
+                op.loc(),
+                "nvvm.wgmma_mma_m64n64k16_f32_bf16 descriptors must be u64"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -219,8 +212,8 @@ impl WgmmaMmaM64N64K16F32Bf16Op {
 /// # Operands
 ///
 /// - `acc_ptr` (ptr): pointer to the 4-f32 accumulator (read-modify-write)
-/// - `a0..a3` (i32): A fragment, 4 tf32-in-b32 registers
-/// - `b0,b1` (i32): B fragment, 2 tf32-in-b32 registers
+/// - `a0..a3` (u32): A fragment, 4 tf32-in-b32 registers
+/// - `b0,b1` (u32): B fragment, 2 tf32-in-b32 registers
 ///
 /// # Results
 ///
@@ -228,7 +221,6 @@ impl WgmmaMmaM64N64K16F32Bf16Op {
 #[pliron_op(
     name = "nvvm.mma_sync_m16n8k8_f32_tf32",
     format,
-    verifier = "succ",
     interfaces = [NOpdsInterface<7>, NResultsInterface<0>],
 )]
 pub struct MmaSyncM16N8K8F32Tf32Op;
@@ -240,11 +232,42 @@ impl MmaSyncM16N8K8F32Tf32Op {
     }
 }
 
+impl Verify for MmaSyncM16N8K8F32Tf32Op {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = self.get_operation().deref(ctx);
+        if op.get_num_operands() != 7 || op.get_num_results() != 0 {
+            return verify_err!(
+                op.loc(),
+                "nvvm.mma_sync_m16n8k8_f32_tf32 requires seven operands and no results"
+            );
+        }
+        let accumulator_ty = op.get_operand(0).get_type(ctx);
+        if accumulator_ty
+            .deref(ctx)
+            .downcast_ref::<MirPtrType>()
+            .is_none()
+        {
+            return verify_err!(
+                op.loc(),
+                "nvvm.mma_sync_m16n8k8_f32_tf32 accumulator must be a MIR pointer"
+            );
+        }
+        // Operands 1..=6 are the A (a0..a3) and B (b0,b1) fragment registers,
+        // each a b32 lane value carrying a packed tf32.
+        for idx in 1..7 {
+            if !is_u32(ctx, op.get_operand(idx).get_type(ctx)) {
+                return verify_err!(
+                    op.loc(),
+                    "nvvm.mma_sync_m16n8k8_f32_tf32 fragment registers must be u32"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Register WGMMA operations with the context.
 pub(super) fn register(ctx: &mut Context) {
-    WgmmaFenceSyncAlignedOp::register(ctx);
-    WgmmaCommitGroupSyncAlignedOp::register(ctx);
-    WgmmaWaitGroupSyncAlignedOp::register(ctx);
     WgmmaMakeSmemDescOp::register(ctx);
     WgmmaMmaM64N64K16F32Bf16Op::register(ctx);
     MmaSyncM16N8K8F32Tf32Op::register(ctx);

@@ -5,7 +5,7 @@
 
 //! CUDA driver error types and result conversion utilities.
 //!
-//! [`DriverError`] wraps a raw `CUresult` code and implements [`Display`],
+//! [`DriverError`] wraps a raw `CUresult` code and implements `Display`,
 //! [`Debug`], and [`Error`](std::error::Error) by querying the driver for
 //! human-readable descriptions via `cuGetErrorName` / `cuGetErrorString`.
 //!
@@ -22,29 +22,47 @@ use std::{
 /// A CUDA driver error wrapping a raw [`CUresult`](cuda_bindings::CUresult) code.
 ///
 /// The inner value is public so callers can match on specific
-/// `cudaError_enum_*` constants when needed. Prefer the [`Display`] impl for
+/// `cudaError_enum_*` constants when needed. Prefer the `Display` impl for
 /// user-facing messages -- it calls into the driver to produce a description.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DriverError(pub cuda_bindings::CUresult);
 
 impl DriverError {
-    /// Shared formatting helper for both [`Display`] and [`Debug`].
+    /// Returns true when the driver cannot JIT the PTX version in a module.
+    ///
+    /// This usually means the selected CUDA toolkit is newer than the
+    /// installed driver. PTX requires direct driver support even when other
+    /// parts of the toolkit can use CUDA minor-version compatibility.
+    pub fn is_unsupported_ptx_version(&self) -> bool {
+        self.0 == cuda_bindings::cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+    }
+
+    /// Shared formatting helper for both `Display` and [`Debug`].
     ///
     /// Attempts to resolve the error string via the driver; falls back to a
     /// placeholder if `cuGetErrorString` itself fails (e.g., driver not
     /// initialized).
     fn _fmt(&self, formatter: &mut Formatter) -> fmt::Result {
+        let help = "the CUDA driver cannot JIT PTX from the selected toolkit; upgrade the driver \
+                    or select a compatible toolkit with CUDA_TOOLKIT_PATH or CUDA_HOME";
+
         match self.error_string() {
-            Ok(err_str) => formatter
-                .debug_tuple("DriverError")
-                .field(&self.0)
-                .field(&err_str)
-                .finish(),
-            Err(_) => formatter
-                .debug_tuple("DriverError")
-                .field(&self.0)
-                .field(&"<cuGetErrorString failed>")
-                .finish(),
+            Ok(err_str) => {
+                let mut output = formatter.debug_tuple("DriverError");
+                output.field(&self.0).field(&err_str);
+                if self.is_unsupported_ptx_version() {
+                    output.field(&help);
+                }
+                output.finish()
+            }
+            Err(_) => {
+                let mut output = formatter.debug_tuple("DriverError");
+                output.field(&self.0).field(&"<cuGetErrorString failed>");
+                if self.is_unsupported_ptx_version() {
+                    output.field(&help);
+                }
+                output.finish()
+            }
         }
     }
 
@@ -119,5 +137,20 @@ impl<T> IntoResult<T> for (cuda_bindings::CUresult, MaybeUninit<T>) {
             cuda_bindings::cudaError_enum_CUDA_SUCCESS => Ok(unsafe { self.1.assume_init() }),
             _ => Err(DriverError(self.0)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_unsupported_ptx_version() {
+        let unsupported =
+            DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION);
+        let unrelated = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+
+        assert!(unsupported.is_unsupported_ptx_version());
+        assert!(!unrelated.is_unsupported_ptx_version());
     }
 }

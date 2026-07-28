@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Memory operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Memory operation conversion: `dialect-mir` → LLVM dialect.
 //!
-//! Converts `dialect-mir` memory operations to their `dialect-llvm` equivalents.
+//! Converts `dialect-mir` memory operations to their LLVM dialect equivalents.
 //!
 //! # Operations
 //!
@@ -28,14 +28,15 @@
 //!
 //! ## Dynamic Shared Memory (`DynamicSharedArray<T, ALIGN>`)
 //!
-//! Dynamic shared memory uses a per-kernel symbol (`__dynamic_smem_{kernel_name}`).
+//! Dynamic shared memory uses a symbol for each function that owns an access
+//! (`__dynamic_smem_{function_name}`).
 //! Key characteristics:
 //!
-//! - **Per-kernel symbols**: Each kernel gets its own extern shared symbol
-//! - **Pre-computed alignment**: A pre-pass scans all `DynamicSharedArray` calls in a kernel
-//!   to determine the maximum alignment before creating the global
-//! - **Single pool per kernel**: All `DynamicSharedArray` calls within a kernel share the
-//!   same runtime pool (sized by `shared_mem_bytes` at launch)
+//! - **Per-owner symbols**: Each function containing an access gets an extern symbol
+//! - **Pre-computed alignment**: A pre-pass combines the owner's body alignment with
+//!   the strongest launch-contract marker that can reach it
+//! - **Single runtime pool per launch**: The symbols refer to dynamic shared memory
+//!   sized by `shared_mem_bytes` at launch
 //!
 //! ### PTX Output Example
 //!
@@ -48,22 +49,31 @@
 //! ```
 
 use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
-use crate::convert::types::convert_type;
+use crate::convert::types::{convert_type, get_type_size, validate_initialized_global_layout};
 use crate::helpers;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::types::ArrayType;
 use dialect_mir::types::MirPtrType;
+use llvm_export::attributes::IntegerOverflowFlagsAttr;
+use llvm_export::op_interfaces::IntBinArithOpWithOverflowFlag;
+use llvm_export::ops as llvm;
+use llvm_export::ops::GlobalOpExt;
+use llvm_export::types::{ArrayType, FuncType, VoidType};
+use pliron::attribute::AttrObj;
+use pliron::builtin::attributes::IntegerAttr;
+use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
+use pliron::identifier::Identifier;
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
 use pliron::irbuild::rewriter::Rewriter;
 use pliron::linked_list::ContainsLinkedList;
+use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
-use pliron::r#type::{TypeObj, Typed};
+use pliron::r#type::{TypeHandle, Typed};
+use pliron::utils::apint::APInt;
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::create_error!(
@@ -93,7 +103,211 @@ pub(crate) fn convert_store(
     };
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
+    if dialect_mir::ops::MirStoreOp::new(op).is_volatile(ctx) {
+        llvm_export::ops::set_op_volatile(ctx, llvm_store.get_operation(), true);
+    }
+    copy_alignment(ctx, op, llvm_store.get_operation());
     rewriter.insert_operation(ctx, llvm_store.get_operation());
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Copy the ABI alignment stamped on a MIR memory op onto its lowered LLVM op.
+///
+/// The alignment is stamped by the pre-pass in `lowering.rs` while types are
+/// still MIR; this helper transfers it to the newly created LLVM op so the
+/// exporter can emit `align N`.
+fn copy_alignment(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op: Ptr<Operation>) {
+    if let Some(align) = llvm_export::ops::op_alignment(ctx, mir_op) {
+        llvm_export::ops::set_op_alignment(ctx, llvm_op, align);
+    }
+}
+
+fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op: Ptr<Operation>) {
+    if let Some(info) = llvm_export::ops::debug_local_variable(ctx, mir_op) {
+        llvm_export::ops::set_debug_local_variable(ctx, llvm_op, info);
+    }
+    if let Some(scope) = llvm_export::ops::debug_local_source_scope(ctx, mir_op) {
+        llvm_export::ops::set_debug_local_source_scope(ctx, llvm_op, scope);
+    }
+    if let Some((file, pos)) = llvm_export::ops::debug_local_declaration_location(ctx, mir_op) {
+        llvm_export::ops::set_debug_local_declaration_location(
+            ctx, llvm_op, file, pos.line, pos.column,
+        );
+    }
+}
+
+/// Convert `mir.memcpy` to the matching `llvm.memcpy.p<dst>.p<src>.i<bits>`.
+///
+/// MIR's count is measured in pointee elements, while LLVM's memcpy intrinsic
+/// expects bytes. The pre-conversion destination pointer type still carries the
+/// MIR pointee, so use it to scale the count before emitting the call.
+///
+/// The intrinsic name is an overload: LLVM encodes each pointer's address
+/// space and the length width into it, and its verifier rejects a call whose
+/// argument types disagree with the name. Today every pointer reaching a
+/// `copy_nonoverlapping` is a Rust raw pointer, which cuda-oxide normalizes to
+/// the generic address space (an `addrspacecast` is inserted when the raw
+/// pointer is formed), so the operands are always `p0` and `i64`. We still
+/// derive the suffix from the real operand types rather than hardcoding
+/// `p0.p0.i64`: it matches how every other overloaded intrinsic is named here
+/// (`ctpop`, `fptosi.sat`, ...), and it keeps this lowering correct if raw
+/// pointers ever start carrying a non-generic address space.
+pub(crate) fn convert_memcpy(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    convert_mem_transfer(ctx, rewriter, op, operands_info, "memcpy")
+}
+
+/// Convert `mir.memmove` to the matching `llvm.memmove.p<dst>.p<src>.i<bits>`.
+///
+/// Identical to [`convert_memcpy`] except it emits the overlap-safe
+/// `llvm.memmove` intrinsic. `mir.memmove` backs `core::intrinsics::copy`
+/// (`ptr::copy`); `mir.memcpy` backs the non-overlapping variant.
+pub(crate) fn convert_memmove(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    convert_mem_transfer(ctx, rewriter, op, operands_info, "memmove")
+}
+
+/// Shared lowering for `mir.memcpy` / `mir.memmove`. `intrinsic_base` selects
+/// the LLVM intrinsic family ("memcpy" or "memmove"); both share the same
+/// `(dst, src, len_bytes, isvolatile)` signature and element->byte count scaling.
+fn convert_mem_transfer(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+    intrinsic_base: &str,
+) -> Result<()> {
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    let (dst, src, count) = match operands.as_slice() {
+        [dst, src, count] => (*dst, *src, *count),
+        _ => {
+            return pliron::input_err_noloc!(
+                "{intrinsic_base} operation requires exactly 3 operands"
+            );
+        }
+    };
+
+    let pointee = {
+        let dst_ptr_ty = operands_info
+            .lookup_most_recent_of_type::<MirPtrType>(ctx, dst)
+            .ok_or_else(|| {
+                pliron::create_error!(
+                    op.deref(ctx).loc(),
+                    pliron::result::ErrorKind::VerificationFailed,
+                    pliron::result::StringError(format!(
+                        "{intrinsic_base} destination must be a MIR pointer before lowering"
+                    ))
+                )
+            })?;
+        dst_ptr_ty.pointee
+    };
+    let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
+    let elem_size = get_type_size(ctx, elem_ty);
+
+    let bytes = if elem_size == 1 {
+        count
+    } else {
+        let count_ty = count.get_type(ctx);
+        let bits = count_ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .map(|ty| ty.width())
+            .unwrap_or(64);
+        let count_int_ty = IntegerType::get(ctx, bits, Signedness::Signless);
+        let size_attr: AttrObj = IntegerAttr::new(
+            count_int_ty,
+            APInt::from_u64(
+                elem_size,
+                std::num::NonZeroUsize::new(bits as usize).unwrap(),
+            ),
+        )
+        .into();
+        let size_const = llvm::ConstantOp::new(ctx, size_attr);
+        let size_val = size_const.get_operation().deref(ctx).get_result(0);
+        rewriter.insert_operation(ctx, size_const.get_operation());
+
+        let flags = IntegerOverflowFlagsAttr::default();
+        let mul = llvm::MulOp::new_with_overflow_flag(ctx, count, size_val, flags);
+        rewriter.insert_operation(ctx, mul.get_operation());
+        mul.get_operation().deref(ctx).get_result(0)
+    };
+
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let false_attr: AttrObj = IntegerAttr::new(
+        i1_ty,
+        APInt::from_u64(0, std::num::NonZeroUsize::new(1).unwrap()),
+    )
+    .into();
+    let volatile = llvm::ConstantOp::new(ctx, false_attr);
+    rewriter.insert_operation(ctx, volatile.get_operation());
+    let volatile_val = volatile.get_operation().deref(ctx).get_result(0);
+
+    let void_ty = VoidType::get(ctx);
+    let func_ty = FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![
+            dst.get_type(ctx),
+            src.get_type(ctx),
+            bytes.get_type(ctx),
+            volatile_val.get_type(ctx),
+        ],
+        false,
+    );
+    let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError(format!("{intrinsic_base} operation has no parent block"))
+        )
+    })?;
+    // Derive the overload suffix from the real (already type-converted)
+    // operands so the name can never disagree with the argument types.
+    let dst_ty = dst.get_type(ctx);
+    let dst_as = dst_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let src_ty = src.get_type(ctx);
+    let src_as = src_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let len_bits = bytes
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .unwrap_or(64);
+    let intrinsic_name = format!("llvm_{intrinsic_base}_p{dst_as}_p{src_as}_i{len_bits}");
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic_name, func_ty)
+        .map_err(anyhow_to_pliron)?;
+
+    let callee: Identifier = intrinsic_name.as_str().try_into().map_err(|e| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError(format!("Invalid memcpy intrinsic name: {e:?}"))
+        )
+    })?;
+    let call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(callee),
+        func_ty,
+        vec![dst, src, bytes, volatile_val],
+    );
+    rewriter.insert_operation(ctx, call.get_operation());
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -113,9 +327,33 @@ pub(crate) fn convert_load(
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    if dialect_mir::ops::MirLoadOp::new(op).is_volatile(ctx) {
+        llvm_export::ops::set_op_volatile(ctx, llvm_load.get_operation(), true);
+    }
+    copy_alignment(ctx, op, llvm_load.get_operation());
     rewriter.insert_operation(ctx, llvm_load.get_operation());
     rewriter.replace_operation(ctx, op, llvm_load.get_operation());
 
+    Ok(())
+}
+
+/// Convert `mir.dbg_value` to the LLVM-export debug marker.
+///
+/// The op is still debug-only after lowering. The textual LLVM exporter later
+/// prints it as an `llvm.dbg.value` intrinsic call.
+pub(crate) fn convert_dbg_value(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let value = op.deref(ctx).get_operand(0);
+    let loc = op.deref(ctx).loc().clone();
+    let llvm_dbg_value = llvm::DebugValueOp::new(ctx, value);
+    llvm_dbg_value.get_operation().deref_mut(ctx).set_loc(loc);
+    copy_debug_local_variable(ctx, op, llvm_dbg_value.get_operation());
+    rewriter.insert_operation(ctx, llvm_dbg_value.get_operation());
+    rewriter.erase_operation(ctx, op);
     Ok(())
 }
 
@@ -156,6 +394,8 @@ pub(crate) fn convert_alloca(
     let one_val = one_const.get_operation().deref(ctx).get_result(0);
 
     let alloca = llvm::AllocaOp::new(ctx, llvm_pointee, one_val);
+    copy_alignment(ctx, op, alloca.get_operation());
+    copy_debug_local_variable(ctx, op, alloca.get_operation());
     rewriter.insert_operation(ctx, alloca.get_operation());
     rewriter.replace_operation(ctx, op, alloca.get_operation());
 
@@ -186,10 +426,15 @@ pub(crate) fn convert_ref(
     let one_val = one_const.get_operation().deref(ctx).get_result(0);
 
     let alloca = llvm::AllocaOp::new(ctx, operand_ty, one_val);
+    // Propagate alignment stamped by the pre-pass (covers repr(align(N))
+    // structs). Without this, the synthesised alloca would be under-aligned
+    // relative to any loads/stores that claim the struct's true alignment.
+    copy_alignment(ctx, op, alloca.get_operation());
     rewriter.insert_operation(ctx, alloca.get_operation());
     let alloca_ptr = alloca.get_operation().deref(ctx).get_result(0);
 
     let store = llvm::StoreOp::new(ctx, operand, alloca_ptr);
+    copy_alignment(ctx, op, store.get_operation());
     rewriter.insert_operation(ctx, store.get_operation());
 
     rewriter.replace_operation_with_values(ctx, op, vec![alloca_ptr]);
@@ -228,9 +473,9 @@ pub(crate) fn convert_ptr_offset(
     let llvm_gep = llvm::GetElementPtrOp::new(
         ctx,
         ptr,
-        vec![dialect_llvm::ops::GepIndex::Value(offset)],
+        vec![llvm_export::ops::GepIndex::Value(offset)],
         elem_ty,
-    )?;
+    );
     rewriter.insert_operation(ctx, llvm_gep.get_operation());
     rewriter.replace_operation(ctx, op, llvm_gep.get_operation());
 
@@ -264,28 +509,22 @@ pub fn convert_shared_alloc_dc(
 
         let elem_type_attr = op_ref
             .attributes
-            .0
-            .get(&"elem_type".try_into().unwrap())
+            .get::<TypeAttr>(&"elem_type".try_into().unwrap())
             .ok_or_else(|| {
                 anyhow_to_pliron(anyhow::anyhow!(
-                    "MirSharedAllocOp missing elem_type attribute"
+                    "MirSharedAllocOp missing elem_type TypeAttr attribute"
                 ))
             })?;
-        let elem_type_attr = elem_type_attr
-            .downcast_ref::<TypeAttr>()
-            .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("elem_type is not a TypeAttr")))?;
         let mir_elem_type = elem_type_attr.get_type(ctx);
 
         let size_attr = op_ref
             .attributes
-            .0
-            .get(&"size".try_into().unwrap())
+            .get::<IntegerAttr>(&"size".try_into().unwrap())
             .ok_or_else(|| {
-                anyhow_to_pliron(anyhow::anyhow!("MirSharedAllocOp missing size attribute"))
+                anyhow_to_pliron(anyhow::anyhow!(
+                    "MirSharedAllocOp missing size IntegerAttr attribute"
+                ))
             })?;
-        let size_attr = size_attr
-            .downcast_ref::<IntegerAttr>()
-            .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("size is not an IntegerAttr")))?;
         let size = size_attr.value().to_u64();
 
         let alignment = shared_alloc_op.get_alignment_value(ctx).unwrap_or(0);
@@ -336,7 +575,7 @@ fn create_shared_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
     shared_globals: &mut SharedGlobalsMap,
-    mir_elem_type: Ptr<TypeObj>,
+    mir_elem_type: TypeHandle,
     size: u64,
     alignment: u64,
     alloc_key: Option<String>,
@@ -354,7 +593,7 @@ fn create_shared_global(
     } else {
         llvm::GlobalOp::new(ctx, name.clone(), array_type.into())
     };
-    global_op.set_address_space(ctx, dialect_llvm::types::address_space::SHARED);
+    global_op.set_address_space(ctx, llvm_export::types::address_space::SHARED);
 
     let parent_block = op
         .deref(ctx)
@@ -391,41 +630,63 @@ pub fn convert_global_alloc_dc(
 ) -> Result<()> {
     use pliron::builtin::attributes::{StringAttr, TypeAttr};
 
-    let (global_key, mir_global_type, alignment) = {
+    let (global_key, mir_global_type, alignment, addr_space, initializer_hex) = {
         let global_op = dialect_mir::ops::MirGlobalAllocOp::new(op);
         let op_ref = op.deref(ctx);
 
         let global_key_attr = op_ref
             .attributes
-            .0
-            .get(&"global_key".try_into().unwrap())
+            .get::<StringAttr>(&"global_key".try_into().unwrap())
             .ok_or_else(|| {
                 anyhow_to_pliron(anyhow::anyhow!(
-                    "MirGlobalAllocOp missing global_key attribute"
+                    "MirGlobalAllocOp missing global_key StringAttr attribute"
                 ))
             })?;
-        let global_key_attr = global_key_attr
-            .downcast_ref::<StringAttr>()
-            .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("global_key is not a StringAttr")))?;
         let global_key = String::from((*global_key_attr).clone());
 
         let global_type_attr = op_ref
             .attributes
-            .0
-            .get(&"global_type".try_into().unwrap())
+            .get::<TypeAttr>(&"global_type".try_into().unwrap())
             .ok_or_else(|| {
                 anyhow_to_pliron(anyhow::anyhow!(
-                    "MirGlobalAllocOp missing global_type attribute"
+                    "MirGlobalAllocOp missing global_type TypeAttr attribute"
                 ))
             })?;
-        let global_type_attr = global_type_attr
-            .downcast_ref::<TypeAttr>()
-            .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("global_type is not a TypeAttr")))?;
         let mir_global_type = global_type_attr.get_type(ctx);
 
         let alignment = global_op.get_alignment_value(ctx).unwrap_or(0);
+        let initializer_hex = op_ref
+            .attributes
+            .get::<StringAttr>(&"global_initializer_hex".try_into().unwrap())
+            .map(|attr| String::from((*attr).clone()));
 
-        (global_key, mir_global_type, alignment)
+        // Read the address space the op's result already carries — set by
+        // mir-importer based on the static's type (`ConstantMemory<T>` → 4,
+        // ordinary → 1). The dialect verifier accepts both.
+        let res_ty = op_ref.get_result(0).get_type(ctx);
+        let addr_space = res_ty
+            .deref(ctx)
+            .downcast_ref::<dialect_mir::types::MirPtrType>()
+            .map(|p| {
+                if p.address_space == dialect_mir::types::address_space::CONSTANT {
+                    llvm_export::types::address_space::CONSTANT
+                } else {
+                    llvm_export::types::address_space::GLOBAL
+                }
+            })
+            .ok_or_else(|| {
+                anyhow_to_pliron(anyhow::anyhow!(
+                    "MirGlobalAllocOp result is not a MirPtrType"
+                ))
+            })?;
+
+        (
+            global_key,
+            mir_global_type,
+            alignment,
+            addr_space,
+            initializer_hex,
+        )
     };
 
     let global_name = if let Some(existing_name) = device_globals.get(&global_key) {
@@ -435,42 +696,87 @@ pub fn convert_global_alloc_dc(
             ctx,
             op,
             device_globals,
-            &global_key,
-            mir_global_type,
-            alignment,
+            DeviceGlobalSpec {
+                key: &global_key,
+                mir_type: mir_global_type,
+                alignment,
+                addr_space,
+                initializer_hex: initializer_hex.as_deref(),
+            },
         )?
     };
 
-    let address_of_op =
-        llvm::AddressOfOp::new(ctx, global_name, dialect_llvm::types::address_space::GLOBAL);
+    let address_of_op = llvm::AddressOfOp::new(ctx, global_name, addr_space);
     rewriter.insert_operation(ctx, address_of_op.get_operation());
     rewriter.replace_operation(ctx, op, address_of_op.get_operation());
 
     Ok(())
 }
 
+struct DeviceGlobalSpec<'a> {
+    key: &'a str,
+    mir_type: TypeHandle,
+    alignment: u64,
+    addr_space: u32,
+    initializer_hex: Option<&'a str>,
+}
+
 fn create_device_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
     device_globals: &mut DeviceGlobalsMap,
-    global_key: &str,
-    mir_global_type: Ptr<TypeObj>,
-    alignment: u64,
+    spec: DeviceGlobalSpec<'_>,
 ) -> Result<pliron::identifier::Identifier> {
-    let llvm_global_type = convert_type(ctx, mir_global_type).map_err(anyhow_to_pliron)?;
+    // An explicit initializer is already the evaluated Rust allocation image.
+    // Keep it as `[N x i8]` all the way through LLVM instead of rebuilding a
+    // typed constant. Typed reconstruction can lose NaN payload bits and needs
+    // a second, easily-divergent implementation of Rust struct padding.
+    let semantic_llvm_type = convert_type(ctx, spec.mir_type).map_err(anyhow_to_pliron)?;
+    let (llvm_global_type, alignment) = if let Some(initializer_hex) = spec.initializer_hex {
+        let byte_count = initializer_hex_byte_count(initializer_hex).map_err(anyhow_to_pliron)?;
+        if spec.alignment == 0 {
+            return Err(anyhow_to_pliron(anyhow::anyhow!(
+                "device global initializer is missing its evaluated Rust allocation alignment"
+            )));
+        }
+        validate_initialized_global_layout(ctx, spec.mir_type, byte_count, spec.alignment)
+            .map_err(anyhow_to_pliron)?;
+        let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+        (
+            ArrayType::get(ctx, i8_ty.into(), byte_count).into(),
+            spec.alignment,
+        )
+    } else {
+        (semantic_llvm_type, spec.alignment)
+    };
 
-    static DEVICE_GLOBAL_COUNTER: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-    let counter = DEVICE_GLOBAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Constant-memory globals reuse the Rust-side mangled name so host code can
+    // resolve them by name via `cuModuleGetGlobal`. Ordinary device globals
+    // are private to the kernel and get a counter-based unique name.
     let name: pliron::identifier::Identifier =
-        format!("__device_global_{counter}").try_into().unwrap();
+        if spec.addr_space == llvm_export::types::address_space::CONSTANT {
+            spec.key.try_into().map_err(|e| {
+                anyhow_to_pliron(anyhow::anyhow!(
+                    "constant global_key {:?} is not a valid identifier: {e:?}",
+                    spec.key
+                ))
+            })?
+        } else {
+            static DEVICE_GLOBAL_COUNTER: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let counter = DEVICE_GLOBAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            format!("__device_global_{counter}").try_into().unwrap()
+        };
 
     let global_op = if alignment > 0 {
         llvm::GlobalOp::new_with_alignment(ctx, name.clone(), llvm_global_type, alignment)
     } else {
         llvm::GlobalOp::new(ctx, name.clone(), llvm_global_type)
     };
-    global_op.set_address_space(ctx, dialect_llvm::types::address_space::GLOBAL);
+    global_op.set_address_space(ctx, spec.addr_space);
+    if let Some(initializer_hex) = spec.initializer_hex {
+        global_op.set_initializer_hex(ctx, initializer_hex);
+    }
 
     let parent_block = op
         .deref(ctx)
@@ -485,9 +791,23 @@ fn create_device_global(
         .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("Module is empty")))?;
 
     global_op.get_operation().insert_at_front(module_block, ctx);
-    device_globals.insert(global_key.to_string(), name.clone());
+    device_globals.insert(spec.key.to_string(), name.clone());
 
     Ok(name)
+}
+
+fn initializer_hex_byte_count(hex: &str) -> std::result::Result<u64, anyhow::Error> {
+    if !hex.len().is_multiple_of(2) {
+        anyhow::bail!("device global initializer has an odd-length hex byte string");
+    }
+    if let Some(invalid) = hex.bytes().find(|byte| !byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "device global initializer contains invalid hex digit {:?}",
+            invalid as char
+        );
+    }
+    u64::try_from(hex.len() / 2)
+        .map_err(|_| anyhow::anyhow!("device global initializer is too large for LLVM"))
 }
 
 /// Convert `mir.extern_shared` to LLVM extern global variable in shared address space.
@@ -496,16 +816,16 @@ fn create_device_global(
 /// with address space 3 and zero-length array type `[0 x i8]`. The actual size
 /// is determined at kernel launch via `LaunchConfig::shared_mem_bytes`.
 ///
-/// # Per-Kernel Symbols
+/// # Per-Owner Symbols
 ///
-/// Each kernel gets its own dynamic shared memory symbol (`__dynamic_smem_{kernel_name}`).
-/// This ensures explicit separation in the generated PTX.
+/// Each function that owns an access gets a dynamic shared-memory symbol
+/// (`__dynamic_smem_{function_name}`).
 ///
 /// # Alignment
 ///
-/// The alignment is pre-computed during the lowering pre-pass. All
-/// `DynamicSharedArray<T, ALIGN>` calls in a kernel share the same global, which
-/// uses the maximum alignment requested by any call.
+/// The alignment is pre-computed during the lowering pre-pass. It is the
+/// maximum of the owner's body requirements and every launch-contract marker
+/// that can reach it.
 ///
 /// # Byte Offset
 ///
@@ -571,9 +891,9 @@ pub fn convert_extern_shared_dc(
         let gep_op = llvm::GetElementPtrOp::new(
             ctx,
             base_ptr,
-            vec![dialect_llvm::ops::GepIndex::Value(offset_value)],
+            vec![llvm_export::ops::GepIndex::Value(offset_value)],
             i8_ty.into(),
-        )?;
+        );
         rewriter.insert_operation(ctx, gep_op.get_operation());
         rewriter.replace_operation(ctx, op, gep_op.get_operation());
     } else {
@@ -583,17 +903,16 @@ pub fn convert_extern_shared_dc(
     Ok(())
 }
 
-/// Get or create the extern shared memory global for a kernel.
+/// Get or create the extern shared memory global for an owning function.
 ///
 /// Creates an LLVM global variable with:
 /// - Zero-length array type: `[0 x i8]`
 /// - External linkage (no initializer)
 /// - Address space 3 (shared memory)
-/// - Pre-computed maximum alignment from all DynamicSharedArray calls in the kernel
+/// - Pre-computed body and calling-kernel contract alignment
 ///
-/// Each kernel gets its own dynamic shared memory symbol
-/// (`__dynamic_smem_kernel_name`). Uses `shared_globals` for deduplication
-/// (only one global per kernel).
+/// Each owning function gets its own dynamic shared memory symbol. Uses
+/// `shared_globals` for deduplication (only one global per function).
 fn get_or_create_extern_shared_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
@@ -605,7 +924,7 @@ fn get_or_create_extern_shared_global(
     let (symbol_name, max_alignment) = dynamic_smem_alignments.get(func_name).cloned().ok_or_else(
         || {
             anyhow_to_pliron(anyhow::anyhow!(
-                "Internal error: dynamic shared memory alignment not pre-computed for kernel '{}'. \
+                "Internal error: dynamic shared memory alignment not pre-computed for function '{}'. \
                  This should have been done in compute_max_dynamic_smem_alignment.",
                 func_name
             ))
@@ -626,10 +945,10 @@ fn get_or_create_extern_shared_global(
         array_type.into(),
         max_alignment,
     );
-    global_op.set_address_space(ctx, dialect_llvm::types::address_space::SHARED);
+    global_op.set_address_space(ctx, llvm_export::types::address_space::SHARED);
 
     {
-        use dialect_llvm::attributes::LinkageAttr;
+        use llvm_export::attributes::LinkageAttr;
         global_op.set_attr_llvm_global_linkage(ctx, LinkageAttr::ExternalLinkage);
     }
 
@@ -654,5 +973,1105 @@ fn get_or_create_extern_shared_global(
 
 #[cfg(test)]
 mod tests {
-    // TODO (npasham): Add unit tests for memory conversion
+    //! End-to-end lowering tests for `dialect-mir` memory ops.
+    //!
+    //! The `convert_*` functions in this file take a live
+    //! `DialectConversionRewriter`, which is owned by pliron's conversion
+    //! driver and not constructible standalone. So each test builds a small
+    //! MIR module, runs the full `lower_mir_to_llvm` pass on it, and asserts
+    //! the lowered module contains the expected `dialect-llvm` shape — same
+    //! pattern as `tests/lowering_test.rs`.
+
+    use super::*;
+    use crate::convert::ops::test_util::*;
+    use dialect_mir::ops as mir;
+    use dialect_mir::types::{MirArrayType, MirPtrType, MirStructType, MirTupleType};
+    use llvm_export::op_interfaces::PointerTypeResult;
+    use llvm_export::ops as llvm;
+    use llvm_export::types::{PointerType, address_space as llvm_addr};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::{StringAttr, TypeAttr};
+    use pliron::builtin::op_interfaces::SymbolOpInterface;
+    use pliron::builtin::types::{IntegerType, Signedness};
+    use pliron::context::Context;
+    use pliron::linked_list::ContainsLinkedList;
+    use pliron::location::{Location, Source};
+    use pliron::op::Op;
+    use pliron::operation::Operation;
+    use std::path::PathBuf;
+
+    fn ptr_addrspace(ctx: &Context, ty: TypeHandle) -> u32 {
+        ty.deref(ctx)
+            .downcast_ref::<PointerType>()
+            .expect("expected llvm.PointerType")
+            .address_space()
+    }
+
+    fn src_location(ctx: &mut Context, file: &str, line: i32, column: i32) -> Location {
+        Location::SrcPos {
+            src: Source::new_from_file(ctx, PathBuf::from(file)),
+            pos: combine::stream::position::SourcePosition { line, column },
+        }
+    }
+
+    fn over_aligned_tuple_ty(ctx: &mut Context) -> TypeHandle {
+        let byte: TypeHandle = IntegerType::get(ctx, 8, Signedness::Unsigned).into();
+        let marker: TypeHandle = MirStructType::get_with_full_layout(
+            ctx,
+            "Align32".into(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            32,
+        )
+        .into();
+        MirTupleType::get_with_layout(ctx, vec![marker, byte], vec![0, 1], vec![0, 0], 32, 32)
+            .into()
+    }
+
+    #[test]
+    fn convert_alloca_lowers_to_llvm_alloca() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        alloca_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(
+            count_ops::<llvm::AllocaOp>(&ctx, &body),
+            1,
+            "expected exactly one llvm.alloca"
+        );
+        let alloca = find_first::<llvm::AllocaOp>(&ctx, &body).unwrap();
+        // Element type should round-trip through convert_type as i32.
+        let elem_ty = alloca.result_pointee_type(&ctx);
+        assert!(elem_ty.deref(&ctx).is::<IntegerType>());
+    }
+
+    #[test]
+    fn convert_alloca_preserves_nested_array_element_alignment() {
+        let mut ctx = make_ctx();
+        let tuple_ty = over_aligned_tuple_ty(&mut ctx);
+        let inner: TypeHandle = MirArrayType::get(&mut ctx, tuple_ty, 2).into();
+        let outer: TypeHandle = MirArrayType::get(&mut ctx, inner, 3).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, outer, true);
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        alloca_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let alloca = find_first::<llvm::AllocaOp>(&ctx, &body).expect("expected llvm.alloca");
+        assert_eq!(
+            llvm_export::ops::op_alignment(&ctx, alloca.get_operation()),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn convert_alloca_preserves_debug_local_metadata() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        llvm::set_debug_local_variable(
+            &mut ctx,
+            alloca_op,
+            llvm::DebugLocalVariableInfo {
+                name: "x".to_string(),
+                argument_index: Some(1),
+                ty: llvm::DebugLocalTypeKind::Basic {
+                    name: "i32".to_string(),
+                    size_bits: 32,
+                    encoding: "DW_ATE_signed",
+                },
+            },
+        );
+        alloca_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let alloca = find_first::<llvm::AllocaOp>(&ctx, &body).unwrap();
+        let info = llvm::debug_local_variable(&ctx, alloca.get_operation())
+            .expect("debug local metadata should survive lowering");
+
+        assert_eq!(info.name, "x");
+        assert_eq!(info.argument_index, Some(1));
+        assert_eq!(
+            info.ty,
+            llvm::DebugLocalTypeKind::Basic {
+                name: "i32".to_string(),
+                size_bits: 32,
+                encoding: "DW_ATE_signed",
+            }
+        );
+    }
+
+    #[test]
+    fn convert_store_lowers_to_llvm_store() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        // Kernel takes (ptr, val) so we can store one into the other.
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i32_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let val = block.deref(&ctx).get_argument(1);
+
+        let store_op = Operation::new(
+            &mut ctx,
+            mir::MirStoreOp::get_concrete_op_info(),
+            vec![],
+            vec![ptr_val, val],
+            vec![],
+            0,
+        );
+        store_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(
+            count_ops::<llvm::StoreOp>(&ctx, &body),
+            1,
+            "expected one llvm.store"
+        );
+        // The original mir.store must be gone.
+        assert_eq!(count_ops::<mir::MirStoreOp>(&ctx, &body), 0);
+
+        // convert_store swaps operand order: mir.store is [ptr, value] but
+        // llvm.store takes (value, ptr). Verify that mapping survived.
+        let store = find_first::<llvm::StoreOp>(&ctx, &body).unwrap();
+        let addr_ty = store.get_operand_address(&ctx).get_type(&ctx);
+        assert!(addr_ty.deref(&ctx).is::<PointerType>(), "operand 1 is ptr");
+    }
+
+    #[test]
+    fn convert_store_preserves_volatile() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i32_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let val = block.deref(&ctx).get_argument(1);
+
+        let store_op = Operation::new(
+            &mut ctx,
+            mir::MirStoreOp::get_concrete_op_info(),
+            vec![],
+            vec![ptr_val, val],
+            vec![],
+            0,
+        );
+        mir::MirStoreOp::new(store_op).set_volatile(&mut ctx, true);
+        store_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let store = find_first::<llvm::StoreOp>(&ctx, &body).unwrap();
+        assert!(
+            llvm_export::ops::op_volatile(&ctx, store.get_operation()),
+            "volatile mir.store must lower to a volatile llvm.store"
+        );
+    }
+
+    #[test]
+    fn convert_load_lowers_to_llvm_load() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![ptr_val],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 1);
+        assert_eq!(count_ops::<mir::MirLoadOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn convert_dbg_value_lowers_to_llvm_dbg_value() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![]);
+        let value = block.deref(&ctx).get_argument(0);
+
+        let dbg_op = mir::MirDbgValueOp::new(&mut ctx, value);
+        let dbg_loc = pliron::location::Location::Named {
+            name: "current value location".to_string(),
+            child_loc: Box::new(pliron::location::Location::Unknown),
+        };
+        dbg_op
+            .get_operation()
+            .deref_mut(&ctx)
+            .set_loc(dbg_loc.clone());
+        llvm::set_debug_local_variable(
+            &mut ctx,
+            dbg_op.get_operation(),
+            llvm::DebugLocalVariableInfo {
+                name: "x".to_string(),
+                argument_index: None,
+                ty: llvm::DebugLocalTypeKind::Basic {
+                    name: "i32".to_string(),
+                    size_bits: 32,
+                    encoding: "DW_ATE_signed",
+                },
+            },
+        );
+        llvm::set_debug_local_source_scope(&mut ctx, dbg_op.get_operation(), 42);
+        llvm::set_debug_local_declaration_location(
+            &mut ctx,
+            dbg_op.get_operation(),
+            PathBuf::from("decl.rs"),
+            7,
+            3,
+        );
+        dbg_op.get_operation().insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(count_ops::<mir::MirDbgValueOp>(&ctx, &body), 0);
+        let dbg_value = find_first::<llvm::DebugValueOp>(&ctx, &body)
+            .expect("expected lowered llvm.dbg_value marker");
+        assert_eq!(
+            dbg_value.get_operation().deref(&ctx).loc(),
+            dbg_loc,
+            "dbg.value lowering should keep the current-value source location"
+        );
+        let info = llvm::debug_local_variable(&ctx, dbg_value.get_operation())
+            .expect("debug local metadata should survive dbg_value lowering");
+
+        assert_eq!(info.name, "x");
+        assert_eq!(
+            llvm::debug_local_source_scope(&ctx, dbg_value.get_operation()),
+            Some(42),
+            "dbg.value lowering should keep the MIR source-scope owner"
+        );
+        let (decl_file, decl_pos) =
+            llvm::debug_local_declaration_location(&ctx, dbg_value.get_operation())
+                .expect("declaration location should survive dbg_value lowering");
+        assert_eq!(decl_file, PathBuf::from("decl.rs"));
+        assert_eq!(decl_pos.line, 7);
+        assert_eq!(decl_pos.column, 3);
+        assert_eq!(
+            info.ty,
+            llvm::DebugLocalTypeKind::Basic {
+                name: "i32".to_string(),
+                size_bits: 32,
+                encoding: "DW_ATE_signed",
+            }
+        );
+    }
+
+    #[test]
+    fn mem2reg_salvages_tagged_alloca_into_mir_dbg_value() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![i32_ty]);
+        let arg = block.deref(&ctx).get_argument(0);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let decl_loc = src_location(&mut ctx, "kernel.rs", 12, 9);
+        alloca_op.deref_mut(&ctx).set_loc(decl_loc.clone());
+        llvm::set_debug_local_variable(
+            &mut ctx,
+            alloca_op,
+            llvm::DebugLocalVariableInfo {
+                name: "x".to_string(),
+                argument_index: Some(1),
+                ty: llvm::DebugLocalTypeKind::Basic {
+                    name: "i32".to_string(),
+                    size_bits: 32,
+                    encoding: "DW_ATE_signed",
+                },
+            },
+        );
+        llvm::set_debug_local_source_scope(&mut ctx, alloca_op, 9);
+        alloca_op.insert_at_back(block, &ctx);
+        let slot = alloca_op.deref(&ctx).get_result(0);
+
+        let store_op = Operation::new(
+            &mut ctx,
+            mir::MirStoreOp::get_concrete_op_info(),
+            vec![],
+            vec![slot, arg],
+            vec![],
+            0,
+        );
+        store_op.insert_at_back(block, &ctx);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![slot],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        let loaded = load_op.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![loaded]);
+
+        let mut analyses = pliron::pass_manager::AnalysisManager::default();
+        pliron::opts::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
+            .expect("mem2reg should promote the local slot");
+
+        let blocks = vec![block];
+        assert_eq!(count_ops::<mir::MirAllocaOp>(&ctx, &blocks), 0);
+        assert_eq!(count_ops::<mir::MirStoreOp>(&ctx, &blocks), 0);
+        assert_eq!(count_ops::<mir::MirLoadOp>(&ctx, &blocks), 0);
+
+        let dbg_values = find_all::<mir::MirDbgValueOp>(&ctx, &blocks);
+        assert!(
+            !dbg_values.is_empty(),
+            "mem2reg should leave value-based debug records for promoted locals"
+        );
+        let info = llvm::debug_local_variable(&ctx, dbg_values[0].get_operation())
+            .expect("mir.dbg_value should carry the promoted local metadata");
+        assert_eq!(info.name, "x");
+        assert_eq!(info.argument_index, Some(1));
+        assert_eq!(
+            llvm::debug_local_source_scope(&ctx, dbg_values[0].get_operation()),
+            Some(9),
+            "mem2reg salvage should keep the local's MIR source-scope owner"
+        );
+        assert_eq!(
+            dbg_values[0].get_operation().deref(&ctx).loc(),
+            decl_loc,
+            "debug records for source-less promoted ops should fall back to the local declaration"
+        );
+    }
+
+    #[test]
+    fn convert_load_preserves_volatile() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![ptr_val],
+            vec![],
+            0,
+        );
+        mir::MirLoadOp::new(load_op).set_volatile(&mut ctx, true);
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let load = find_first::<llvm::LoadOp>(&ctx, &body).unwrap();
+        assert!(
+            llvm_export::ops::op_volatile(&ctx, load.get_operation()),
+            "volatile mir.load must lower to a volatile llvm.load"
+        );
+    }
+
+    #[test]
+    fn convert_ref_lowers_to_alloca_then_store() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+
+        // Take a u32 by value, build `&x`.
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![]);
+        let arg = block.deref(&ctx).get_argument(0);
+
+        let ref_op_ptr = Operation::new(
+            &mut ctx,
+            mir::MirRefOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![arg],
+            vec![],
+            0,
+        );
+        mir::MirRefOp::new(ref_op_ptr).set_mutable(&mut ctx, false);
+        ref_op_ptr.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(
+            count_ops::<llvm::AllocaOp>(&ctx, &body),
+            1,
+            "ref must materialize via alloca"
+        );
+        assert_eq!(
+            count_ops::<llvm::StoreOp>(&ctx, &body),
+            1,
+            "ref must store the value into the alloca"
+        );
+        assert_eq!(count_ops::<mir::MirRefOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn convert_ref_preserves_tuple_alignment_on_alloca_and_store() {
+        let mut ctx = make_ctx();
+        let tuple_ty = over_aligned_tuple_ty(&mut ctx);
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, tuple_ty, false);
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let undef = mir::MirUndefOp::new(&mut ctx, tuple_ty);
+        undef.get_operation().insert_at_back(block, &ctx);
+        let value = undef.get_operation().deref(&ctx).get_result(0);
+        let ref_op = Operation::new(
+            &mut ctx,
+            mir::MirRefOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![value],
+            vec![],
+            0,
+        );
+        mir::MirRefOp::new(ref_op).set_mutable(&mut ctx, false);
+        ref_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let alloca = find_first::<llvm::AllocaOp>(&ctx, &body).expect("expected llvm.alloca");
+        let store = find_first::<llvm::StoreOp>(&ctx, &body).expect("expected llvm.store");
+        assert_eq!(
+            llvm_export::ops::op_alignment(&ctx, alloca.get_operation()),
+            Some(32)
+        );
+        assert_eq!(
+            llvm_export::ops::op_alignment(&ctx, store.get_operation()),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn convert_ptr_offset_lowers_to_gep_with_pointee_elem_type() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i64_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let off_val = block.deref(&ctx).get_argument(1);
+
+        let off_op = Operation::new(
+            &mut ctx,
+            mir::MirPtrOffsetOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![ptr_val, off_val],
+            vec![],
+            0,
+        );
+        off_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let gep = find_first::<llvm::GetElementPtrOp>(&ctx, &body).expect("expected one llvm.gep");
+        // Element type must come from the MirPtrType pointee (i32), not the
+        // i8 fallback used when no operand-type info is available.
+        let elem_ty = gep.src_elem_type(&ctx);
+        let elem_ty_ref = elem_ty.deref(&ctx);
+        let int_ty = elem_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("gep src_elem_type should be IntegerType");
+        assert_eq!(int_ty.width(), 32, "gep elem type must be i32 (pointee)");
+    }
+
+    // =========================================================================
+    // Enum layout: converted width per shape + divergent-enum rejection
+    // =========================================================================
+
+    use dialect_mir::types::{EnumVariant, MirEnumType};
+
+    /// Build a Direct-tag `MirEnumType` the way the importer does:
+    /// unsigned tag of `tag_bits`, plus rustc's `total_size`/`abi_align`.
+    fn make_enum_ty(
+        ctx: &mut Context,
+        name: &str,
+        tag_bits: u32,
+        variants: Vec<EnumVariant>,
+        total_size: u64,
+        abi_align: u64,
+    ) -> TypeHandle {
+        let tag_ty: TypeHandle = IntegerType::get(ctx, tag_bits, Signedness::Unsigned).into();
+        // Sequential 0..n discriminants: these layout tests only exercise
+        // size/width, not value mapping.
+        let discriminants: Vec<u64> = (0..variants.len() as u64).collect();
+        MirEnumType::get_with_layout(
+            ctx,
+            name.to_string(),
+            tag_ty,
+            discriminants,
+            variants,
+            0, // tag at byte 0, like every shape these tests exercise
+            total_size,
+            abi_align,
+        )
+        .into()
+    }
+
+    fn unit_variants(n: usize) -> Vec<EnumVariant> {
+        (0..n).map(|i| EnumVariant::unit(format!("V{i}"))).collect()
+    }
+
+    /// Converted enum allocation size must equal rustc's `total_size` for
+    /// every memory-faithful tag shape: that size is what GEP strides by.
+    #[test]
+    fn enum_conversion_strides_by_rustc_size() {
+        use crate::convert::types::llvm_type_size_align;
+
+        let mut ctx = make_ctx();
+
+        // #[repr(u32)] fieldless (issue #118 shape): {i32}, 4 bytes.
+        let repr_u32 = make_enum_ty(&mut ctx, "ReprU32", 32, unit_variants(4), 4, 4);
+        let conv = convert_type(&mut ctx, repr_u32).unwrap();
+        assert_eq!(
+            llvm_type_size_align(&ctx, conv),
+            Some((4, 4)),
+            "repr(u32) tag"
+        );
+
+        // #[repr(usize)] fieldless: {i64}, 8 bytes.
+        let repr_usize = make_enum_ty(&mut ctx, "ReprUsize", 64, unit_variants(4), 8, 8);
+        let conv = convert_type(&mut ctx, repr_usize).unwrap();
+        assert_eq!(
+            llvm_type_size_align(&ctx, conv),
+            Some((8, 8)),
+            "repr(usize) tag"
+        );
+
+        // repr(align(8)) with an i8 tag: the byte claims alone would give
+        // alignment 1, so the slot map raises the storage alignment with a
+        // zero-length anchor field. Size and alignment must both match
+        // rustc, or arrays and by-value ABI uses would be unsound.
+        let padded = make_enum_ty(&mut ctx, "Padded", 8, unit_variants(2), 8, 8);
+        let conv = convert_type(&mut ctx, padded).unwrap();
+        assert_eq!(
+            llvm_type_size_align(&ctx, conv),
+            Some((8, 8)),
+            "repr(align(8)) i8 tag"
+        );
+
+        // u8 tag + i64 payload, rustc size 16: the slot map places the
+        // payload at its rustc byte offset 8 behind an explicit
+        // [7 x i8] filler, making the layout datalayout-independent.
+        let i64_payload: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let payload = make_enum_ty(
+            &mut ctx,
+            "OnePayload",
+            8,
+            vec![
+                EnumVariant::new_with_layout("A".to_string(), vec![i64_payload], vec![8], vec![8]),
+                EnumVariant::unit("B".to_string()),
+            ],
+            16,
+            8,
+        );
+        let conv = convert_type(&mut ctx, payload).unwrap();
+        let (size, _align) = llvm_type_size_align(&ctx, conv).unwrap();
+        assert_eq!(size, 16, "natural layout matches rustc size, no pad");
+        let conv_ref = conv.deref(&ctx);
+        let struct_ty = conv_ref
+            .downcast_ref::<llvm_export::types::StructType>()
+            .expect("converted enum is a struct");
+        assert_eq!(
+            struct_ty.fields().count(),
+            3,
+            "{{tag, [7 x i8] filler, payload}}: explicit filler to byte 8"
+        );
+    }
+
+    /// Multi-payload enum: variants overlap in Rust, and identical
+    /// (offset, converted type) payloads share one typed slot, so the
+    /// converted struct is byte-identical to rustc's layout AND every
+    /// access stays pure SSA (no spill).
+    #[test]
+    fn multi_payload_enum_shares_payload_slot() {
+        use crate::convert::types::{build_enum_slot_map, llvm_type_size_align};
+
+        let mut ctx = make_ctx();
+        let e = make_multi_payload_enum_ty(&mut ctx);
+        let map = build_enum_slot_map(&mut ctx, e).unwrap();
+        assert_eq!(map.carrier_slot, Some(0));
+        assert_eq!(
+            map.field_slots,
+            vec![Some(1), Some(1)],
+            "A.0 and B.0 overlap at byte 4 with the same type: one shared slot"
+        );
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((8, 4)),
+            "byte-identical to rustc's 8-byte layout, not the 12-byte concat"
+        );
+    }
+
+    /// rustc may place the tag AFTER payload bytes; the slot map must
+    /// follow the recorded tag_offset, never assume slot 0.
+    #[test]
+    fn enum_slot_map_tag_not_at_zero() {
+        use crate::convert::types::{build_enum_slot_map, llvm_type_size_align};
+
+        let mut ctx = make_ctx();
+        let u64_a: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let u64_b: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let tag_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        // enum F { A(u64), B(u64) }: payloads share byte 0, tag at byte 8.
+        let ty: TypeHandle = MirEnumType::get_with_layout(
+            &mut ctx,
+            "TagAtEight".to_string(),
+            tag_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("A".to_string(), vec![u64_a], vec![0], vec![8]),
+                EnumVariant::new_with_layout("B".to_string(), vec![u64_b], vec![0], vec![8]),
+            ],
+            8,
+            16,
+            8,
+        )
+        .into();
+        let map = build_enum_slot_map(&mut ctx, ty).unwrap();
+        assert_eq!(
+            map.field_slots,
+            vec![Some(0), Some(0)],
+            "payloads share the first slot"
+        );
+        assert_eq!(
+            map.carrier_slot,
+            Some(1),
+            "tag claims its own slot at byte 8"
+        );
+        let (size, _align) = llvm_type_size_align(&ctx, map.llvm_struct_ty).unwrap();
+        assert_eq!(size, 16, "{{ i64, i8, [7 x i8] }}");
+    }
+
+    /// Multi-payload enum whose variants overlap in Rust: both payloads use
+    /// bytes 4..8 after the direct `u32` tag, so the complete value is eight
+    /// bytes. Mimics `#[repr(u32)] enum E { A(u32), B(u32) }`.
+    fn make_multi_payload_enum_ty(ctx: &mut Context) -> TypeHandle {
+        let i32_a: TypeHandle = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+        let i32_b: TypeHandle = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+        make_enum_ty(
+            ctx,
+            "MultiPayload",
+            32,
+            vec![
+                EnumVariant::new_with_layout("A".to_string(), vec![i32_a], vec![4], vec![4]),
+                EnumVariant::new_with_layout("B".to_string(), vec![i32_b], vec![4], vec![4]),
+            ],
+            8,
+            4,
+        )
+    }
+
+    /// Device-local GEP + load must use the same exact eight-byte rustc layout
+    /// as every other enum path. This protects pointer stride in issue #131's
+    /// in-kernel `[E; 4]` arrays; the sibling kernel-parameter test proves the
+    /// same representation is also valid at the host/device boundary.
+    #[test]
+    fn device_local_multi_payload_enum_gep_and_load_lower() {
+        let mut ctx = make_ctx();
+        let enum_ty = make_multi_payload_enum_ty(&mut ctx);
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i64_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let off_val = block.deref(&ctx).get_argument(1);
+
+        let off_op = Operation::new(
+            &mut ctx,
+            mir::MirPtrOffsetOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![ptr_val, off_val],
+            vec![],
+            0,
+        );
+        off_op.insert_at_back(block, &ctx);
+        let elem_ptr = off_op.deref(&ctx).get_result(0);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![elem_ptr],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("device-local rustc-layout enum GEP + load must lower");
+    }
+
+    /// A kernel parameter may carry this enum because the device slot map is
+    /// byte-identical to rustc's overlapped host layout.
+    #[test]
+    fn kernel_param_accepts_multi_payload_enum() {
+        use pliron::builtin::attributes::StringAttr;
+
+        let mut ctx = make_ctx();
+        let enum_ty = make_multi_payload_enum_ty(&mut ctx);
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        // Mark the function as a GPU kernel the way the importer does.
+        {
+            let module_block = module_ptr
+                .deref(&ctx)
+                .get_region(0)
+                .deref(&ctx)
+                .iter(&ctx)
+                .next()
+                .unwrap();
+            let func_op = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+            let kernel_attr = StringAttr::new("true".to_string());
+            let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
+            func_op.deref_mut(&ctx).attributes.set(key, kernel_attr);
+        }
+
+        // The slot map lowers MultiPayload byte-identically to rustc's
+        // layout ({ i32, i32 }, 8 bytes), so the kernel ABI accepts it.
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("multi-payload enum kernel param must lower");
+    }
+
+    /// A legacy enum without physical rustc metadata must be rejected at the
+    /// kernel boundary. Importer-produced niche layouts are now known and are
+    /// accepted; this fixture deliberately constructs `Unknown` metadata.
+    #[test]
+    fn kernel_param_rejects_enum_with_unknown_layout() {
+        use pliron::builtin::attributes::StringAttr;
+
+        let mut ctx = make_ctx();
+        // MirEnumType::get with no layout is the legacy Unknown form.
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let pointee = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+        let tag_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let niched: TypeHandle = MirEnumType::get(
+            &mut ctx,
+            "Option".to_string(),
+            tag_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".to_string()),
+                EnumVariant::new("Some".to_string(), vec![pointee.into()]),
+            ],
+        )
+        .into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, niched, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        {
+            let module_block = module_ptr
+                .deref(&ctx)
+                .get_region(0)
+                .deref(&ctx)
+                .iter(&ctx)
+                .next()
+                .unwrap();
+            let func_op = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+            let kernel_attr = StringAttr::new("true".to_string());
+            let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
+            func_op.deref_mut(&ctx).attributes.set(key, kernel_attr);
+        }
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("unknown-layout enum kernel param must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Option") && msg.contains("kernel boundary"),
+            "error must name the enum and the kernel boundary, got: {msg}"
+        );
+        assert!(msg.contains("unknown physical rustc layout"));
+    }
+
+    /// Build a `mir.shared_alloc` returning `MirPtrType<i32, addrspace=3>` of
+    /// length `size`, with the given alloc_key, and append it to `block`.
+    fn append_shared_alloc(ctx: &mut Context, block: Ptr<BasicBlock>, alloc_key: &str, size: u64) {
+        use pliron::builtin::attributes::IntegerAttr;
+        use pliron::utils::apint::APInt;
+
+        let i32_ty: TypeHandle = IntegerType::get(ctx, 32, Signedness::Signless).into();
+        let result_ty = MirPtrType::get_shared(ctx, i32_ty, true);
+        let op = Operation::new(
+            ctx,
+            mir::MirSharedAllocOp::get_concrete_op_info(),
+            vec![result_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let alloc = mir::MirSharedAllocOp::new(op);
+        alloc.set_attr_elem_type(ctx, TypeAttr::new(i32_ty));
+        let size_attr = IntegerAttr::new(
+            IntegerType::get(ctx, 64, Signedness::Signless),
+            APInt::from_u64(size, std::num::NonZeroUsize::new(64).unwrap()),
+        );
+        alloc.set_attr_size(ctx, size_attr);
+        alloc.set_attr_alloc_key(ctx, StringAttr::new(alloc_key.to_string()));
+        op.insert_at_back(block, ctx);
+    }
+
+    #[test]
+    fn convert_shared_alloc_creates_global_in_addrspace_3() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        append_shared_alloc(&mut ctx, block, "k1", 64);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        // Global lives at module level; addressof lives in the function body.
+        let top = module_top_block(&ctx, module_ptr);
+        let global = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .find_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .expect("expected an llvm.global for the shared allocation");
+        assert_eq!(
+            global.address_space(&ctx),
+            llvm_addr::SHARED,
+            "shared_alloc global must live in addrspace 3"
+        );
+        assert!(
+            global
+                .get_symbol_name(&ctx)
+                .to_string()
+                .starts_with("__shared_mem_"),
+            "shared global should have __shared_mem_ prefix"
+        );
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let addrof =
+            find_first::<llvm::AddressOfOp>(&ctx, &body).expect("expected an llvm.addressof");
+        assert_eq!(
+            ptr_addrspace(
+                &ctx,
+                addrof
+                    .get_operation()
+                    .deref(&ctx)
+                    .get_result(0)
+                    .get_type(&ctx)
+            ),
+            llvm_addr::SHARED,
+        );
+    }
+
+    #[test]
+    fn convert_shared_alloc_deduplicates_by_alloc_key() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        // Two allocations sharing the same alloc_key — they must collapse to
+        // a single underlying global (this is what enables a single `static`
+        // referenced from multiple sites to land in one shared region).
+        append_shared_alloc(&mut ctx, block, "same-key", 64);
+        append_shared_alloc(&mut ctx, block, "same-key", 64);
+        // A third with a different key must NOT dedupe with them.
+        append_shared_alloc(&mut ctx, block, "other-key", 32);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let top = module_top_block(&ctx, module_ptr);
+        let shared_globals = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .filter(|g| g.address_space(&ctx) == llvm_addr::SHARED)
+            .count();
+        assert_eq!(
+            shared_globals, 2,
+            "two distinct alloc_keys must produce two globals"
+        );
+
+        // Each of the three mir.shared_alloc ops becomes one addressof.
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(count_ops::<llvm::AddressOfOp>(&ctx, &body), 3);
+    }
+
+    fn append_global_alloc(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        global_key: &str,
+        constant: bool,
+    ) -> Ptr<Operation> {
+        let i32_ty: TypeHandle = IntegerType::get(ctx, 32, Signedness::Signless).into();
+        let result_ty = if constant {
+            MirPtrType::get_constant(ctx, i32_ty, false)
+        } else {
+            MirPtrType::get_global(ctx, i32_ty, true)
+        };
+        let op = Operation::new(
+            ctx,
+            mir::MirGlobalAllocOp::get_concrete_op_info(),
+            vec![result_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let alloc = mir::MirGlobalAllocOp::new(op);
+        alloc.set_attr_global_type(ctx, TypeAttr::new(i32_ty));
+        alloc.set_attr_global_key(ctx, StringAttr::new(global_key.to_string()));
+        op.insert_at_back(block, ctx);
+        op
+    }
+
+    #[test]
+    fn convert_global_alloc_places_in_global_or_constant_addrspace() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        append_global_alloc(&mut ctx, block, "ordinary_static", false);
+        append_global_alloc(&mut ctx, block, "_ZN7my_mod3KEYE", true);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let top = module_top_block(&ctx, module_ptr);
+        let globals: Vec<_> = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .collect();
+        let global_addr_global = globals
+            .iter()
+            .find(|g| g.address_space(&ctx) == llvm_addr::GLOBAL)
+            .expect("expected one global in addrspace(1)");
+        let global_addr_const = globals
+            .iter()
+            .find(|g| g.address_space(&ctx) == llvm_addr::CONSTANT)
+            .expect("expected one global in addrspace(4)");
+
+        // Constant-memory globals reuse the Rust mangled name so host code can
+        // resolve them by name via `cuModuleGetGlobal`; ordinary globals get
+        // a counter-suffixed `__device_global_N`.
+        assert_eq!(
+            global_addr_const.get_symbol_name(&ctx).to_string(),
+            "_ZN7my_mod3KEYE",
+            "constant globals must keep the mangled global_key as symbol name"
+        );
+        assert!(
+            global_addr_global
+                .get_symbol_name(&ctx)
+                .to_string()
+                .starts_with("__device_global_"),
+            "ordinary device globals get the __device_global_ prefix"
+        );
+    }
+
+    #[test]
+    fn initialized_global_lowers_to_byte_storage() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        let op = append_global_alloc(&mut ctx, block, "nan_payload", false);
+        let alloc = mir::MirGlobalAllocOp::new(op);
+        alloc.set_alignment_value(&mut ctx, 4);
+        let initializer_key: Identifier = "global_initializer_hex".try_into().unwrap();
+        op.deref_mut(&ctx)
+            .attributes
+            .set(initializer_key, StringAttr::new("3412c07f".to_string()));
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let top = module_top_block(&ctx, module_ptr);
+        let global = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .find_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .expect("expected lowered device global");
+        let global_ty = global.get_type(&ctx);
+        let global_ty_ref = global_ty.deref(&ctx);
+        let array_ty = global_ty_ref
+            .downcast_ref::<ArrayType>()
+            .expect("initialized global must use byte-array storage");
+        assert_eq!(array_ty.size(), 4);
+        let elem_ty = array_ty.elem_type();
+        let elem_ty_ref = elem_ty.deref(&ctx);
+        let elem = elem_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("byte-array element must be an integer");
+        assert_eq!(elem.width(), 8);
+        assert_eq!(global.get_alignment(&ctx), Some(4));
+        assert_eq!(global.initializer_hex(&ctx).as_deref(), Some("3412c07f"));
+    }
 }

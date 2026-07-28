@@ -17,6 +17,11 @@
 //! N values of type T that travel together through registers. All access
 //! methods use **copy semantics** - we copy values out, not reference them.
 //!
+//! For the *memory* counterpart - over-aligned element types whose alignment
+//! makes loads and stores single wide transactions - see [`crate::vector`]
+//! (e.g. [`crate::vector::F32x4`]). For packed 16-bit ALU pairs, see
+//! [`crate::f16x2`] / [`crate::bf16x2`].
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -50,7 +55,7 @@ pub trait SimdElement: Copy + Sized {
     /// This reflects hardware constraints:
     /// - `f32`: up to 32 (tcgen05.ld.x8 returns 32 f32 per thread)
     /// - `f16`/`bf16`: typically 2 (packed pairs)
-    /// - `u32`/`i32`: up to 32 (tcgen05 register tiles)
+    /// - `u32`/`i32`: up to 128 (tcgen05 register tiles)
     const MAX_N: usize;
 }
 
@@ -63,11 +68,11 @@ impl SimdElement for f64 {
 }
 
 impl SimdElement for u32 {
-    const MAX_N: usize = 32;
+    const MAX_N: usize = 128;
 }
 
 impl SimdElement for i32 {
-    const MAX_N: usize = 32;
+    const MAX_N: usize = 128;
 }
 
 impl SimdElement for u64 {
@@ -109,7 +114,7 @@ impl SimdElement for i16 {
 /// | Element Type | Common N values | Hardware Representation |
 /// |--------------|-----------------|-------------------------|
 /// | `f32`        | 2, 4, 8, 16, 32 | N × 32-bit registers    |
-/// | `u32`/`i32`  | 2, 4, 8         | N × 32-bit registers    |
+/// | `u32`/`i32`  | 2 to 128        | N × 32-bit registers    |
 /// | `f64`        | 2, 4            | N × 64-bit registers    |
 ///
 /// # Example

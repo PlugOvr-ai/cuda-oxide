@@ -2,9 +2,14 @@
 
 ## Cooperative Groups — End-to-End Smoke Test
 
-21 device-verified checks for `cuda_device::cooperative_groups`,
-exercising every supported group type, every warp collective, and the
-full `(reduce/scan, warp/block, op, type)` matrix on real hardware.
+21 end-to-end checks for `cuda_device::cooperative_groups`, exercising every
+supported group type, every warp collective, and the full
+`(reduce/scan, warp/block, op, type)` matrix.
+
+The established checks have real-hardware coverage. The synchronized-shuffle
+source-boundary assertions added during the generated-intrinsics migration
+currently have compile evidence only. No GPU was available for that batch, so
+those new assertions remain unexecuted.
 
 The crate doubles as a hand-debug aid: the generated `coop_groups_demo.ptx`
 is the canonical reference for "what does this typed handle actually
@@ -41,7 +46,15 @@ The 21 checks split into three layers:
 | `match_all_sync`    | constant input ⇒ full warp mask                                |
 | `grid_sync`         | every block sees every other block's pre-barrier marker write  |
 
-`grid_sync` runs as a cooperative launch (`cuda_launch! { ..., cooperative: true }`).
+`grid_sync` (and `typed_grid_sync` in Layer 2) run as cooperative
+launches through the typed path: both kernels carry
+`#[cooperative_launch]` inside a `#[cuda_module]` module, so their
+generated launch methods submit via `cuLaunchKernelEx` with
+`CU_LAUNCH_ATTRIBUTE_COOPERATIVE`. The same module also holds
+`test_cluster_coop_grid_sync`, which combines `#[cluster_launch(2, 1, 1)]`
+with `#[cooperative_launch]` and a `#[launch_contract]`. On Hopper+ that
+kernel is prepared and launched through the safe `PreparedLaunch` path;
+pre-Hopper devices print that the combined mode was not exercised.
 
 ### Layer 2 — typed cooperative-groups handles (5 checks)
 
@@ -49,7 +62,7 @@ The 21 checks split into three layers:
 |:---------------------------|:------------------------------------------------------------------------|
 | `typed_warp32_ballot`      | `WarpTile<32>::ballot` byte-identical to `warp::ballot_sync`            |
 | `typed_warp16_ballot`      | sub-warp ballot is **tile-relative** (16-bit mask, not 32-bit)          |
-| `typed_warp16_shfl`        | sub-warp `shfl(_, 0)` broadcasts each tile's lane 0 separately          |
+| `typed_warp16_shfl`        | tile-relative broadcast plus i32/f32 XOR/down/up boundaries and sparse even-lane coalesced sources |
 | `typed_grid_sync`          | `this_grid().sync()` matches the raw `grid::sync()` semantics           |
 | `typed_grid_rank`          | `this_grid().thread_rank()` is the identity permutation `0..total`      |
 
@@ -104,10 +117,10 @@ Output buffer layout for reduce/scan kernels:
   correctness of the lower powers is covered by the `WarpTile<16>`
   checks in Layer 2 plus the warp-reduce/scan tests in Layer 3 (which
   exercise the same mask machinery at `N = 32`).
-- **`CoalescedThreads`** — no kernel in this demo enters a
-  divergent branch and re-converges on `coalesced_threads()`. The
-  module is exercised in-tree by `hashmap_v2` and `hashmap_v3`'s
-  typed warp-find paths.
+- **General `CoalescedThreads` algorithms** — `typed_warp16_shfl` covers one
+  sparse even-lane group and invalid-source self fallback. Broader divergent
+  layouts remain exercised by `hashmap_v2` and `hashmap_v3`'s typed warp-find
+  paths.
 
 ## Hardware Requirements
 
@@ -144,6 +157,13 @@ the larger ops). This is the same trade-off the typed warp paths in
 `tile_32` / `tile_16` find kernels) make; functional correctness is
 unaffected.
 
+The typed i32/f32 shuffle leaves are generated as `i0050`-`i0057`; the
+cooperative-group API remains handwritten. For sub-warp and sparse groups, the
+wrapper substitutes the calling lane when XOR, down, or up would select a lane
+outside the member mask. An invalid coalesced `shfl` source rank also selects
+the caller. This avoids an undefined PTX read while preserving the existing
+API and the example's success output.
+
 ## Adding a New Check
 
 The recipe is identical for every test in the file:
@@ -151,8 +171,10 @@ The recipe is identical for every test in the file:
 1. Write a `#[kernel]` function that performs the operation under test
    and writes its result into a `DisjointSlice<T>`.
 2. In `main`, allocate a `DeviceBuffer<T>` of the right size, launch
-   via `cuda_launch!`, copy back with `to_host_vec`, and compare each
-   cell against a host-computed expected value.
+   via `unsafe { cuda_launch! { ... } }` (the macro cannot check the
+   argument list, so each site carries a SAFETY comment), copy back
+   with `to_host_vec`, and compare each cell against a host-computed
+   expected value.
 3. Print one summary line ending in `yes` or `NO`. On `NO`, also
    print the first few mismatches and `std::process::exit(1)` so the
    smoketest harness flags it.

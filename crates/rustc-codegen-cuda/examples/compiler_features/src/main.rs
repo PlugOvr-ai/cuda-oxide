@@ -414,6 +414,38 @@ mod kernels {
             *out_elem = product;
         }
     }
+
+    // =============================================================================
+    // CONSTANT ASSERT OPERANDS (COMPILE-ONLY REGRESSION)
+    // =============================================================================
+
+    /// Keeps rustc's `assert(!const true, ...)` form (expected=false) in
+    /// optimized MIR. This kernel is compiled to exercise importer lowering
+    /// but is deliberately never launched by the host test.
+    #[allow(unconditional_panic)]
+    #[kernel]
+    pub fn compile_constant_assert_expected_false(value: u32, mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        if let Some(out_elem) = out.get_mut(idx) {
+            *out_elem = value / 0;
+        }
+    }
+
+    /// Keeps rustc's `assert(const false, ...)` form (expected=true) in
+    /// optimized MIR. Like the division case, this is a compile-only probe and
+    /// must not be launched.
+    #[allow(unconditional_panic)]
+    // The out-of-bounds index is the point: it is what produces the constant
+    // assert condition this probe exists to compile.
+    #[allow(clippy::out_of_bounds_indexing)]
+    #[kernel]
+    pub fn compile_constant_assert_expected_true(mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let empty: [u32; 0] = [];
+            *out_elem = empty[0];
+        }
+    }
 }
 
 // =============================================================================
@@ -436,7 +468,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: baseline_while_loop");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.baseline_while_loop((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.baseline_while_loop((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 28, "baseline_while_loop failed");
         println!("  ✓ Result: {} (expected 28)", result[0]);
@@ -446,13 +479,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: baseline_binary_match");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.baseline_binary_match((stream).as_ref(), cfg, true, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.baseline_binary_match((stream).as_ref(), cfg, true, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 100, "baseline_binary_match(true) failed");
         println!("  ✓ flag=true: {} (expected 100)", result[0]);
 
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.baseline_binary_match((stream).as_ref(), cfg, false, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.baseline_binary_match((stream).as_ref(), cfg, false, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 0, "baseline_binary_match(false) failed");
         println!("  ✓ flag=false: {} (expected 0)", result[0]);
@@ -469,13 +504,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let b_dev = DeviceBuffer::from_host(&stream, &b)?;
         let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
 
-        module.baseline_vecadd(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(n as u32),
-            &a_dev,
-            &b_dev,
-            &mut c_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.baseline_vecadd(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(n as u32),
+                &a_dev,
+                &b_dev,
+                &mut c_dev,
+            )
+        }?;
         let result = c_dev.to_host_vec(&stream)?;
         let expected = vec![11.0f32, 22.0, 33.0, 44.0];
         assert_eq!(result, expected, "baseline_vecadd failed");
@@ -488,7 +526,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let test_cases = [(0u32, 10u32), (1, 20), (2, 30), (3, 99), (100, 99)];
         for (val, expected) in test_cases {
             let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-            module.test_multiway_match_u32((stream).as_ref(), cfg, val, &mut out_dev)?;
+            // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+            unsafe { module.test_multiway_match_u32((stream).as_ref(), cfg, val, &mut out_dev) }?;
             let result = out_dev.to_host_vec(&stream)?;
             assert_eq!(
                 result[0], expected,
@@ -505,7 +544,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let test_cases = [(0u32, 0u32), (1u32, 1u32), (42u32, 42u32)];
         for (val, expected) in test_cases {
             let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-            module.test_option((stream).as_ref(), cfg, val, &mut out_dev)?;
+            // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+            unsafe { module.test_option((stream).as_ref(), cfg, val, &mut out_dev) }?;
             let result = out_dev.to_host_vec(&stream)?;
             assert_eq!(result[0], expected, "test_option({}) failed", val);
             println!("  ✓ val={}: {} (expected {})", val, result[0], expected);
@@ -516,7 +556,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_for_loop_sum");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_for_loop_sum((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_for_loop_sum((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 28, "test_for_loop_sum failed");
         println!("  ✓ Result: {} (expected 28)", result[0]);
@@ -528,7 +569,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data = vec![1u32, 2, 3, 4, 5];
         let data_dev = DeviceBuffer::from_host(&stream, &data)?;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_iter_sum((stream).as_ref(), cfg, &data_dev, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_iter_sum((stream).as_ref(), cfg, &data_dev, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 15, "test_iter_sum failed");
         println!("  ✓ Result: {} (expected 15)", result[0]);
@@ -540,7 +582,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data = vec![10u32, 20, 30, 40]; // 0*10 + 1*20 + 2*30 + 3*40 = 0+20+60+120=200
         let data_dev = DeviceBuffer::from_host(&stream, &data)?;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_enumerate((stream).as_ref(), cfg, &data_dev, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_enumerate((stream).as_ref(), cfg, &data_dev, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 200, "test_enumerate failed");
         println!("  ✓ Result: {} (expected 200)", result[0]);
@@ -550,7 +593,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_for_loop_break");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_for_loop_break((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_for_loop_break((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 10, "test_for_loop_break failed");
         println!("  ✓ Result: {} (expected 10)", result[0]);
@@ -560,7 +604,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_for_loop_continue");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_for_loop_continue((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_for_loop_continue((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 16, "test_for_loop_continue failed");
         println!("  ✓ Result: {} (expected 16)", result[0]);
@@ -570,7 +615,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_nested_for_loops");
     {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N)?;
-        module.test_nested_for_loops((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_nested_for_loops((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 36, "test_nested_for_loops failed");
         println!("  ✓ Result: {} (expected 36)", result[0]);
@@ -580,7 +626,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_u64_shift_by_32");
     {
         let mut out_dev = DeviceBuffer::<u64>::zeroed(&stream, N)?;
-        module.test_u64_shift_by_32((stream).as_ref(), cfg, 8u64, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_u64_shift_by_32((stream).as_ref(), cfg, 8u64, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         let expected = 8u64 << 32;
         assert_eq!(result[0], expected, "test_u64_shift_by_32 failed");
@@ -594,7 +641,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing: test_u64_shift_by_46");
     {
         let mut out_dev = DeviceBuffer::<u64>::zeroed(&stream, N)?;
-        module.test_u64_shift_by_46((stream).as_ref(), cfg, &mut out_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_u64_shift_by_46((stream).as_ref(), cfg, &mut out_dev) }?;
         let result = out_dev.to_host_vec(&stream)?;
         let expected = 1u64 << 46;
         assert_eq!(result[0], expected, "test_u64_shift_by_46 failed");
@@ -610,12 +658,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let input = vec![2.0f32; 4]; // p(2) = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 = 255
         let input_dev = DeviceBuffer::from_host(&stream, &input)?;
         let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, 4)?;
-        module.parallel_polynomial_eval(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(4),
-            &input_dev,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_polynomial_eval(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(4),
+                &input_dev,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         let expected = 255.0f32;
         assert!(
@@ -632,13 +683,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data_dev = DeviceBuffer::from_host(&stream, &data)?;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, 4)?;
         // 4 threads, chunk_size=4: thread 0 sums 1+2+3+4=10, thread 1 sums 5+6+7+8=26, etc.
-        module.parallel_chunked_sum(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(4),
-            &data_dev,
-            4u32,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_chunked_sum(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(4),
+                &data_dev,
+                4u32,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 10, "parallel_chunked_sum[0] failed");
         assert_eq!(result[1], 26, "parallel_chunked_sum[1] failed");
@@ -652,13 +706,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let matrix: Vec<u32> = (1..=16).collect();
         let matrix_dev = DeviceBuffer::from_host(&stream, &matrix)?;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, 4)?;
-        module.parallel_row_sum(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(4),
-            &matrix_dev,
-            4u32,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_row_sum(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(4),
+                &matrix_dev,
+                4u32,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         // Row 0: 1+2+3+4=10, Row 1: 5+6+7+8=26, Row 2: 9+10+11+12=42, Row 3: 13+14+15+16=58
         assert_eq!(result, vec![10, 26, 42, 58], "parallel_row_sum failed");
@@ -673,12 +730,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Thread 1: product of 4,5,6 = 120
         // Thread 2: product of 7,8,9 = 504
         // Thread 3: product of 10,11,12 = 1320
-        module.parallel_partial_product(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(4),
-            3u32,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_partial_product(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(4),
+                3u32,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         assert_eq!(result[0], 6, "parallel_partial_product[0] failed");
         assert_eq!(result[1], 120, "parallel_partial_product[1] failed");
@@ -693,13 +753,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
         let data_dev = DeviceBuffer::from_host(&stream, &data)?;
         let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, N)?;
-        module.parallel_local_average(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(N as u32),
-            &data_dev,
-            RADIUS,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_local_average(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                &data_dev,
+                RADIUS,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         // At position 256 (middle), average of 253..259 = 256.0
         let mid = N / 2;
@@ -730,14 +793,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let a_dev = DeviceBuffer::from_host(&stream, &a)?;
         let b_dev = DeviceBuffer::from_host(&stream, &b)?;
         let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, NUM_THREADS)?;
-        module.parallel_dot_product_chunked(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(NUM_THREADS as u32),
-            &a_dev,
-            &b_dev,
-            CHUNK_SIZE,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_dot_product_chunked(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(NUM_THREADS as u32),
+                &a_dev,
+                &b_dev,
+                CHUNK_SIZE,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         // Each thread: chunk_size * 2.0 = 64.0, total = 128 * 64 = 8192.0
         let total: f32 = result.iter().sum();
@@ -766,15 +832,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, NUM_THREADS)?;
         let low: u32 = 50;
         let high: u32 = 150;
-        module.parallel_range_count(
-            (stream).as_ref(),
-            LaunchConfig::for_num_elems(NUM_THREADS as u32),
-            &data_dev,
-            CHUNK_SIZE,
-            low,
-            high,
-            &mut out_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.parallel_range_count(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(NUM_THREADS as u32),
+                &data_dev,
+                CHUNK_SIZE,
+                low,
+                high,
+                &mut out_dev,
+            )
+        }?;
         let result = out_dev.to_host_vec(&stream)?;
         // Count values in [50, 150) = 100 values
         let total: u32 = result.iter().sum();

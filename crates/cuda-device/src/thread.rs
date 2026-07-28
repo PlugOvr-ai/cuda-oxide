@@ -14,7 +14,7 @@
 //! - Index helpers: `index_1d`, `index_2d::<S>`, `unsafe index_2d_runtime`
 //!   that return typed `ThreadIndex` witnesses
 //! - `IndexFormula`: a marker trait for index spaces that can be derived
-//!   from the kernel scope alone (used by `DisjointSlice::get_mut_indexed`)
+//!   from the kernel launch context alone (used by `DisjointSlice::get_mut_indexed`)
 //!
 //! # Safety Model
 //!
@@ -27,8 +27,9 @@
 //!    (`threadIdx`, `blockIdx`, `blockDim`) -- read-only special registers
 //!    assigned by the runtime at kernel launch. The formula
 //!    `outer * stride + inner` combines these into a scalar index per thread.
-//! 3. `index_1d`: unique per thread, unconditionally
-//!    (`threadIdx.x < blockDim.x` is hardware-enforced).
+//! 3. `index_1d`: the X-only formula is unique only for a 1D launch. A typed
+//!    1D contract proves that shape; the legacy path checks all Y/Z grid and
+//!    block dimensions at runtime and makes the witness invalid on mismatch.
 //! 4. `index_2d::<S>()`: unique per thread for const-stride 2D grids.
 //!    The stride lives in the witness type, and `DisjointSlice` only
 //!    accepts indices from the matching index space -- mismatched
@@ -53,36 +54,45 @@ pub enum Index1D {}
 /// Type-level index space for a 2D row-major index with a const row stride.
 pub enum Index2D<const ROW_STRIDE: usize> {}
 
-/// Index spaces whose `ThreadIndex` can be derived from the kernel scope alone.
+/// Index spaces whose `ThreadIndex` can be derived from the launch context alone.
 ///
 /// `Index1D` and `Index2D<S>` impl this — their formulas take no runtime
 /// inputs. [`Runtime2DIndex`] does **not** impl this, because the row stride
 /// is a runtime value the type system can't see; reach for the unsafe
 /// [`index_2d_runtime`] when you need a runtime stride.
 ///
-/// Used by [`DisjointSlice::get_mut_indexed`] to mint the per-thread index
+/// Used by `DisjointSlice::get_mut_indexed` to mint the per-thread index
 /// in the same call that resolves it to a mutable reference.
 pub trait IndexFormula: Sized {
     #[doc(hidden)]
-    fn from_scope<'kernel>(
-        scope: &'kernel KernelScope<'kernel>,
-    ) -> Option<ThreadIndex<'kernel, Self>>;
+    fn from_scope<'kernel, Domain, Coordinates>(
+        scope: &'kernel LaunchContext<'kernel, Domain, Coordinates>,
+    ) -> Option<ThreadIndex<'kernel, Self>>
+    where
+        Domain: __internal::LaunchDomain;
 }
 
 impl IndexFormula for Index1D {
     #[inline(always)]
-    fn from_scope<'kernel>(
-        scope: &'kernel KernelScope<'kernel>,
-    ) -> Option<ThreadIndex<'kernel, Self>> {
-        Some(__internal::index_1d(scope))
+    fn from_scope<'kernel, Domain, Coordinates>(
+        scope: &'kernel LaunchContext<'kernel, Domain, Coordinates>,
+    ) -> Option<ThreadIndex<'kernel, Self>>
+    where
+        Domain: __internal::LaunchDomain,
+    {
+        let index = __internal::index_1d(scope);
+        index.is_valid().then_some(index)
     }
 }
 
 impl<const ROW_STRIDE: usize> IndexFormula for Index2D<ROW_STRIDE> {
     #[inline(always)]
-    fn from_scope<'kernel>(
-        scope: &'kernel KernelScope<'kernel>,
-    ) -> Option<ThreadIndex<'kernel, Self>> {
+    fn from_scope<'kernel, Domain, Coordinates>(
+        scope: &'kernel LaunchContext<'kernel, Domain, Coordinates>,
+    ) -> Option<ThreadIndex<'kernel, Self>>
+    where
+        Domain: __internal::LaunchDomain,
+    {
         __internal::index_2d::<ROW_STRIDE>(scope)
     }
 }
@@ -98,31 +108,49 @@ impl<const ROW_STRIDE: usize> IndexFormula for Index2D<ROW_STRIDE> {
 /// makes a stride mismatch a type error instead of a contract.
 pub enum Runtime2DIndex {}
 
-/// Stack-local witness produced by `make_kernel_scope` and consumed by
-/// `__internal::index_*`. The `'kernel` lifetime tags every `ThreadIndex`
-/// minted from it. Hidden from public docs because users never name this
-/// type — the macros inject it.
+/// Stack-local launch context produced by the kernel macro and consumed by
+/// trusted thread-index functions.
+///
+/// `Domain` records which launch axes the host checked. `Coordinates` records
+/// whether the host proved that each active axis fits in 32 bits. The proc
+/// macros choose both markers from `#[launch_contract]`; safe user code cannot
+/// construct a scope because all fields and its constructor are private.
 #[doc(hidden)]
-pub struct KernelScope<'kernel> {
+pub struct LaunchContext<
+    'kernel,
+    Domain = __internal::UnknownDomain,
+    Coordinates = __internal::NativeCoordinates,
+> {
     _kernel: PhantomData<fn(&'kernel mut ()) -> &'kernel mut ()>,
+    _domain: PhantomData<fn() -> Domain>,
+    _coordinates: PhantomData<fn() -> Coordinates>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
-impl<'kernel> KernelScope<'kernel> {
+/// Borrowed kernel-scope proof with one lifetime shared by the reference and
+/// the invariant scope value.
+#[doc(hidden)]
+pub type LaunchContextRef<'kernel, Domain, Coordinates> =
+    &'kernel LaunchContext<'kernel, Domain, Coordinates>;
+
+impl<'kernel, Domain, Coordinates> LaunchContext<'kernel, Domain, Coordinates> {
     #[inline(always)]
     unsafe fn new() -> Self {
-        KernelScope {
+        LaunchContext {
             _kernel: PhantomData,
+            _domain: PhantomData,
+            _coordinates: PhantomData,
             _not_send_sync: PhantomData,
         }
     }
 }
 
-/// A thread-unique index derived from hardware built-in variables (special registers).
+/// A conditionally thread-unique index derived from hardware built-in variables.
 ///
 /// `ThreadIndex` cannot be constructed directly. The contained `usize` is
-/// unique per thread, which is what makes parallel writes to `DisjointSlice`
-/// race-free without synchronisation.
+/// unique when the launch geometry matches its index space. A prepared launch
+/// proves that condition; an unsafe raw launch must uphold it explicitly. That
+/// conditional uniqueness makes parallel writes to `DisjointSlice` race-free.
 ///
 /// The index-space parameter ties each witness to the indexing scheme that
 /// created it. A `DisjointSlice<T, Index2D<128>>` won't accept a
@@ -131,7 +159,7 @@ impl<'kernel> KernelScope<'kernel> {
 ///
 /// `ThreadIndex` is intentionally `!Send`, `!Sync`, `!Copy`, and `!Clone`,
 /// so safe code can't duplicate a witness or smuggle one to a different
-/// thread. The `'kernel` lifetime is borrowed from a stack-local scope the
+/// thread. The `'kernel` lifetime is borrowed from a stack-local launch context the
 /// proc macros inject; it can't outlive the kernel body.
 ///
 /// # Construction
@@ -144,7 +172,7 @@ impl<'kernel> KernelScope<'kernel> {
 ///
 /// # Where you can call them
 ///
-/// The `'kernel` scope only exists inside `#[kernel]` and `#[device]`
+/// The `'kernel` launch context only exists inside `#[kernel]` and `#[device]`
 /// bodies, which has two practical consequences:
 ///
 /// - **Plain `fn` device helpers (no annotation)** can't acquire a
@@ -162,7 +190,7 @@ impl<'kernel> KernelScope<'kernel> {
 /// # Reserved names inside `#[kernel]` and `#[device]`
 ///
 /// The macros rewrite a small set of names inside annotated bodies so
-/// the user never has to thread the kernel scope through by hand:
+/// the user never has to pass the launch context through by hand:
 ///
 /// - free functions: `index_1d`, `index_2d`, `index_2d_runtime`
 /// - methods (zero-arg call sites): `get_mut_indexed`
@@ -178,14 +206,19 @@ impl<'kernel> KernelScope<'kernel> {
 /// ```
 ///
 /// Method calls are matched on the method name only — `slice.get_mut_indexed()`
-/// has the kernel scope spliced in as the (currently invisible)
-/// `&KernelScope` argument the method actually takes.
+/// has the launch context spliced in as the (currently invisible)
+/// `&LaunchContext` argument the method actually takes.
 ///
 /// The trade-off: if you define a local `fn index_1d` (or any of the
 /// other reserved names) and call it from inside `#[kernel]` or
 /// `#[device]`, the macro will silently rewrite that call too. Pick a
 /// different name (e.g. `compute_index_1d`, `pop_indexed`) for any
 /// helper you want to keep.
+///
+/// The proof-carrying [`index_1d_u32`] and [`coord_2d_u32`] functions are not
+/// on this list. They take the launch context named explicitly by
+/// `#[kernel(launch_context = ...)]`, so ordinary Rust aliases and same-named
+/// local functions behave normally.
 ///
 /// # Example
 ///
@@ -210,9 +243,20 @@ pub struct ThreadIndex<'kernel, IndexSpace = Index1D> {
 
 impl<'kernel, IndexSpace> ThreadIndex<'kernel, IndexSpace> {
     #[inline(always)]
-    unsafe fn new(raw: usize, _scope: &'kernel KernelScope<'kernel>) -> Self {
+    unsafe fn new<Domain, Coordinates>(
+        raw: usize,
+        valid: bool,
+        _scope: &'kernel LaunchContext<'kernel, Domain, Coordinates>,
+    ) -> Self {
         ThreadIndex {
-            raw,
+            // Keep ThreadIndex a scalar/newtype for the device ABI. usize::MAX
+            // is reserved as the invalid legacy witness; a mathematically
+            // valid 2D index at that one value is conservatively rejected.
+            raw: if valid && raw != usize::MAX {
+                raw
+            } else {
+                usize::MAX
+            },
             _kernel: PhantomData,
             _space: PhantomData,
             _not_send_sync: PhantomData,
@@ -227,26 +271,182 @@ impl<'kernel, IndexSpace> ThreadIndex<'kernel, IndexSpace> {
         self.raw
     }
 
+    /// Whether the launch shape and index arithmetic produced a valid witness.
+    ///
+    /// Legacy uncontracted kernels learn their rank only at runtime. A 1D
+    /// formula under a 2D launch therefore yields an invalid witness instead
+    /// of allowing two threads to alias the same output element.
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool {
+        self.raw != usize::MAX
+    }
+
     /// Check if this index is less than a bound.
     ///
     /// Convenience method for bounds checking.
     #[inline(always)]
     pub fn in_bounds(&self, len: usize) -> bool {
-        self.raw < len
+        self.is_valid() && self.raw < len
     }
 }
 
 impl<'kernel, IndexSpace> fmt::Debug for ThreadIndex<'kernel, IndexSpace> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ThreadIndex").field(&self.raw).finish()
+        f.debug_struct("ThreadIndex")
+            .field("raw", &self.raw)
+            .field("valid", &self.is_valid())
+            .finish()
+    }
+}
+
+/// A 32-bit, thread-unique index for a validated 1D launch.
+///
+/// This witness is available only in a kernel with
+/// `#[launch_contract(domain = 1, coordinates = u32)]`. The host validates
+/// `grid.x * block.x <= 2^32` before launch, so the index calculation and all
+/// later tile-offset calculations can stay in `u32`.
+///
+/// Like [`ThreadIndex`], it is deliberately `!Copy`, `!Clone`, `!Send`, and
+/// `!Sync`.
+pub struct ThreadIndex32<'kernel> {
+    raw: u32,
+    _kernel: PhantomData<fn(&'kernel mut ()) -> &'kernel mut ()>,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl<'kernel> ThreadIndex32<'kernel> {
+    #[inline(always)]
+    unsafe fn new(
+        raw: u32,
+        _scope: &'kernel LaunchContext<'kernel, __internal::Domain1, __internal::U32Coordinates>,
+    ) -> Self {
+        Self {
+            raw,
+            _kernel: PhantomData,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Return the validated 32-bit global thread index.
+    #[inline(always)]
+    pub fn get(&self) -> u32 {
+        self.raw
+    }
+}
+
+impl fmt::Debug for ThreadIndex32<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ThreadIndex32").field(&self.raw).finish()
+    }
+}
+
+/// A pair of 32-bit global row/column coordinates for a validated 2D launch.
+///
+/// This witness is available only in a kernel with
+/// `#[launch_contract(domain = 2, coordinates = u32)]`. It is packed into one
+/// `u64`, preserving a simple scalar device layout while keeping both
+/// coordinate calculations in `u32`.
+///
+/// `ThreadCoord2D32` is deliberately `!Copy`, `!Clone`, `!Send`, and `!Sync`.
+pub struct ThreadCoord2D32<'kernel> {
+    packed: u64,
+    _kernel: PhantomData<fn(&'kernel mut ()) -> &'kernel mut ()>,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl<'kernel> ThreadCoord2D32<'kernel> {
+    #[inline(always)]
+    unsafe fn new(
+        row: u32,
+        col: u32,
+        _scope: &'kernel LaunchContext<'kernel, __internal::Domain2, __internal::U32Coordinates>,
+    ) -> Self {
+        Self {
+            packed: ((row as u64) << 32) | col as u64,
+            _kernel: PhantomData,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Global row coordinate (`blockIdx.y * blockDim.y + threadIdx.y`).
+    #[inline(always)]
+    pub fn row(&self) -> u32 {
+        (self.packed >> 32) as u32
+    }
+
+    /// Global column coordinate (`blockIdx.x * blockDim.x + threadIdx.x`).
+    #[inline(always)]
+    pub fn col(&self) -> u32 {
+        self.packed as u32
+    }
+}
+
+impl fmt::Debug for ThreadCoord2D32<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadCoord2D32")
+            .field("row", &self.row())
+            .field("col", &self.col())
+            .finish()
     }
 }
 
 #[doc(hidden)]
 pub mod __internal {
-    use super::{Index1D, Index2D, KernelScope, Runtime2DIndex, ThreadIndex};
+    use super::{
+        Index1D, Index2D, LaunchContext, Runtime2DIndex, ThreadCoord2D32, ThreadIndex,
+        ThreadIndex32,
+    };
 
-    /// Mints a fresh `KernelScope` whose `'kernel` lifetime backs every
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    /// Scope marker for kernels without a typed launch-domain contract.
+    pub enum UnknownDomain {}
+    /// Scope marker for host-validated 1D launches.
+    pub enum Domain1 {}
+    /// Scope marker for host-validated 2D launches.
+    pub enum Domain2 {}
+    /// Scope marker for host-validated 3D launches.
+    pub enum Domain3 {}
+
+    /// Scope marker for ordinary target-width coordinate arithmetic.
+    pub enum NativeCoordinates {}
+    /// Scope marker for launches whose active coordinate products fit `u32`.
+    pub enum U32Coordinates {}
+
+    impl sealed::Sealed for UnknownDomain {}
+    impl sealed::Sealed for Domain1 {}
+    impl sealed::Sealed for Domain2 {}
+    impl sealed::Sealed for Domain3 {}
+
+    /// Internal facts carried by launch-domain marker types.
+    ///
+    /// This trait is sealed. It is public only because proc-macro-generated
+    /// code mentions the marker types in public kernel bodies.
+    #[doc(hidden)]
+    pub trait LaunchDomain: sealed::Sealed {
+        /// Highest active axis the launch contract permits (`0` = unknown).
+        const MAX_DIMENSIONS: u8;
+    }
+
+    impl LaunchDomain for UnknownDomain {
+        const MAX_DIMENSIONS: u8 = 0;
+    }
+
+    impl LaunchDomain for Domain1 {
+        const MAX_DIMENSIONS: u8 = 1;
+    }
+
+    impl LaunchDomain for Domain2 {
+        const MAX_DIMENSIONS: u8 = 2;
+    }
+
+    impl LaunchDomain for Domain3 {
+        const MAX_DIMENSIONS: u8 = 3;
+    }
+
+    /// Mints a fresh `LaunchContext` whose `'kernel` lifetime backs every
     /// `ThreadIndex` produced inside this kernel/device body.
     ///
     /// # Safety
@@ -262,60 +462,183 @@ pub mod __internal {
     /// The "only macros call this" rule shapes where `thread::index_*` is
     /// usable:
     ///
-    /// - **Plain `fn` device helpers (no annotation)** can't acquire a
-    ///   `ThreadIndex`. The public `thread::index_*` items resolve fine
-    ///   (they're `unreachable!` stubs), so the call compiles, but
-    ///   without the macro rewriting it to the `__internal::*` form
-    ///   the stub body executes and panics on first call.
-    /// - **`#[device]` fns** *can* call `thread::index_*`, but the returned
+    /// - **Plain `fn` device helpers (no annotation)** can't acquire a legacy
+    ///   `ThreadIndex`. The public legacy `thread::index_*` items resolve fine
+    ///   (they're `unreachable!` stubs), but without rewriting the stub body
+    ///   executes and panics on first call.
+    /// - **`#[device]` fns** can call the legacy `thread::index_1d` / 2D
+    ///   helpers, but the returned
     ///   `ThreadIndex<'kernel, _>` borrows from the helper's local scope —
     ///   you can use it inside the helper, you can't return it out.
     ///   `#[device]` is mainly for FFI exports via LTOIR, where this
-    ///   doesn't bite in practice.
+    ///   doesn't bite in practice. They cannot call `index_1d_u32`: only a
+    ///   prepared kernel entry owns its typed launch proof, so helpers receive
+    ///   the index or a checked view as an argument instead.
+    ///   Contract-backed [`ThreadIndex32`] is different: a device helper cannot
+    ///   create the host launch proof, so its caller must pass an index or checked
+    ///   view into the helper.
     #[inline(always)]
-    pub unsafe fn make_kernel_scope<'kernel>() -> KernelScope<'kernel> {
-        unsafe { KernelScope::new() }
+    pub unsafe fn make_kernel_scope<'kernel, Domain, Coordinates>()
+    -> LaunchContext<'kernel, Domain, Coordinates> {
+        unsafe { LaunchContext::new() }
     }
 
+    #[inline(always)]
+    fn checked_axis(block: u32, block_size: u32, thread: u32) -> usize {
+        let block = block as usize;
+        let block_size = block_size as usize;
+        let thread = thread as usize;
+        if block_size == 0 || block > (usize::MAX - thread) / block_size {
+            usize::MAX
+        } else {
+            block * block_size + thread
+        }
+    }
+
+    #[inline(always)]
+    fn one_dimensional_launch<Domain: LaunchDomain, Coordinates>(
+        _scope: &LaunchContext<'_, Domain, Coordinates>,
+    ) -> bool {
+        let y_is_unit = if Domain::MAX_DIMENSIONS == 1 {
+            true
+        } else {
+            super::blockDim_y() == 1 && super::gridDim_y() == 1
+        };
+        let z_is_unit = if Domain::MAX_DIMENSIONS == 1 || Domain::MAX_DIMENSIONS == 2 {
+            true
+        } else {
+            super::blockDim_z() == 1 && super::gridDim_z() == 1
+        };
+        y_is_unit && z_is_unit
+    }
+
+    #[inline(always)]
+    fn at_most_two_dimensional_launch<Domain: LaunchDomain, Coordinates>(
+        _scope: &LaunchContext<'_, Domain, Coordinates>,
+    ) -> bool {
+        if Domain::MAX_DIMENSIONS == 1 || Domain::MAX_DIMENSIONS == 2 {
+            true
+        } else {
+            super::blockDim_z() == 1 && super::gridDim_z() == 1
+        }
+    }
+
+    /// Real `index_1d` intrinsic the `#[kernel]` / `#[device]` macros call in
+    /// place of the public `super::index_1d` stub. Returns
+    /// `blockIdx.x * blockDim.x + threadIdx.x`.
+    ///
+    /// The X-only formula is unique for a 1D launch. A typed `Domain1` scope
+    /// proves that shape without device guards; other scopes validate every
+    /// Y/Z grid and block dimension and return an invalid sentinel on mismatch.
     #[inline(always)]
     pub fn index_1d<'kernel>(
-        scope: &'kernel KernelScope<'kernel>,
+        scope: &'kernel LaunchContext<'kernel, impl LaunchDomain, impl Sized>,
     ) -> ThreadIndex<'kernel, Index1D> {
-        let tid = super::threadIdx_x() as usize;
-        let bid = super::blockIdx_x() as usize;
-        let bdim = super::blockDim_x() as usize;
-        unsafe { ThreadIndex::new(bid * bdim + tid, scope) }
+        let raw = checked_axis(
+            super::blockIdx_x(),
+            super::blockDim_x(),
+            super::threadIdx_x(),
+        );
+        let valid = one_dimensional_launch(scope) && raw != usize::MAX;
+        unsafe { ThreadIndex::new(raw, valid, scope) }
     }
 
+    /// Real `index_2d::<ROW_STRIDE>` intrinsic the macros call in place of the
+    /// public `super::index_2d` stub. `Some(row * ROW_STRIDE + col)` when
+    /// `col < ROW_STRIDE`, else `None`. Unique per thread for a 2D launch
+    /// (`blockDim.z == gridDim.z == 1`); the const stride is in the witness type.
     #[inline(always)]
     pub fn index_2d<'kernel, const ROW_STRIDE: usize>(
-        scope: &'kernel KernelScope<'kernel>,
+        scope: &'kernel LaunchContext<'kernel, impl LaunchDomain, impl Sized>,
     ) -> Option<ThreadIndex<'kernel, Index2D<ROW_STRIDE>>> {
-        let row = (super::blockIdx_y() as usize) * (super::blockDim_y() as usize)
-            + (super::threadIdx_y() as usize);
-        let col = (super::blockIdx_x() as usize) * (super::blockDim_x() as usize)
-            + (super::threadIdx_x() as usize);
-        if col < ROW_STRIDE {
-            Some(unsafe { ThreadIndex::new(row * ROW_STRIDE + col, scope) })
-        } else {
-            None
+        if !at_most_two_dimensional_launch(scope) {
+            return None;
         }
+        let row = checked_axis(
+            super::blockIdx_y(),
+            super::blockDim_y(),
+            super::threadIdx_y(),
+        );
+        let col = checked_axis(
+            super::blockIdx_x(),
+            super::blockDim_x(),
+            super::threadIdx_x(),
+        );
+        if row == usize::MAX || col == usize::MAX || col >= ROW_STRIDE {
+            return None;
+        }
+        // col < ROW_STRIDE proves a non-zero divisor. Check the complete
+        // linear expression before performing either operation.
+        if row > (usize::MAX - col) / ROW_STRIDE {
+            return None;
+        }
+        let raw = row * ROW_STRIDE + col;
+        Some(unsafe { ThreadIndex::new(raw, true, scope) })
     }
 
+    /// Real `index_2d_runtime` intrinsic the macros call in place of the public
+    /// `super::index_2d_runtime` stub. Like `index_2d` but the row stride is a
+    /// runtime value, so cross-thread uniqueness is the caller's `unsafe`
+    /// obligation (every thread must pass the same `row_stride`).
     #[inline(always)]
     pub unsafe fn index_2d_runtime<'kernel>(
-        scope: &'kernel KernelScope<'kernel>,
+        scope: &'kernel LaunchContext<'kernel, impl LaunchDomain, impl Sized>,
         row_stride: usize,
     ) -> Option<ThreadIndex<'kernel, Runtime2DIndex>> {
-        let row = (super::blockIdx_y() as usize) * (super::blockDim_y() as usize)
-            + (super::threadIdx_y() as usize);
-        let col = (super::blockIdx_x() as usize) * (super::blockDim_x() as usize)
-            + (super::threadIdx_x() as usize);
-        if col < row_stride {
-            Some(unsafe { ThreadIndex::new(row * row_stride + col, scope) })
-        } else {
-            None
+        if !at_most_two_dimensional_launch(scope) {
+            return None;
         }
+        let row = checked_axis(
+            super::blockIdx_y(),
+            super::blockDim_y(),
+            super::threadIdx_y(),
+        );
+        let col = checked_axis(
+            super::blockIdx_x(),
+            super::blockDim_x(),
+            super::threadIdx_x(),
+        );
+        if row == usize::MAX || col == usize::MAX || col >= row_stride {
+            return None;
+        }
+        if row > (usize::MAX - col) / row_stride {
+            return None;
+        }
+        let raw = row * row_stride + col;
+        Some(unsafe { ThreadIndex::new(raw, true, scope) })
+    }
+
+    /// 32-bit index intrinsic for an exactly typed 1D launch context.
+    ///
+    /// Host preparation proved `grid.x * block.x <= 2^32`. Therefore the
+    /// mathematical result fits in `u32`; wrapping operations state that proof
+    /// directly and avoid target-width promotion.
+    #[inline(always)]
+    pub fn index_1d_u32<'kernel>(
+        launch_context: &'kernel LaunchContext<'kernel, Domain1, U32Coordinates>,
+    ) -> ThreadIndex32<'kernel> {
+        let raw = super::blockIdx_x()
+            .wrapping_mul(super::blockDim_x())
+            .wrapping_add(super::threadIdx_x());
+        unsafe { ThreadIndex32::new(raw, launch_context) }
+    }
+
+    /// 32-bit row/column intrinsic for an exactly typed 2D launch context.
+    ///
+    /// Host preparation proves that both active axis products are at most
+    /// `2^32`. The wrapping operations therefore equal the mathematical
+    /// results for every real thread while remaining narrow device arithmetic.
+    #[inline(always)]
+    pub fn coord_2d_u32<'kernel>(
+        launch_context: &'kernel LaunchContext<'kernel, Domain2, U32Coordinates>,
+    ) -> ThreadCoord2D32<'kernel> {
+        let row = super::blockIdx_y()
+            .wrapping_mul(super::blockDim_y())
+            .wrapping_add(super::threadIdx_y());
+        let col = super::blockIdx_x()
+            .wrapping_mul(super::blockDim_x())
+            .wrapping_add(super::threadIdx_x());
+        unsafe { ThreadCoord2D32::new(row, col, launch_context) }
     }
 }
 
@@ -327,19 +650,20 @@ pub mod __internal {
 ///
 /// Computes: `blockIdx.x * blockDim.x + threadIdx.x`
 ///
-/// Designed for **1D grid launches** (grids where only the X dimension is used).
-/// For 2D grids, use [`index_2d`] instead.
+/// Designed for **1D launches** (only the X dimension is used). For 2D grids
+/// use [`index_2d`] instead.
 ///
-/// # Uniqueness Guarantee
+/// # Uniqueness
 ///
-/// This produces a unique index per thread because:
-/// - `threadIdx.x ∈ [0, blockDim.x)` (hardware-guaranteed)
-/// - These are hardware built-in variables (read-only special registers); the formula
-///   `bid * bdim + tid` combines them into non-overlapping ranges per block
+/// This reads only the X dimension, so the formula requires
+/// `blockDim.y == blockDim.z == gridDim.y == gridDim.z == 1`. Contracted 1D
+/// kernels receive that proof from host preparation. Legacy kernels check the
+/// four dimensions on-device; a mismatch creates an invalid witness, and safe
+/// `DisjointSlice` access returns `None`.
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let idx = index_1d();
 /// let i = idx.get();
 /// if let Some(c_elem) = c.get_mut(idx) {
@@ -358,6 +682,53 @@ pub fn index_1d<'kernel>() -> ThreadIndex<'kernel> {
     unreachable!(
         "thread::index_1d called outside #[kernel] / #[device] — the macro rewrites real call sites; the public item is a stub"
     )
+}
+
+/// Get the global 1D thread index using only 32-bit arithmetic.
+///
+/// This is the fast, safe counterpart to [`index_1d`] for kernels declared
+/// with `#[launch_contract(domain = 1, coordinates = u32)]`. Host-side launch
+/// preparation rejects shapes where `grid.x * block.x > 2^32`, so every
+/// produced coordinate fits exactly in a `u32`.
+///
+/// ```rust,ignore
+/// #[kernel(launch_context = launch_context)]
+/// #[launch_contract(domain = 1, coordinates = u32)]
+/// fn vector(mut out: DisjointSlice<u32>) {
+///     let thread_index = thread::index_1d_u32(launch_context);
+///     if let Some(mut element) = out.element_thread32(thread_index) {
+///         element.write(7);
+///     }
+/// }
+/// ```
+#[inline(always)]
+pub fn index_1d_u32<'kernel>(
+    launch_context: LaunchContextRef<'kernel, __internal::Domain1, __internal::U32Coordinates>,
+) -> ThreadIndex32<'kernel> {
+    __internal::index_1d_u32(launch_context)
+}
+
+/// Get global 2D row/column coordinates using 32-bit arithmetic.
+///
+/// This is available only to kernels declared with
+/// `#[launch_contract(domain = 2, coordinates = u32)]`. The explicit launch
+/// context is created only by a matching `#[kernel(launch_context = ...)]`
+/// entry.
+///
+/// ```rust,ignore
+/// #[kernel(launch_context = launch_context)]
+/// #[launch_contract(domain = 2, coordinates = u32, block = (16, 16, 1))]
+/// fn epilogue(mut out: DisjointSlice<f32, RowMajorTiles<2, 4, 4096>>) {
+///     if let Some(mut tile) = out.tile_2d32(thread::coord_2d_u32(launch_context)) {
+///         tile.at_const::<0, 0>().write(1.0);
+///     }
+/// }
+/// ```
+#[inline(always)]
+pub fn coord_2d_u32<'kernel>(
+    launch_context: LaunchContextRef<'kernel, __internal::Domain2, __internal::U32Coordinates>,
+) -> ThreadCoord2D32<'kernel> {
+    __internal::coord_2d_u32(launch_context)
 }
 
 // =============================================================================
@@ -399,7 +770,11 @@ pub fn index_1d<'kernel>() -> ThreadIndex<'kernel> {
 /// `col_a, col_b ∈ [0, stride)`, so the RHS is in `(-stride, stride)`.
 /// The LHS is a multiple of `stride`, so the only solution is
 /// `row_a == row_b` AND `col_a == col_b`. Distinct hardware threads have
-/// distinct `(row, col)`.
+/// distinct `(row, col)` **for a 2D launch**.
+///
+/// This ignores the Z dimension, so it also requires
+/// `blockDim.z == gridDim.z == 1`. Typed 1D/2D contracts prove that condition;
+/// other paths check it on-device and return `None` on mismatch.
 ///
 /// # Parameters
 ///
@@ -408,7 +783,7 @@ pub fn index_1d<'kernel>() -> ThreadIndex<'kernel> {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // GEMM: C[row, col] = ...
 /// let row = index_2d_row();
 /// let col = index_2d_col();
@@ -465,7 +840,7 @@ pub unsafe fn index_2d_runtime<'kernel>(
 /// Computes: `blockIdx.y * blockDim.y + threadIdx.y`
 #[inline(always)]
 pub fn index_2d_row() -> usize {
-    (blockIdx_y() * blockDim_y() + threadIdx_y()) as usize
+    (blockIdx_y() as usize) * (blockDim_y() as usize) + (threadIdx_y() as usize)
 }
 
 /// Get the column component of a 2D thread index.
@@ -477,115 +852,10 @@ pub fn index_2d_col() -> usize {
 }
 
 // =============================================================================
-// X-Dimension Intrinsics
+// Generated Thread, Block, and Grid Intrinsics
 // =============================================================================
 
-/// Get threadIdx.x (thread index within block, X dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn threadIdx_x() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
-    unreachable!("threadIdx_x called outside CUDA kernel context")
-}
-
-/// Get blockIdx.x (block index within grid, X dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn blockIdx_x() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
-    unreachable!("blockIdx_x called outside CUDA kernel context")
-}
-
-/// Get blockDim.x (block dimension, X dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn blockDim_x() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-    unreachable!("blockDim_x called outside CUDA kernel context")
-}
-
-// =============================================================================
-// Y-Dimension Intrinsics
-// =============================================================================
-
-/// Get threadIdx.y (thread index within block, Y dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn threadIdx_y() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
-    unreachable!("threadIdx_y called outside CUDA kernel context")
-}
-
-/// Get blockIdx.y (block index within grid, Y dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn blockIdx_y() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
-    unreachable!("blockIdx_y called outside CUDA kernel context")
-}
-
-/// Get blockDim.y (block dimension, Y dimension)
-///
-/// This function is recognized by the cuda-oxide compiler and replaced
-/// with the appropriate PTX intrinsic. The body should never execute.
-#[inline(never)]
-pub fn blockDim_y() -> u32 {
-    unreachable!("blockDim_y called outside CUDA kernel context")
-}
-
-// =============================================================================
-// Z-Dimension Intrinsics
-// =============================================================================
-
-/// Get threadIdx.z (thread index within block, Z dimension).
-#[inline(never)]
-pub fn threadIdx_z() -> u32 {
-    unreachable!("threadIdx_z called outside CUDA kernel context")
-}
-
-/// Get blockIdx.z (block index within grid, Z dimension).
-#[inline(never)]
-pub fn blockIdx_z() -> u32 {
-    unreachable!("blockIdx_z called outside CUDA kernel context")
-}
-
-/// Get blockDim.z (block dimension, Z dimension).
-#[inline(never)]
-pub fn blockDim_z() -> u32 {
-    unreachable!("blockDim_z called outside CUDA kernel context")
-}
-
-// =============================================================================
-// Grid Dimensions (gridDim)
-// =============================================================================
-
-/// Get gridDim.x — number of blocks along the X axis of the grid.
-#[inline(never)]
-pub fn gridDim_x() -> u32 {
-    unreachable!("gridDim_x called outside CUDA kernel context")
-}
-
-/// Get gridDim.y — number of blocks along the Y axis of the grid.
-#[inline(never)]
-pub fn gridDim_y() -> u32 {
-    unreachable!("gridDim_y called outside CUDA kernel context")
-}
-
-/// Get gridDim.z — number of blocks along the Z axis of the grid.
-#[inline(never)]
-pub fn gridDim_z() -> u32 {
-    unreachable!("gridDim_z called outside CUDA kernel context")
-}
+include!("generated/sreg.rs");
 
 // =============================================================================
 // Synchronization Intrinsics
@@ -598,7 +868,7 @@ pub fn gridDim_z() -> u32 {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::thread;
 ///
 /// // Write to shared memory
@@ -618,13 +888,30 @@ pub fn gridDim_z() -> u32 {
 ///   will cause deadlock
 #[inline(never)]
 pub fn sync_threads() {
-    // Lowered to: call void @llvm.nvvm.barrier0()
+    // Replaced by the generated CTA barrier during device compilation.
     unreachable!("sync_threads called outside CUDA kernel context")
 }
 
 // =============================================================================
 // Compile-Time Launch Bounds Configuration
 // =============================================================================
+
+/// Compiler marker for a typed launch domain and coordinate width.
+///
+/// `#[launch_contract]` inserts this call. The MIR importer removes it before
+/// code generation, so it emits no device instructions.
+///
+/// # Safety
+///
+/// `DOMAIN` must describe the launch shape enforced by the host contract. When
+/// `U32_COORDINATES` is true, host preparation must also prove that the product
+/// of grid and block extents on every active axis is at most `2^32`. Kernel
+/// authors should use `#[launch_contract]` instead of calling this marker.
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn __launch_contract_config<const DOMAIN: u8, const U32_COORDINATES: bool>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
 
 /// Marker function for compile-time launch bounds configuration.
 ///
@@ -667,6 +954,10 @@ pub fn sync_threads() {
 /// - `MIN_BLOCKS` - Minimum blocks per SM for occupancy (optional, default 0 = unspecified).
 ///   Maps to `.minnctapersm`.
 ///
+/// `MAX_THREADS` does not require an exact block size. For example, a maximum
+/// of 256 also permits a launch with 128 threads. Use an exact host
+/// `#[launch_contract(block = (...))]` when the kernel requires one shape.
+///
 /// # Performance Impact
 ///
 /// Launch bounds help the compiler:
@@ -678,7 +969,162 @@ pub fn sync_threads() {
 /// register-heavy kernels or kernels with specific occupancy requirements.
 #[inline(never)]
 pub fn __launch_bounds_config<const MAX_THREADS: u32, const MIN_BLOCKS: u32>() {
+    const { validate_launch_bounds(MAX_THREADS) }
     // This function is detected at compile time and removed.
     // The const generics are extracted to set launch bounds.
     // No runtime code is generated.
+}
+
+const fn validate_launch_bounds(max_threads: u32) {
+    assert!(
+        max_threads > 0,
+        "launch_bounds maximum threads must be greater than zero"
+    );
+}
+
+/// Compile-time marker carrying an exact block shape to the device compiler.
+///
+/// `#[launch_contract(block = (x, y, z))]` already binds the host launch to one
+/// block shape. This marker gives the same fact to the device compiler, which
+/// emits `.reqntid x, y, z`. The CUDA driver then rejects a launch whose block
+/// dimensions differ on any axis, so the exact-block obligation is enforced by
+/// the compiled artifact rather than by the host check alone.
+///
+/// # How it works
+///
+/// 1. `#[launch_contract]` injects `__launch_contract_block_config::<X, Y, Z>()`
+///    at kernel start.
+/// 2. The MIR importer detects the call and extracts the const generics.
+/// 3. The marker call is removed during compilation.
+/// 4. LLVM export emits `!nvvm.annotations` with `reqntidx`, `reqntidy` and
+///    `reqntidz`.
+/// 5. The NVPTX backend emits `.reqntid x, y, z`.
+///
+/// # Relationship to `#[launch_bounds]`
+///
+/// `.maxntid` and `.reqntid` on one entry is a ptxas error, so a kernel
+/// carrying both attributes emits `.reqntid` alone. An exact block shape
+/// implies the thread maximum that `.maxntid` would have declared, so nothing
+/// the device compiler relies on is lost. `.minnctapersm` from
+/// `#[launch_bounds(max, min)]` is unaffected and still emitted.
+#[inline(never)]
+pub fn __launch_contract_block_config<const X: u32, const Y: u32, const Z: u32>() {
+    const { validate_contract_block(X, Y, Z) }
+    // Detected at compile time and removed. No runtime code is generated.
+}
+
+const fn validate_contract_block(x: u32, y: u32, z: u32) {
+    assert!(
+        x > 0 && y > 0 && z > 0,
+        "launch_contract block dimensions must all be greater than zero"
+    );
+}
+
+/// Compiler marker for opt-in unchecked slice/array indexing.
+///
+/// `#[kernel(unchecked_indexing)]` inserts this call. The MIR importer records
+/// the flag and removes the call before code generation, so it emits no device
+/// instructions.
+///
+/// # Trust-me contract (same as `get_unchecked`)
+///
+/// When the flag is set, every MIR bounds-check assertion
+/// (`AssertMessage::BoundsCheck`, i.e. the check behind `a[i]` on slices and
+/// arrays) inside the kernel's translated body is **elided**. An out-of-bounds
+/// index is then **undefined behavior**, exactly as if every indexing
+/// expression had been written with [`slice::get_unchecked`]. The kernel
+/// author asserts that every index is in bounds; the compiler emits no guard
+/// and no trap for those accesses.
+///
+/// Only bounds checks are affected. Arithmetic overflow, division by zero,
+/// remainder by zero, misaligned-pointer checks, and every other assertion
+/// kind keep their normal compare-and-trap lowering. Range-indexing failures
+/// (`&a[i..j]`) and explicit panics reach the device as calls into
+/// `core::panicking::*`, not as MIR assert terminators, so they also still
+/// trap.
+///
+/// # Coverage caveat
+///
+/// The per-kernel flag covers the kernel's translated MIR body, which includes
+/// everything rustc MIR-inlined into it. Separately translated `#[device]`
+/// functions are **not** covered by the per-kernel flag; the whole-build
+/// environment switch `CUDA_OXIDE_UNCHECKED_INDEXING=1` (or
+/// `cargo oxide ... --unchecked-indexing`) covers every translated body.
+///
+/// This function should NOT be called directly; use
+/// `#[kernel(unchecked_indexing)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __unchecked_indexing_config<const ENABLED: bool>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Compile-time loop-unroll request marker (internal, do not call directly).
+///
+/// The `#[kernel]` and `#[device]` macros insert this marker at the start of an
+/// annotated loop body. The MIR importer turns it into a `mir.unroll_hint`
+/// operation, and the loop-unroll pass consumes that hint before lowering. It
+/// generates no runtime code.
+///
+/// # Usage
+///
+/// Put the annotation directly on the loop. Bare `#[unroll]` requests full
+/// unrolling; `#[unroll(N)]` requests `N` copies per trip:
+///
+/// ```rust,ignore
+/// #[kernel]
+/// pub fn my_kernel(mut output: DisjointSlice<u32>, n: u32) {
+///     let tid = thread::index_1d();
+///     if let Some(out_elem) = output.get_mut(tid) {
+///         let mut sum = 0;
+///         let mut i = 0;
+///         #[unroll]
+///         while i < 4 {
+///             sum += i;
+///             i += 1;
+///         }
+///         *out_elem = sum;
+///     }
+///
+///     let mut i = 0;
+///     #[unroll(4)]
+///     while i < n {
+///         i += 1;
+///     }
+/// }
+/// ```
+///
+/// The pass currently recognizes explicit counted `while` loops. Range-based
+/// `for` loops are not yet recognized.
+///
+/// Loops with several `continue` paths are supported. Full `#[unroll]` also
+/// preserves `break` paths and multiple exit targets. Partial `#[unroll(N)]`
+/// requires a positive counter step, a `<` or `<=` test, an unchanging limit,
+/// and no exit besides the normal header test. Unsupported requests warn and
+/// are not unrolled.
+///
+/// One annotation may create at most 1,024 body copies, 8,192 cloned basic
+/// blocks, and 65,536 cloned operations. A partial factor above 1,024 is
+/// rejected; other unsupported loop shapes warn and are not unrolled.
+///
+/// # Parameters
+///
+/// - `FACTOR = 0` requests full unrolling of this loop and requires a
+///   compile-time-known trip count.
+/// - `FACTOR >= 2` requests partial unrolling of this loop by that factor.
+///   It groups that many iterations; it does not limit the loop to that many
+///   total iterations, and a remainder still runs.
+#[inline(never)]
+pub fn __unroll_config<const FACTOR: u32>() {
+    const { validate_unroll_factor(FACTOR) }
+    // This function is detected at compile time and removed.
+    // The const generic FACTOR is extracted to set the loop-unroll request.
+    // No runtime code is generated.
+}
+
+const fn validate_unroll_factor(factor: u32) {
+    assert!(
+        factor == 0 || (factor >= 2 && factor <= 1024),
+        "partial unroll factor must be in 2..=1024, or 0 for full unrolling"
+    );
 }

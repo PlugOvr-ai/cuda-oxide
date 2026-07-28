@@ -1,39 +1,34 @@
 # mir-importer
 
-Rust MIR to `dialect-mir` translator and compilation pipeline for cuda-oxide.
+Rust MIR to `dialect-mir` translator for cuda-oxide.
 
 Translates rustc's Stable MIR into [`dialect-mir`](../dialect-mir/) (a pliron
-dialect, MLIR-like) using the alloca + load/store model, then orchestrates the
-rest of the pipeline through `mem2reg`, lowering to
-[`dialect-llvm`](../dialect-llvm/), LLVM IR export, and PTX generation via `llc`.
+dialect, MLIR-like) using the alloca + load/store model, then calls the shared
+`cuda-oxide-codegen` backend for preparation, lowering, export, and PTX or NVVM
+IR generation.
 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           mir-importer                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────┐    ┌─────────────────────┐    ┌─────────────────┐  │
-│  │   translator    │───▶│       pipeline      │───▶│    export +     │  │
-│  │                 │    │                     │    │      llc        │  │
-│  │  MIR →          │    │ mem2reg + lower to  │    │  LLVM IR → PTX  │  │
-│  │  dialect-mir    │    │     dialect-llvm    │    │                 │  │
-│  │     (alloca)    │    │   (via mir-lower)   │    │                 │  │
-│  └─────────────────┘    └─────────────────────┘    └─────────────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌────────────── mir-importer ──────────────┐
+│ Stable MIR ──▶ dialect-mir translation  │
+└────────────────────┬─────────────────────┘
+                     │ translated module
+                     ▼
+┌────────── cuda-oxide-codegen ────────────┐
+│ verify ─▶ mem2reg/unroll ─▶ lower       │
+│        ─▶ LLVM export ─▶ PTX/NVVM IR    │
+└──────────────────────────────────────────┘
 ```
 
 ## Pipeline Steps
 
 ```text
-┌────────────┐  ┌────────────┐  ┌───────────┐  ┌─────────────────┐  ┌────────────┐
-│ 1. Trans-  │─▶│ 2. Verify  │─▶│ 3. mem2reg│─▶│ 4. Lower        │─▶│ 5. Export  │
-│   late to  │  │ dialect-mir│  │   (slots  │  │  dialect-mir →  │  │  LLVM IR   │
-│ dialect-mir│  │            │  │    → SSA) │  │   dialect-llvm  │  │ → PTX (llc)│
-└────────────┘  └────────────┘  └───────────┘  └─────────────────┘  └────────────┘
+translate → verify → mem2reg → annotated unroll → lower/export → optimize → PTX
 ```
+
+Full variable-debug builds skip `mem2reg` and annotated unrolling so source
+variables remain in stable memory locations for cuda-gdb.
 
 1. **Translate** — Convert Stable MIR into `dialect-mir` using the alloca +
    load/store model (one `mir.alloca` per non-ZST local).
@@ -42,9 +37,25 @@ rest of the pipeline through `mem2reg`, lowering to
 3. **mem2reg** — Promote scalar alloca slots back to SSA via
    `pliron::opts::mem2reg`, eliminating the load/store traffic the translator
    produced.
-4. **Lower** — Convert `dialect-mir` → `dialect-llvm` (via `mir-lower`).
-5. **Generate** — Export `dialect-llvm` to textual LLVM IR, then invoke `llc`
-   for PTX (or emit NVVM IR).
+4. **Unroll** — Apply supported `#[unroll]` and `#[unroll(N)]` requests to the
+   SSA form.
+5. **Lower and export** — Convert `dialect-mir` → LLVM dialect (via `mir-lower`)
+   and export LLVM IR. By default, ordinary float operations carry the
+   `contract` fast-math flag so NVPTX can fuse `fmul+fadd` into `fma.rn.f32`
+   (matching nvcc's `--fmad=true`). `--no-fmad` omits that permission.
+6. **Optimize** — Run `opt -O2` (via `LlvmToolchain`) on the exported IR.
+   Skipped for full-debug builds (`-G`) so locals stay inspectable under
+   cuda-gdb. Override with `CUDA_OXIDE_NO_OPT=1`.
+7. **Generate** — Invoke `llc -fp-contract=fast` for PTX (or emit NVVM IR).
+   The `-fp-contract=fast` flag activates the NVPTX backend's FMA contract
+   mode; pair with the IR `contract` flag from step 5. Disable both gates with
+   `CUDA_OXIDE_NO_FMA=1` or `cargo oxide run --no-fmad`. Explicit fused
+   operations such as `f32::mul_add` remain fused.
+
+NVVM IR and LTOIR defer final code generation. Their versioned `.target` file
+requires the sibling `.options` file, which tells cuda-host, libNVVM, and
+nvJitLink whether to use `-fma=0` or `-fma=1`. Copy both sidecars with the
+artifact; a missing required sidecar is an error rather than a silent fallback.
 
 ## Output Modes
 
@@ -71,9 +82,10 @@ rest of the pipeline through `mem2reg`, lowering to
 
 | Module     | Intrinsics                                         | GPU       |
 |------------|----------------------------------------------------|-----------|
+| `generated`| Admitted generated intrinsics, including barriers  | Varies    |
 | `indexing` | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`,    | All       |
 |            | `index_1d`/`index_2d`, DisjointSlice helpers       |           |
-| `sync`     | `sync_threads`, mbarrier ops, fences               | All       |
+| `sync`     | mbarrier ops and fences                            | All       |
 | `warp`     | Shuffle operations, `lane_id`, warp vote           | All       |
 | `atomic`   | Scoped GPU atomics, `core::sync::atomic` support   | sm_70+    |
 | `memory`   | Shared memory, address space casts, stmatrix       | All       |
@@ -86,10 +98,10 @@ rest of the pipeline through `mem2reg`, lowering to
 
 ### `pipeline.rs` — Compilation Orchestration
 
-Drives the end-to-end flow: register dialects → translate functions →
-verify `dialect-mir` → run `mem2reg` → lower to `dialect-llvm` → add
-device extern declarations → verify `dialect-llvm` → export LLVM IR →
-run `llc` for PTX.
+Registers dialects and translates functions, then calls the single
+`cuda-oxide-codegen` backend orchestrator. That backend owns verification,
+`mem2reg`, unrolling, device extern insertion, lowering, LLVM IR export, and
+optional `llc` PTX generation.
 
 ## Alloca + load/store model
 
@@ -98,7 +110,7 @@ through block arguments via a liveness analysis, the translator emits one
 `mir.alloca` per non-ZST local at the top of the entry block and mediates
 every def/use through `mir.store` / `mir.load` on that slot. Pliron's
 `mem2reg` pass promotes the allocas back to SSA before the `dialect-mir` →
-`dialect-llvm` lowering runs.
+LLVM dialect lowering runs.
 
 ```text
 Rust MIR (not strict SSA):               dialect-mir (alloca + load/store):
@@ -154,7 +166,8 @@ let result = run_pipeline(&functions, &device_externs, &config)?;
 | `NoBody`         | Function has no MIR body                         |
 | `Translation`    | MIR → `dialect-mir` conversion failed            |
 | `Verification`   | IR invariant violated (includes op context)      |
-| `Lowering`       | `dialect-mir` → `dialect-llvm` pass failed       |
+| `Lowering`       | `dialect-mir` → LLVM dialect pass failed         |
+| `LoweredVerification` | Lowered LLVM-dialect invariant failed       |
 | `Export`         | LLVM IR export failed                            |
 | `PtxGeneration`  | `llc` invocation failed                          |
 
@@ -171,21 +184,18 @@ run_pipeline()
   │                       ├─▶ statement::translate_statement()
   │                       │     └─▶ rvalue::translate_rvalue()
   │                       └─▶ terminator::translate_terminator()
-  ├─▶ verify dialect-mir module
-  ├─▶ run pliron::opts::mem2reg (alloca slots → SSA)
-  ├─▶ lower_mir_to_llvm (mir-lower, DialectConversion)
-  ├─▶ add DeviceExternDecl functions
-  ├─▶ verify dialect-llvm module
-  └─▶ export LLVM IR → generate PTX via llc
+  └─▶ cuda-oxide-codegen shared backend
+        └─▶ verify → prepare → externs → lower → export → PTX/NVVM IR
 ```
 
 ## Dependencies
 
+- [cuda-oxide-codegen](../cuda-oxide-codegen/) — shared post-translation backend
 - [pliron](https://github.com/vaivaswatha/pliron) — Pliron IR (MLIR-like) framework
 - [dialect-mir](../dialect-mir/) — pliron dialect modelling Rust MIR
-- [dialect-llvm](../dialect-llvm/) — pliron dialect modelling LLVM IR
+- [llvm-export](../llvm-export/) — pliron-llvm shim + textual `.ll` exporter
 - [dialect-nvvm](../dialect-nvvm/) — NVVM intrinsic ops
-- [mir-lower](../mir-lower/) — `dialect-mir` → `dialect-llvm` lowering pass
+- [mir-lower](../mir-lower/) — `dialect-mir` → LLVM dialect lowering pass
 
 ## Further Reading
 

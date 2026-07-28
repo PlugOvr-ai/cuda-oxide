@@ -4,8 +4,9 @@
 `cuda-oxide`.
 
 The crate is deliberately accelerator-neutral. It knows how to describe bundles
-of generated PTX payloads, but it does not know how to compile or launch them.
-Runtime crates can parse bundles and decide whether they can consume them.
+of generated device-code payloads, but it does not know how to compile or
+launch them. Runtime crates can parse bundles and decide whether they can
+consume them.
 
 `oxide-artifacts` also does not decide target policy. Choices such as PTX versus
 LTOIR, cubin versus fatbin, or single-arch versus multi-arch packaging belong to
@@ -23,7 +24,7 @@ Each bundle contains:
 - a bundle name, normally the producing Rust crate name
 - a device target string, such as `sm_90`
 - zero or more entry records, such as CUDA kernels
-- one or more payload records, such as generated PTX bytes
+- one or more payload records, such as generated PTX, cubin, or IR bytes
 
 Multiple bundle blobs may be concatenated in the same section. Parsers walk the
 section by reading each blob's `total_len` field.
@@ -55,7 +56,8 @@ Artifact Blob
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  |       Payload Count           |        Entry Count            |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |                         Reserved (zero)                       |
+ |        Compile Options (v2) / Reserved Zero (v1)              |
+ |                                                               |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  |                         Bundle Name ...                      /
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -70,7 +72,16 @@ Artifact Blob
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Header size is currently 32 bytes.
+Header size is currently 32 bytes. The final field occupies bytes 24 through
+31 (the half-open range `[24, 32)`) and is a 64-bit compile-options bitset in
+version 2. Bit 0 disables FMA contraction; unknown option bits are rejected.
+Version-1 bundles define the same bytes as reserved zero and use the historical
+default policy, where FMA contraction is allowed.
+
+Version 2 is the latest supported format. For backward compatibility, the
+writer still emits version 1 when the compile-options bitset is zero. It emits
+version 2 only when a bundle carries a non-default compile policy, ensuring
+that an older reader rejects policy it would otherwise silently ignore.
 
 ```text
 Payload Record (24 bytes)
@@ -95,6 +106,9 @@ Payload Record (24 bytes)
 Payload kind values:
 
 - `0x0100`: PTX
+- `0x0110`: NVVM IR
+- `0x0120`: LTOIR
+- `0x0200`: cubin
 
 ```text
 Entry Record (24 bytes)
@@ -132,14 +146,16 @@ relocatable object with a single `.oxart` data section.
 The writer marks the ELF section as retained with
 `SHF_ALLOC | SHF_GNU_RETAIN`.
 
-The rustc CUDA backend writes generated PTX into one bundle blob, emits a host
-object for the current host target, and appends that object to rustc's compiled
-module list before linking. At runtime, `cuda-core` can read the executable's
-object sections and load the PTX payload with `cuModuleLoadData`.
+The rustc CUDA backend writes the generated device artifact into one bundle
+blob, emits a host object for the current host target, and appends that object
+to rustc's compiled module list before linking. At runtime, `cuda-host` can read
+the executable's object sections and load PTX/cubin payloads directly or build a
+cubin from embedded NVVM IR/LTOIR before loading.
 
 ## Constraints
 
-- The format version is currently `1`.
+- The latest supported format version is `2`; default-policy bundles are still
+  emitted as version `1` for backward compatibility.
 - All numeric fields are little-endian.
 - The blob header is fixed at 32 bytes.
 - Payload and entry records are fixed at 24 bytes each.
@@ -158,9 +174,20 @@ object sections and load the PTX payload with `cuModuleLoadData`.
   section.
 - `object`: enables both read and write support.
 
+## Compression Policy
+
+Compression is intentionally not part of the base artifact wire format.
+
+`oxide-artifacts` stores device-code payload bytes as provided by the compiler
+or packaging layer. This keeps the crate as a neutral container for PTX, NVVM IR,
+LTOIR, cubin, and entry metadata, while allowing runtime or loader layers to
+decide how those payloads should be consumed.
+
+If embedded payload size becomes a measured problem, compression should first be
+handled by a higher-level packaging, distribution, or loader layer. Per-payload
+compression should only be added to this format as an explicit versioned
+extension with codec and decompressed-size metadata.
+
 ## TODO
 
-- Investigate whether compression is useful or necessary for embedded payloads,
-  especially for large PTX bundles, and whether it belongs in this crate
-  or in a higher-level packaging layer.
-- Consider Windows support later.
+- Windows support is tracked in [#139](https://github.com/NVlabs/cuda-oxide/issues/139).

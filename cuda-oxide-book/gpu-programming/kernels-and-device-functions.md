@@ -37,9 +37,9 @@ Under the hood, `#[kernel]` does three things:
    `reserved-oxide-symbols` crate; the `<hash>` suffix makes the namespace
    unguessable for user code.
 2. **Adds `#[no_mangle]`** to preserve the symbol name in the generated PTX.
-3. **Generates a marker struct** implementing `CudaKernel` (or
-   `GenericCudaKernel` for generic kernels) so host launch code can look up the
-   correct PTX entry point at compile time.
+3. **Generates host lookup metadata** so typed launch code can find the correct
+   PTX entry. Generic kernels also get a readable helper such as
+   `scale_ptx_name::<f32>()`; generated marker types are internal plumbing.
 
 In the generated PTX, a kernel becomes a `.entry` directive -- the GPU
 equivalent of `main`:
@@ -156,12 +156,81 @@ unavailable today. Here is the current support matrix:
 | `format!`, `println!`             | Require formatting machinery + I/O                                  | Use `gpu_printf!`                    |
 | `std` I/O, networking, filesystem | No OS on GPU                                                        | Communicate via buffers              |
 | Trait objects (`dyn Trait`)       | Require vtable dispatch                                             | Use generics (monomorphized)         |
-| `panic!` with message             | Formatting + allocation                                             | Use `gpu_assert!` or `debug::trap()` |
 
 :::{tip}
 If you accidentally use an unsupported feature, the compiler will produce a
 clear error: `"CUDA-OXIDE: FORBIDDEN CRATE IN DEVICE CODE"` with a list of
 allowed crates (`core`, `alloc`, `cuda_device`, and your local crate).
+:::
+
+(loop-unrolling)=
+
+## Loop unrolling
+
+Inside a `#[kernel]` or `#[device]` function, put `#[unroll]` directly on a
+loop whose trip count is known at compile time. This requests that the compiler
+remove the loop and lay out copies of its body:
+
+```rust
+#[kernel]
+pub fn sum_four(mut out: DisjointSlice<u32>) {
+    let tid = thread::index_1d();
+    if let Some(out_elem) = out.get_mut(tid) {
+        let mut sum = 0;
+        let mut i = 0;
+        #[unroll]
+        while i < 4 {
+            sum += i;
+            i += 1;
+        }
+        *out_elem = sum;
+    }
+}
+```
+
+The pass currently recognizes explicit counted `while` loops. Range-based
+`for` loops are not yet recognized.
+
+Use `#[unroll(N)]`, where `N >= 2`, when the trip count is only known at runtime.
+The loop then does `N` iterations' work per trip. A small remainder loop handles
+any leftover iterations, so `n` does not have to be divisible by `N`:
+
+```rust
+let mut i = 0;
+#[unroll(4)]
+while i < n {
+    process(i);
+    i += 1;
+}
+```
+
+An annotated loop may contain other loops. Only the loop carrying the
+annotation is unrolled; each inner loop is copied intact and remains a loop.
+Add a separate annotation to an inner loop if you want to unroll it too.
+
+Loops with several `continue` paths are supported. Full `#[unroll]` also
+preserves `break` paths and loops with more than one exit target.
+
+Partial `#[unroll(N)]` currently requires the loop condition to be the only
+exit. If the loop has a `break` or another exit, the compiler warns and does not
+unroll that loop.
+
+Partial unrolling also requires a counted-up loop: the counter must have a
+positive step, use `<` or `<=`, and compare against a limit that does not change
+inside the loop. The compiler warns and does not unroll unsupported requests.
+
+To keep generated code bounded, one annotation may create at most 1,024 body
+copies, 8,192 cloned basic blocks, and 65,536 cloned operations. A larger
+request warns and is not unrolled. Full variable-debug builds also skip
+unrolling because they keep loop variables in memory instead of SSA form.
+
+Unrolling trades larger generated code for fewer branches and more
+optimization opportunities. Use it for small or performance-critical loops,
+and measure the result.
+
+:::{seealso}
+For how the compiler analyzes and rewrites annotated loops, including the
+stage-index peephole, see [Compiler Optimizations](../compiler/compiler-optimizations.md).
 :::
 
 ## `#[launch_bounds]` -- occupancy hints
@@ -188,6 +257,19 @@ The generated PTX includes these directives:
 ```text
 .entry optimized_kernel .maxntid 256, 1, 1 .minnctapersm 2 { ... }
 ```
+
+`.maxntid` bounds the product `x * y * z`, so a 256-thread bound admits
+`(256, 1, 1)`, `(16, 16, 1)` and `(4, 8, 8)` alike. Add
+`#[launch_contract(block = (x, y, z))]` when one exact shape is required. That
+emits `.reqntid` in place of `.maxntid`, which the driver enforces per axis:
+
+```text
+.entry exact_kernel .reqntid 256, 1, 1 .minnctapersm 2 { ... }
+```
+
+The two directives are mutually exclusive; ptxas rejects an entry declaring
+both, so a contracted kernel emits `.reqntid` alone. `.minnctapersm` is an
+occupancy hint and composes with either.
 
 :::{tip}
 `#[launch_bounds]` must appear **after** `#[kernel]`:
@@ -247,8 +329,11 @@ In practice this means:
 
 - `unwrap()` and `expect()` work but will trap the GPU on `None`/`Err`.
 - `assert!` and `debug_assert!` work but trap on failure.
-- `panic!("message")` is **not** supported (the formatting machinery is
-  unavailable) -- use `gpu_assert!` or `debug::trap()` instead.
+- `panic!("message")` compiles, and so does `panic!("{}", value)`. The panic
+  path lowers to a trap and the **message is discarded**: there is no panic
+  runtime to print it, and the statements that would have built it are dead
+  once the call is dropped. Reach for `gpu_printf!` before the check when you
+  need to see the values, or `gpu_assert!` for an explicit check.
 
 :::{seealso}
 The [Error Handling and Debugging](error-handling-and-debugging.md) chapter

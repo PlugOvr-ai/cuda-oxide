@@ -1,8 +1,7 @@
 <p align="center">
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml"><img alt="clippy" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml"><img alt="unit-tests" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml"><img alt="cargo-deny" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/ci.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=CI"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/examples-compile.yml"><img alt="examples" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/examples-compile.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=examples"></a>
+  <a href="https://discord.gg/ZUEr4AhH5C"><img alt="discord" src="https://img.shields.io/discord/1515530041767759993?style=flat-square&logo=discord&logoColor=white&label=discord&color=5865F2"></a>
   <br>
   <img src="assets/logo.png" alt="cuda-oxide logo" width="100%">
 </p>
@@ -15,7 +14,8 @@ The workspace combines:
 - single-source compilation -- host and device code live in the same file, built with one `cargo oxide build`
 - a rustc codegen backend that compiles `#[kernel]` functions to CUDA PTX
 - device-side abstractions (type-safe indexing, shared memory, scoped atomics, barriers, TMA, warp/cluster ops)
-- a host-side runtime for memory management and kernel launching (`cuda-core`, `cuda-async`)
+- compile-time kernel policies for separate tuned specializations without runtime policy arguments
+- a host-side runtime for memory management, pinned host transfers, and kernel launching (`cuda-core`, `cuda-async`)
 - a rust-native compilation pipeline using [Pliron](https://github.com/vaivaswatha/pliron), an MLIR-like IR framework in Rust (Rust → Rust MIR → Pliron IR → LLVM IR → PTX)
 
 ## Project Status
@@ -58,15 +58,19 @@ fn main() {
 
     // Launch with a closure — factor is captured and passed to the GPU automatically
     let factor = 2.5f32;
-    module
-        .map::<f32, _>(
+    // SAFETY: this raw configuration is fully 1-D, matches index_1d(), and
+    // launches one thread per output element. A launch contract can move this
+    // proof into the generated safe API.
+    unsafe {
+        module.map::<f32, _>(
             &stream,
             LaunchConfig::for_num_elems(1024),
             move |x: f32| x * factor,
             &input,
             &mut output,
         )
-        .unwrap();
+    }
+    .unwrap();
 
     let result = output.to_host_vec(&stream).unwrap();
     assert!((result[1] - 2.5).abs() < 1e-5);
@@ -77,7 +81,10 @@ The above example defines a generic `#[kernel]` function `map` that accepts any
 `Fn(T) -> T` closure. `#[cuda_module]` embeds the generated device artifact into
 the host binary and generates a typed `module.map::<f32, _>(...)` launch method.
 The closure `move |x| x * factor` is captured, scalarized, and passed as kernel
-parameters automatically.
+parameters automatically. `LaunchConfig` is intentionally raw data, so using
+it to launch a kernel is unsafe: the caller must prove that its dimensions and
+resources match the kernel. Kernels with `#[launch_contract(...)]` instead use
+a checked `PreparedLaunch` through the safe generated method.
 
 For composable async GPU work, `stream:` disappears, `{kernel}_async` returns a
 lazy `DeviceOperation`, and execution happens when you call `.sync()` or
@@ -88,14 +95,16 @@ use cuda_async::device_operation::DeviceOperation;
 
 // Assuming `module`, `input`, and `output` come from the cuda-async setup:
 let factor = 2.5f32;
-module
-    .map_async::<f32, _>(
+let launch = unsafe {
+    // SAFETY: the raw launch is 1-D and matches this kernel's index space.
+    module.map_async::<f32, _>(
         LaunchConfig::for_num_elems(1024),
         move |x: f32| x * factor,
         &input,
         &mut output,
     )?
-    .sync()?;
+};
+launch.sync()?;
 // or: .await?;
 ```
 
@@ -105,8 +114,17 @@ See the `async_mlp` example and `crates/cuda-async/README.md` for the full async
 # Build and run an example
 cargo oxide run host_closure
 
-# Show full compilation pipeline (Rust MIR → dialect-mir → mem2reg → dialect-llvm → LLVM IR → PTX)
+# Build and print the generated PTX
+cargo oxide inspect vecadd
+
+# Show full compilation pipeline (Rust MIR → dialect-mir → mem2reg → LLVM dialect → LLVM IR → PTX)
 cargo oxide pipeline vecadd
+
+# Remove project-local build outputs and generated artifacts
+cargo oxide clean
+
+# Run CUDA correctness checks
+cargo oxide sanitize vecadd --tool memcheck
 
 # Debug with cuda-gdb
 cargo oxide debug vecadd --tui
@@ -116,15 +134,11 @@ cargo oxide debug vecadd --tui
 
 ### Requirements
 
-- **cargo-oxide** — cargo subcommand that drives the build pipeline (`cargo oxide run`, `build`, `debug`, etc.)
-- **Rust nightly** with `rust-src` and `rustc-dev` components (pinned in `rust-toolchain.toml`)
+- **cargo-oxide** — cargo subcommand that drives the build pipeline (`cargo oxide run`, `build`, `sanitize`, `debug`, etc.)
+- **Rust nightly** with `rust-src` and `rustc-dev` and `llvm-tools` components (pinned in `rust-toolchain.toml`)
 - **CUDA Toolkit** (12.x+)
-- **LLVM 21+** with NVPTX backend (`llc` must be in PATH)
 - **Clang + libclang dev headers** (`clang-21` / `libclang-common-21-dev`) — needed by `bindgen` when building the host `cuda-bindings` crate
 - **Linux** (tested on Ubuntu 24.04)
-
-> **Why LLVM 21?** We emit TMA / tcgen05 / WGMMA intrinsics that `llc` from LLVM 20 and earlier can't
-> handle. Simple kernels might still work with an older `llc`, but anything Hopper / Blackwell needs 21+.
 
 ### Install
 
@@ -132,13 +146,22 @@ cargo oxide debug vecadd --tui
 
 Inside the cuda-oxide repo, `cargo oxide` works out of the box via a workspace alias.
 
-For use outside the repo (your own projects):
+For use outside the repo (your own projects), install it with the pinned nightly toolchain:
 
 ```bash
-cargo install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend.
+
+#### Nix (alternative)
+
+If you have Nix with flakes enabled, `nix develop` in the repo gives you a reproducible shell with CUDA 13, LLVM 22, Clang, and the pinned Rust nightly — no manual apt installs. The shellHook auto-discovers host NVIDIA drivers on NixOS and non-NixOS systems.
+
+```bash
+nix develop                                       # full dev shell in this repo
+nix run github:NVlabs/cuda-oxide#new my-project   # bootstrap a project
+```
 
 #### Rust
 
@@ -156,7 +179,7 @@ export PATH="/usr/local/cuda/bin:$PATH"
 nvcc --version
 ```
 
-#### LLVM
+#### LLVM (optional)
 
 ```bash
 # Ubuntu/Debian
@@ -176,8 +199,11 @@ sudo ./llvm.sh 21
 llc-21 --version | grep nvptx
 ```
 
-The pipeline auto-discovers `llc-22` and `llc-21` on `PATH` (in that order).
+The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-22` and `llc-21` on `PATH` (in that order).
 To pin a specific binary, set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
+
+> We emit TMA / tcgen05 / WGMMA intrinsics that `llc` from LLVM 20 and earlier can't handle.
+> Simple kernels might still work with an older `llc`, but anything Hopper / Blackwell needs 21+.
 
 #### Clang (host `cuda-bindings`)
 
@@ -207,6 +233,9 @@ cargo oxide doctor
 
 # Build and run an example end-to-end
 cargo oxide run vecadd
+
+# Run the same example under NVIDIA Compute Sanitizer
+cargo oxide sanitize vecadd
 ```
 
 `cargo oxide doctor` validates your Rust toolchain, CUDA toolkit, LLVM, and
@@ -216,25 +245,30 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 
 ## Examples
 
-**46 examples** in `crates/rustc-codegen-cuda/examples/`. Highlights:
+**60+ examples** in `crates/rustc-codegen-cuda/examples/`. Highlights:
 
 | Example              | Description                                                              |
 |----------------------|--------------------------------------------------------------------------|
 | `vecadd`             | Vector addition -- canonical first example                               |
 | `host_closure`       | Generic kernels with closures passed from host                           |
 | `generic`            | Generic kernels with monomorphization (`scale<T>`)                       |
-| `gemm_sol`           | GEMM SoL: 868 TFLOPS (58% cuBLAS on B200), 8 kernels across 4 phases     |
+| `ord_cmp`            | Device-side `Ord::cmp` lowering for signed and unsigned integers         |
+| `gemm_sol_final`     | Canonical Blackwell GEMM SoL: size-specialized CLC + cg2 + vector stores |
+| `gemm_sol`           | Historical GEMM kernel progression and comparison kernels                |
 | `tcgen05`            | Blackwell tensor cores (sm_100a): TMEM, MMA, cta_group::2                |
 | `atomics`            | GPU atomics: 6 types x 3 scopes x 5 orderings (20 tests)                 |
+| `atomic_f16`         | Scalar f16 atomics: per-scope correctness checks + f32 vs f16 bench      |
 | `cluster`            | Thread Block Clusters + DSMEM ring exchange (Hopper+)                    |
 | `async_mlp`          | Async MLP pipeline: GEMM → MatVec → ReLU across concurrent streams       |
 | `mathdx_ffi_test`    | cuFFTDx thread-level FFT + cuBLASDx block-level GEMM                     |
+| `device_ffi_test`    | Device FFI: Rust kernels calling C++ CCCL warp-level reductions via LTOIR|
 | `async_vecadd`       | Async GPU execution with `cuda-async` and `DeviceOperation`              |
 | `cross_crate_kernel` | Library crates defining kernels, bundled into binaries                   |
+| `cuda_module_in_lib` | `#[cuda_module]` in a library crate, loaded by embedded bundle name      |
 
 ```bash
 cargo oxide run vecadd
-cargo oxide run gemm_sol
+cargo oxide run gemm_sol_final
 ```
 
 ## Crate Overview
@@ -247,7 +281,7 @@ cargo oxide run gemm_sol
 | `cuda-host`         | Typed module loading, launch helpers, LTOIR loader                        |
 | `cuda-macros`       | Proc macros (`#[cuda_module]`, `#[kernel]`, `gpu_printf!`)                |
 | `cuda-bindings`     | Raw `bindgen` FFI bindings to `cuda.h`                                    |
-| `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`)       |
+| `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`, ...)  |
 | `cuda-async`        | Async execution layer (`DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`) |
 | `libnvvm-sys`       | `dlopen` bindings to libNVVM (used by `cuda-host::ltoir`)                 |
 | `nvjitlink-sys`     | `dlopen` bindings to nvJitLink (used by `cuda-host::ltoir`)               |
@@ -258,9 +292,9 @@ cargo oxide run gemm_sol
 |----------------------|-------------------------------------------------------|
 | `rustc-codegen-cuda` | Custom rustc backend                                  |
 | `mir-importer`       | Rust MIR -> `dialect-mir` translation + pipeline      |
-| `mir-lower`          | `dialect-mir` -> `dialect-llvm` lowering              |
+| `mir-lower`          | `dialect-mir` -> LLVM dialect lowering                |
 | `dialect-mir`        | pliron dialect modelling Rust MIR                     |
-| `dialect-llvm`       | pliron dialect modelling LLVM IR (+ export to `.ll`)  |
+| `llvm-export`        | pliron-llvm shim + textual `.ll` exporter             |
 | `dialect-nvvm`       | pliron dialect modelling NVVM intrinsics              |
 
 ### Build Tooling
@@ -289,8 +323,9 @@ cargo oxide run gemm_sol
 - LTOIR generation for Blackwell+ (device-side LTO)
 - Device FFI: Rust <-> C++/CCCL interop via LTOIR
 - MathDx integration: cuFFTDx thread-level FFT, cuBLASDx block-level GEMM
-- Host runtime: `cuda-core` (explicit control) and `cuda-async` (composable async operations)
-- GEMM SoL: 868 TFLOPS (58% cuBLAS SoL) on B200 with cta_group::2, CLC, 4-stage pipeline
+- Tile interop (experimental): [`cutile_inter_kernel`](crates/rustc-codegen-cuda/examples/cutile_inter_kernel/README.md) chains a cutile-rs Tile kernel and a cuda-oxide SIMT PTX kernel on the same CUDA stream over shared device tensors. Intra-kernel Tile interop is work in progress and tracked in [#96](https://github.com/NVlabs/cuda-oxide/issues/96).
+- Host runtime: `cuda-core` (explicit control, pinned host transfers) and `cuda-async` (composable async operations)
+- Canonical Blackwell GEMM SoL example with size-specialized M256xN256/M512xN256 CLC + cta_group::2 kernels and vectorized epilogues (see `gemm_sol_final`)
 
 ## Documentation
 
@@ -304,4 +339,6 @@ cuda-oxide is one of several Rust + GPU efforts under active development. Projec
 
 ## License
 
-The `cuda-bindings` crate is licensed under the NVIDIA Software License: [LICENSE-NVIDIA](LICENSE-NVIDIA). All other crates are licensed under the Apache License, Version 2.0: [LICENSE-APACHE](LICENSE-APACHE).
+cuda-oxide is licensed under the Apache License, Version 2.0: [LICENSE](LICENSE).
+Third-party components retain the licenses stated in their files; see
+[dependency-licenses.csv](dependency-licenses.csv) for the tracked license inventory.

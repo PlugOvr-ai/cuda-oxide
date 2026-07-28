@@ -1,6 +1,6 @@
 [package]
 name = "cuda-host"
-version = "0.1.0"
+version = "0.2.1"
 edition.workspace = true
 description = "Host-side utilities for CUDA kernel development"
 authors.workspace = true
@@ -11,11 +11,14 @@ repository.workspace = true
 half = { workspace = true }
 cuda-macros = { workspace = true }
 cuda-core = { workspace = true }
-libnvvm-sys = { workspace = true }
-nvjitlink-sys = { workspace = true }
+cuda-artifact-finalizer = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 cuda-async = { workspace = true, optional = true }
 
 [features]
 default = []
 async = ["dep:cuda-async", "cuda-macros/async"]
+
+[dev-dependencies]
+cuda-device = { workspace = true }

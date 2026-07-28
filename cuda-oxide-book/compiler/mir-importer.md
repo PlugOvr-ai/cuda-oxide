@@ -7,12 +7,13 @@ takes the Stable MIR that rustc hands us and translates it into
 `dialect-mir`, the pliron dialect that preserves Rust semantics. The
 translator initially emits an alloca/load/store form -- cheap to produce,
 easy to reason about, and a pliron identity on input. A subsequent
-`pliron::opts::mem2reg` pass then promotes those slots back into SSA form,
-leaving `dialect-mir` ready for lowering to `dialect-llvm`.
+`pliron::opts::mem2reg` pass promotes those slots back into SSA form. cuda-oxide
+then runs its [compiler optimizations](compiler-optimizations.md), beginning
+with annotated loop unrolling, before lowering to the LLVM dialect.
 
 But translation is only half the job. `mir-importer` also orchestrates the
-*entire* compilation pipeline: translate, verify, lower, export, and generate
-PTX. It is both the translator and the stage manager.
+*entire* compilation pipeline: translate, verify, optimize `dialect-mir`, lower,
+export, and generate PTX. It is both the translator and the stage manager.
 
 The crate lives in `crates/mir-importer` and is split into two parts:
 
@@ -27,16 +28,21 @@ The crate lives in `crates/mir-importer` and is split into two parts:
 Before diving into translation details, here is the big picture. The
 `run_pipeline()` function is the entry point that `rustc-codegen-cuda` calls
 after collecting device functions. It takes a list of `CollectedFunction`
-structs and a `PipelineConfig`, then runs six stages:
+structs and a `PipelineConfig`, then runs these stages:
 
 ```text
 Step 1:  Translate Rust MIR → `dialect-mir`
 Step 2:  Verify `dialect-mir` module
 Step 3:  Run `pliron::opts::mem2reg` to promote alloca slots back into SSA
-Step 4:  Lower `dialect-mir` → `dialect-llvm` (via mir-lower)
-Step 5:  Export `dialect-llvm` to textual LLVM IR (.ll)
-Step 6:  Run llc to compile .ll to .ptx
+Step 4:  Apply `dialect-mir` optimizations (currently annotated loop unrolling)
+Step 5:  Lower `dialect-mir` → LLVM dialect (via mir-lower)
+Step 6:  For NVVM builds, adjust the LLVM dialect via nvvm-transforms
+Step 7:  Export the LLVM dialect to textual LLVM IR (.ll)
+Step 8:  Compile with llc, or with libNVVM and nvJitLink
 ```
+
+Full variable-debug builds skip steps 3 and 4 so source variables remain in
+stable memory locations for cuda-gdb.
 
 Each `CollectedFunction` carries everything the pipeline needs to know about a
 device function:
@@ -66,11 +72,15 @@ For each function, the pipeline:
    into cryptic LLVM failures downstream.
 4. Runs `pliron::opts::mem2reg` to promote the alloca slots back into SSA
    values within `dialect-mir`.
-5. Runs `lower_mir_to_llvm` (from the `mir-lower` crate) to lower every
-   `dialect-mir` operation into its `dialect-llvm` equivalent via
+5. Runs [compiler optimizations](compiler-optimizations.md), currently
+   unrolling supported loops carrying `#[unroll]` or `#[unroll(N)]` requests.
+6. Runs `lower_mir_to_llvm` (from the `mir-lower` crate) to lower every
+   `dialect-mir` operation into its LLVM dialect equivalent via
    `DialectConversion`.
-6. Exports the `dialect-llvm` module to a textual `.ll` string, writes it to
-   disk, and invokes `llc` to produce the final `.ptx` file.
+7. For NVVM builds, runs `nvvm-transforms` with the dialect selected for the
+   target GPU. Ordinary PTX builds skip this step.
+8. Exports the LLVM dialect module to a textual `.ll` string and compiles it
+   with `llc`, or with libNVVM and nvJitLink for NVVM output.
 
 If any step fails, the pipeline stops and returns a typed error (`NoBody`,
 `Translation`, `Verification`, `Lowering`, `Export`, or `PtxGeneration`) with
@@ -161,7 +171,7 @@ We resolve this tension in two phases:
    to the reaching definition and inserting block arguments (the pliron
    spelling of phi nodes) wherever a value merges along multiple control
    paths. Address-taken slots -- the ones we genuinely need to keep on the
-   stack -- are left alone for the `dialect-mir` → `dialect-llvm` lowering
+   stack -- are left alone for the `dialect-mir` → LLVM dialect lowering
    to translate into real `alloca`s.
 
 Here is the problem in miniature. Given MIR where `_1` is written in `bb0`
@@ -223,7 +233,7 @@ attention:
 | `bool`                | `IntegerType(1)`              | 1-bit integer, as is tradition       |
 | `(A, B, C)`           | `MirTupleType`                | Heterogeneous product type           |
 | `&[T]`                | `MirSliceType`                | Pointer + length                     |
-| `DisjointSlice<T>`    | `MirDisjointSliceType`        | Safety-verified mutable slice        |
+| `DisjointSlice<T>`    | `MirDisjointSliceType`        | Bounds-checked, typed-index mutable slice |
 | `struct Foo`          | `MirStructType`               | With field offsets from rustc layout |
 | `*mut T` / `*const T` | `MirPtrType`                  | With GPU address space               |
 | `enum Option<T>`      | `MirEnumType`                 | Discriminant + variants              |
@@ -337,6 +347,14 @@ In practice, the translator simply ignores the unwind target in every `Call`
 and `Assert` terminator, generating only the return-path branch. The unwind
 blocks are never translated. They vanish, like they were never there.
 
+The panic *message* vanishes with them. A block whose terminator is a diverging
+call into `core::panicking` lowers to `nvvm.trap` + `mir.unreachable` and
+nothing else -- its statements exist only to build what that dropped call would
+have consumed (the message `&str`, the `format_args!` pieces), and the block has
+no successor, so nothing they write can ever be read. Skipping them is also what
+makes a message-carrying panic compilable in the first place: a materialized
+`&str` constant has no device lowering.
+
 This is not as scary as it sounds. Rust's borrow checker and type system
 prevent most of the bugs that would cause panics. And for the ones that
 slip through (array bounds checks, unwrap on `None`), a GPU trap is the
@@ -411,15 +429,23 @@ From here, the pipeline takes over:
 
 1. **Verify** -- pliron checks that every operation's types match, every
    block's arguments are correct, and dominance holds.
-2. **Lower** -- `lower_mir_to_llvm` transforms `mir.add` into `llvm.fadd`,
+2. **Optimize** -- `mir-transforms` rewrites supported annotated loops and
+   cleans up the control flow it changes.
+3. **Lower** -- `lower_mir_to_llvm` transforms `mir.add` into `llvm.fadd`,
    `mir.load` into `llvm.load`, `mir.slice` into an LLVM struct of pointer
    and length, and so on.
-3. **Export** -- `dialect-llvm` is printed as a textual `.ll` file with
+4. **Prepare NVVM IR when needed** -- `nvvm-transforms` converts operations to
+   the LLVM form accepted by the selected libNVVM target. Ordinary PTX builds
+   skip this step.
+5. **Export** -- the LLVM dialect is printed as a textual `.ll` file with
    the appropriate `!nvvm.annotations` metadata marking `vecadd` as a
    kernel entry point.
-4. **llc** -- LLVM's NVPTX backend compiles the `.ll` to `.ptx`, and the
-   result is written next to the host binary.
+6. **Compile** -- LLVM's NVPTX backend normally compiles the `.ll` to `.ptx`.
+   NVVM builds instead use libNVVM and nvJitLink. The result is written next
+   to the host binary.
 
-`dialect-mir` captures Rust semantics faithfully. The next step is lowering
-it to something LLVM can understand -- covered in
-[The Lowering Pipeline](lowering-pipeline.md).
+`dialect-mir` captures Rust semantics faithfully. Before lowering it, cuda-oxide
+can perform targeted, behavior-preserving rewrites. The first is explained in
+[Compiler Optimizations](compiler-optimizations.md). The
+[Lowering Pipeline](lowering-pipeline.md) then converts the result into something
+LLVM can understand.

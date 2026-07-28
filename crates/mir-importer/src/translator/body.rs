@@ -22,23 +22,29 @@
 use super::block;
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
+use crate::translator::location::span_to_location;
 use crate::translator::values::{self, SlotAddrSpaceMap, ValueMap};
 use dialect_mir::ops::MirFuncOp;
 use dialect_mir::types::address_space;
+use llvm_export::export::DebugKind;
+use llvm_export::ops::{
+    DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap, DebugTypeMember,
+};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::context::{Context, Ptr};
 use pliron::identifier::{Identifier, Legaliser};
 use pliron::input_err_noloc;
-use pliron::location::{Located, Location};
+use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
 
 // Re-export rustc_public types for convenience
+use rustc_hash::FxHashMap;
 use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::mono;
-use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+use rustc_public::ty::{ConstantKind, FloatTy, IntTy, RigidTy, Ty, TyKind, UintTy};
 
 /// Cluster dimensions extracted from `#[cluster(x,y,z)]` attribute.
 ///
@@ -63,16 +69,39 @@ pub struct LaunchBounds {
     pub min_blocks: u32,
 }
 
+/// Exact block shape declared by `#[launch_contract(block = (x, y, z))]`.
+///
+/// Detected by scanning MIR for
+/// `cuda_device::thread::__launch_contract_block_config::<X, Y, Z>()` marker
+/// calls. Emitted as `.reqntid x, y, z`, which the CUDA driver enforces per
+/// axis at launch.
+#[derive(Debug, Clone, Copy)]
+pub struct ContractBlock {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// Minimum extern-shared alignment declared by `#[launch_contract]`.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicSharedAlignment {
+    pub bytes: u64,
+}
+
 /// Scans MIR for `__cluster_config::<X, Y, Z>()` marker and extracts cluster dimensions.
 ///
 /// The `#[cluster(x,y,z)]` macro injects this call at the start of the kernel.
 /// We scan the MIR to find it and extract the const generic parameters.
 ///
 /// Returns `Some(ClusterDims)` if found, `None` otherwise.
-fn detect_cluster_config(body: &mir::Body) -> Option<ClusterDims> {
+fn detect_cluster_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Option<ClusterDims> {
     use rustc_public::ty::TyConstKind;
 
-    for block in &body.blocks {
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
         // Use let-else for early continue pattern
         let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
             continue;
@@ -120,10 +149,15 @@ fn detect_cluster_config(body: &mir::Body) -> Option<ClusterDims> {
 /// We scan the MIR to find it and extract the const generic parameters.
 ///
 /// Returns `Some(LaunchBounds)` if found, `None` otherwise.
-fn detect_launch_bounds_config(body: &mir::Body) -> Option<LaunchBounds> {
+fn detect_launch_bounds_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Result<Option<LaunchBounds>, String> {
     use rustc_public::ty::TyConstKind;
 
-    for block in &body.blocks {
+    let mut detected: Option<LaunchBounds> = None;
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
         let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
             continue;
         };
@@ -137,42 +171,298 @@ fn detect_launch_bounds_config(body: &mir::Body) -> Option<LaunchBounds> {
             continue;
         };
 
-        let fn_name = def_id.name();
-        if fn_name != "__launch_bounds_config" && !fn_name.ends_with("::__launch_bounds_config") {
+        let definition_name = def_id.name();
+        if def_id.krate().name.as_str() != "cuda_device"
+            || (definition_name != "__launch_bounds_config"
+                && !definition_name.ends_with("::__launch_bounds_config"))
+        {
             continue;
         }
 
-        // Extract const generic args (MAX_THREADS, MIN_BLOCKS)
-        let mut values = [0u32, 0u32];
-        for (i, arg) in args.0.iter().take(2).enumerate() {
-            let rustc_public::ty::GenericArgKind::Const(c) = arg else {
-                continue;
-            };
-            values[i] = match c.kind() {
-                TyConstKind::Value(_, alloc) => alloc.read_uint().ok().map(|v| v as u32),
-                _ => c.eval_target_usize().ok().map(|v| v as u32),
-            }
-            .unwrap_or(values[i]);
+        if args.0.len() != 2 {
+            return Err(format!(
+                "cuda_device launch-bounds marker has {} generic arguments; expected exactly 2",
+                args.0.len()
+            ));
         }
-
-        return Some(LaunchBounds {
+        let mut values = [0u32; 2];
+        for (index, (name, arg)) in ["maximum threads", "minimum blocks"]
+            .into_iter()
+            .zip(args.0.iter())
+            .enumerate()
+        {
+            let rustc_public::ty::GenericArgKind::Const(value) = arg else {
+                return Err(format!(
+                    "cuda_device launch-bounds {name} argument is not a constant"
+                ));
+            };
+            let raw = match value.kind() {
+                TyConstKind::Value(_, allocation) => allocation.read_uint().map_err(|error| {
+                    format!("could not read launch-bounds {name} constant: {error:?}")
+                })?,
+                _ => u128::from(value.eval_target_usize().map_err(|error| {
+                    format!("could not evaluate launch-bounds {name} constant: {error:?}")
+                })?),
+            };
+            values[index] = u32::try_from(raw)
+                .map_err(|_| format!("launch-bounds {name} value {raw} does not fit in u32"))?;
+        }
+        if values[0] == 0 {
+            return Err("launch-bounds maximum threads must be greater than zero".to_string());
+        }
+        let bounds = LaunchBounds {
             max_threads: values[0],
             min_blocks: values[1],
-        });
+        };
+        if let Some(existing) = detected {
+            if existing.max_threads != bounds.max_threads
+                || existing.min_blocks != bounds.min_blocks
+            {
+                return Err(format!(
+                    "a kernel contains conflicting cuda_device launch-bounds markers: ({}, {}) and ({}, {})",
+                    existing.max_threads,
+                    existing.min_blocks,
+                    bounds.max_threads,
+                    bounds.min_blocks,
+                ));
+            }
+        } else {
+            detected = Some(bounds);
+        }
+    }
+    Ok(detected)
+}
+
+/// Scans MIR for `__launch_contract_block_config::<X, Y, Z>()` and extracts the
+/// exact block shape declared by `#[launch_contract(block = (x, y, z))]`.
+///
+/// Returns `Some(ContractBlock)` if found, `None` otherwise.
+fn detect_contract_block_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Result<Option<ContractBlock>, String> {
+    use rustc_public::ty::TyConstKind;
+
+    let mut detected: Option<ContractBlock> = None;
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+
+        let definition_name = def_id.name();
+        if def_id.krate().name.as_str() != "cuda_device"
+            || (definition_name != "__launch_contract_block_config"
+                && !definition_name.ends_with("::__launch_contract_block_config"))
+        {
+            continue;
+        }
+
+        if args.0.len() != 3 {
+            return Err(format!(
+                "cuda_device launch-contract block marker has {} generic arguments; expected exactly 3",
+                args.0.len()
+            ));
+        }
+        let mut values = [0u32; 3];
+        for (index, (axis, arg)) in ["x", "y", "z"].into_iter().zip(args.0.iter()).enumerate() {
+            let rustc_public::ty::GenericArgKind::Const(value) = arg else {
+                return Err(format!(
+                    "cuda_device launch-contract block {axis} argument is not a constant"
+                ));
+            };
+            let raw = match value.kind() {
+                TyConstKind::Value(_, allocation) => allocation.read_uint().map_err(|error| {
+                    format!("could not read launch-contract block {axis} constant: {error:?}")
+                })?,
+                _ => u128::from(value.eval_target_usize().map_err(|error| {
+                    format!("could not evaluate launch-contract block {axis} constant: {error:?}")
+                })?),
+            };
+            values[index] = u32::try_from(raw).map_err(|_| {
+                format!("launch-contract block {axis} value {raw} does not fit in u32")
+            })?;
+            if values[index] == 0 {
+                return Err(format!(
+                    "launch-contract block {axis} dimension must be greater than zero"
+                ));
+            }
+        }
+        let shape = ContractBlock {
+            x: values[0],
+            y: values[1],
+            z: values[2],
+        };
+        if let Some(existing) = detected {
+            if existing.x != shape.x || existing.y != shape.y || existing.z != shape.z {
+                return Err(format!(
+                    "a kernel contains conflicting cuda_device launch-contract block markers: ({}, {}, {}) and ({}, {}, {})",
+                    existing.x, existing.y, existing.z, shape.x, shape.y, shape.z,
+                ));
+            }
+        } else {
+            detected = Some(shape);
+        }
+    }
+    Ok(detected)
+}
+
+/// Rejects an exact block shape that needs more threads than
+/// `#[launch_bounds]` allows.
+///
+/// An exact block displaces the thread maximum in the emitted PTX, because
+/// ptxas rejects an entry carrying both `.maxntid` and `.reqntid`. A maximum
+/// below the required thread count would therefore be dropped in silence, and
+/// the kernel would launch at a shape its author ruled out. A maximum at or
+/// above the required count is redundant rather than contradictory, since
+/// `.reqntid` is the stronger statement, so it stays allowed.
+fn validate_block_against_bounds(bounds: LaunchBounds, block: ContractBlock) -> Result<(), String> {
+    let required = u64::from(block.x) * u64::from(block.y) * u64::from(block.z);
+    if required > u64::from(bounds.max_threads) {
+        return Err(format!(
+            "a kernel declares #[launch_contract(block = ({}, {}, {}))], needing {} threads per block, and #[launch_bounds({})], allowing at most {}",
+            block.x, block.y, block.z, required, bounds.max_threads, bounds.max_threads,
+        ));
+    }
+    Ok(())
+}
+
+/// Scans MIR for the `__unchecked_indexing_config::<ENABLED>()` marker
+/// injected by `#[kernel(unchecked_indexing)]` and extracts its const bool.
+///
+/// Returns `Ok(true)` when a marker with `ENABLED = true` is reachable in
+/// this body. The marker call itself is stripped later during terminator
+/// translation; this scan only records the policy.
+fn detect_unchecked_indexing_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Result<bool, String> {
+    use rustc_public::ty::TyConstKind;
+
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+
+        let definition_name = def_id.name();
+        if def_id.krate().name.as_str() != "cuda_device"
+            || (definition_name != "__unchecked_indexing_config"
+                && !definition_name.ends_with("::__unchecked_indexing_config"))
+        {
+            continue;
+        }
+
+        if args.0.len() != 1 {
+            return Err(format!(
+                "cuda_device unchecked-indexing marker has {} generic arguments; expected exactly 1",
+                args.0.len()
+            ));
+        }
+        let rustc_public::ty::GenericArgKind::Const(value) = &args.0[0] else {
+            return Err(
+                "cuda_device unchecked-indexing marker argument is not a constant".to_string(),
+            );
+        };
+        let enabled = match value.kind() {
+            TyConstKind::Value(_, allocation) => allocation.read_bool().map_err(|error| {
+                format!("could not read unchecked-indexing marker constant: {error:?}")
+            })?,
+            _ => {
+                value.eval_target_usize().map_err(|error| {
+                    format!("could not evaluate unchecked-indexing marker constant: {error:?}")
+                })? != 0
+            }
+        };
+        if enabled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the whole-build unchecked-indexing switch is on.
+///
+/// `CUDA_OXIDE_UNCHECKED_INDEXING=1` (or `true`) elides bounds-check asserts
+/// in every translated body, including separately translated `#[device]`
+/// functions that the per-kernel marker cannot reach.
+fn unchecked_indexing_env_enabled() -> bool {
+    std::env::var("CUDA_OXIDE_UNCHECKED_INDEXING")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Scans MIR for the dynamic-shared alignment marker injected by
+/// `#[launch_contract]` and extracts its const generic argument. The importer
+/// records the value before removing the call from the executable path.
+fn detect_dynamic_shared_alignment(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Option<DynamicSharedAlignment> {
+    use rustc_public::ty::TyConstKind;
+
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+        let fn_name = def_id.name();
+        if fn_name != "__dynamic_shared_alignment"
+            && !fn_name.ends_with("::__dynamic_shared_alignment")
+        {
+            continue;
+        }
+        let rustc_public::ty::GenericArgKind::Const(alignment) = args.0.first()? else {
+            continue;
+        };
+        let bytes = match alignment.kind() {
+            TyConstKind::Value(_, alloc) => alloc.read_uint().ok().map(|value| value as u64),
+            _ => alignment.eval_target_usize().ok(),
+        }?;
+        return Some(DynamicSharedAlignment { bytes });
     }
     None
 }
 
-/// Return the non-unwind successors of a terminator.
+/// Return the non-unwind successors of a block's terminator.
 ///
 /// [`mir::Terminator::successors`] includes unwind cleanup blocks alongside
 /// "normal" control-flow targets. The CUDA toolchain does not support stack
 /// unwinding (hardware could, but `nvcc`/`ptxas` never wire it up), so the
 /// translator treats unwind cleanups as dead code. This helper strips them
-/// out so the worklist only visits blocks that matter on GPU.
-fn non_unwind_successors(kind: &mir::TerminatorKind) -> Vec<usize> {
+/// out so the worklist only visits blocks that matter on GPU. Monomorphized
+/// branch reachability is supplied separately by rustc's collector; the
+/// importer must not reconstruct a second constant-evaluation model from the
+/// converted public MIR.
+fn non_unwind_successors(block: &mir::BasicBlock) -> Vec<usize> {
     use mir::TerminatorKind::*;
-    match kind {
+    match &block.terminator.kind {
         Goto { target } => vec![*target],
         SwitchInt { targets, .. } => targets.all_targets(),
         Return | Resume | Abort | Unreachable => vec![],
@@ -182,25 +472,389 @@ fn non_unwind_successors(kind: &mir::TerminatorKind) -> Vec<usize> {
     }
 }
 
-/// BFS from the entry block (index 0) following non-unwind successors.
+fn validate_monomorphized_successor_shape(
+    body_block_count: usize,
+    rustc_mir_block_count: usize,
+    rustc_mono_successors: &[Vec<usize>],
+) -> Result<(), String> {
+    if body_block_count != rustc_mir_block_count {
+        return Err(format!(
+            "rustc/public MIR CFG mismatch: collector recorded {rustc_mir_block_count} blocks but importer received {body_block_count}"
+        ));
+    }
+    if rustc_mono_successors.len() != body_block_count {
+        return Err(format!(
+            "rustc collector supplied successor lists for {} blocks but the public MIR body has {body_block_count}",
+            rustc_mono_successors.len()
+        ));
+    }
+    for (source, successors) in rustc_mono_successors.iter().enumerate() {
+        if let Some(target) = successors
+            .iter()
+            .copied()
+            .find(|target| *target >= body_block_count)
+        {
+            return Err(format!(
+                "rustc collector edge {source} -> {target} is outside the {body_block_count}-block public MIR body"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_monomorphized_successors(
+    body: &mir::Body,
+    rustc_mir_block_count: usize,
+    rustc_mono_successors: &[Vec<usize>],
+) -> Result<(), String> {
+    validate_monomorphized_successor_shape(
+        body.blocks.len(),
+        rustc_mir_block_count,
+        rustc_mono_successors,
+    )?;
+    for (source, successors) in rustc_mono_successors.iter().enumerate() {
+        let public_successors = body.blocks[source].terminator.successors();
+        if let Some(target) = successors
+            .iter()
+            .copied()
+            .find(|target| !public_successors.contains(target))
+        {
+            return Err(format!(
+                "rustc collector edge {source} -> {target} does not exist in the converted public MIR CFG"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// BFS from the entry block following rustc's exact per-block monomorphized
+/// successors, intersected with the importer's existing non-unwind policy.
 ///
 /// The result is a sorted set of reachable-on-GPU block indices; unwind-only
 /// cleanup blocks end up outside this set and are filled in with
 /// `mir.unreachable` by [`translate_body`] so pliron verification still
-/// passes.
-fn compute_reachable_blocks(body: &mir::Body) -> std::collections::BTreeSet<usize> {
+/// passes. Constant switches and device runtime-check switches are never
+/// re-evaluated here: the collector's edges are the semantic source of truth.
+fn compute_reachable_blocks(
+    body: &mir::Body,
+    rustc_mono_successors: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
     let mut reachable = std::collections::BTreeSet::new();
     let mut frontier: Vec<usize> = vec![0];
     reachable.insert(0);
     while let Some(idx) = frontier.pop() {
-        let successors = non_unwind_successors(&body.blocks[idx].terminator.kind);
-        for succ in successors {
-            if reachable.insert(succ) {
+        let non_unwind: std::collections::BTreeSet<_> = non_unwind_successors(&body.blocks[idx])
+            .into_iter()
+            .collect();
+        for &succ in &rustc_mono_successors[idx] {
+            if non_unwind.contains(&succ) && reachable.insert(succ) {
                 frontier.push(succ);
             }
         }
     }
     reachable
+}
+
+#[derive(Clone)]
+struct LocalDebugInfo {
+    variable: DebugLocalVariableInfo,
+    loc: pliron::location::Location,
+    source_scope: u32,
+}
+
+/// Build the first full-debug variable map.
+///
+/// This stage only supports simple whole-local bindings:
+///
+/// ```text
+/// debug name => _3
+/// ```
+///
+/// Fragments/projections need `DIExpression(DW_OP_LLVM_fragment, ...)` and more
+/// value-location tracking, so they are intentionally skipped until the basic
+/// local/argument path is solid.
+fn collect_debug_locals(
+    ctx: &mut Context,
+    body: &mir::Body,
+) -> FxHashMap<mir::Local, LocalDebugInfo> {
+    let mut locals = FxHashMap::default();
+
+    for info in &body.var_debug_info {
+        if info.composite.is_some() {
+            continue;
+        }
+
+        let Some(local) = info.local() else {
+            continue;
+        };
+        let local_idx: usize = local;
+        if local_idx == 0 {
+            continue;
+        }
+
+        let Some(decl) = body.local_decl(local) else {
+            continue;
+        };
+        let Some(ty) = debug_type_for_ty(&decl.ty) else {
+            continue;
+        };
+
+        let name = info.name.to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        locals.entry(local).or_insert_with(|| LocalDebugInfo {
+            variable: DebugLocalVariableInfo {
+                name,
+                argument_index: info.argument_index,
+                ty,
+            },
+            loc: span_to_location(ctx, info.source_info.span),
+            source_scope: info.source_info.scope,
+        });
+    }
+
+    locals
+}
+
+/// Maximum nesting depth for composite debug types. Guards against deeply
+/// nested or (via generics) pathological value-type trees; beyond this we omit
+/// the inner detail rather than recurse without bound.
+const MAX_DEBUG_TYPE_DEPTH: usize = 8;
+
+fn debug_type_for_ty(ty: &Ty) -> Option<DebugLocalTypeKind> {
+    debug_type_for_ty_at(ty, 0)
+}
+
+fn debug_type_for_ty_at(ty: &Ty, depth: usize) -> Option<DebugLocalTypeKind> {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Bool) => Some(DebugLocalTypeKind::Basic {
+            name: "bool".to_string(),
+            size_bits: 8,
+            encoding: "DW_ATE_boolean",
+        }),
+        TyKind::RigidTy(RigidTy::Int(int_ty)) => Some(DebugLocalTypeKind::Basic {
+            name: int_name(int_ty).to_string(),
+            size_bits: (int_ty.num_bytes() * 8) as u64,
+            encoding: "DW_ATE_signed",
+        }),
+        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => Some(DebugLocalTypeKind::Basic {
+            name: uint_name(uint_ty).to_string(),
+            size_bits: (uint_ty.num_bytes() * 8) as u64,
+            encoding: "DW_ATE_unsigned",
+        }),
+        TyKind::RigidTy(RigidTy::Float(float_ty)) => Some(DebugLocalTypeKind::Basic {
+            name: float_name(float_ty).to_string(),
+            size_bits: float_size_bits(float_ty),
+            encoding: "DW_ATE_float",
+        }),
+        TyKind::RigidTy(RigidTy::RawPtr(pointee, mutability)) => {
+            Some(DebugLocalTypeKind::Pointer {
+                name: raw_pointer_name(pointee, mutability),
+                size_bits: 64,
+            })
+        }
+        TyKind::RigidTy(RigidTy::Ref(_, pointee, mutability)) => {
+            Some(DebugLocalTypeKind::Pointer {
+                name: reference_name(pointee, mutability),
+                size_bits: 64,
+            })
+        }
+        TyKind::RigidTy(RigidTy::Tuple(subtypes)) if depth < MAX_DEBUG_TYPE_DEPTH => {
+            let name = format!(
+                "({})",
+                subtypes
+                    .iter()
+                    .map(short_ty_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let fields = subtypes
+                .iter()
+                .enumerate()
+                .map(|(idx, sub)| (format!("__{idx}"), *sub));
+            debug_struct_type(ty, name, fields, depth)
+        }
+        TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) if depth < MAX_DEBUG_TYPE_DEPTH => {
+            // Only plain structs (one variant) are described as composites here;
+            // enums and unions need DWARF variant parts (deferred).
+            if !matches!(adt_def.kind(), rustc_public::ty::AdtKind::Struct) {
+                return None;
+            }
+            let variants = adt_def.variants();
+            if variants.len() != 1 {
+                return None;
+            }
+            let name = adt_def.trimmed_name();
+            let fields = variants[0]
+                .fields()
+                .into_iter()
+                .map(|field| (field.name.to_string(), field.ty_with_args(&substs)));
+            debug_struct_type(ty, name, fields, depth)
+        }
+        TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) if depth < MAX_DEBUG_TYPE_DEPTH => {
+            let count = array_len_const(&len_const)?;
+            let element = debug_type_for_ty_at(&elem_ty, depth + 1)?;
+            let size_bits = layout_size_bits(ty)?;
+            Some(DebugLocalTypeKind::Array {
+                name: format!("[{}; {count}]", short_ty_name(&elem_ty)),
+                size_bits,
+                element: Box::new(element),
+                count,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Build a `DICompositeType`-shaped struct/tuple from rustc's real layout.
+///
+/// Member offsets come from `ty.layout()` (so `repr(Rust)` field reordering is
+/// honored), not declaration order. Fields whose type we cannot yet describe,
+/// and zero-sized fields (e.g. `PhantomData`), are omitted; the remaining
+/// members keep their correct offsets.
+fn debug_struct_type(
+    ty: &Ty,
+    name: String,
+    fields: impl Iterator<Item = (String, Ty)>,
+    depth: usize,
+) -> Option<DebugLocalTypeKind> {
+    let layout = ty.layout().ok()?;
+    let shape = layout.shape();
+    let offsets: Vec<u64> = match &shape.fields {
+        rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
+            offsets.iter().map(|off| off.bytes() as u64).collect()
+        }
+        _ => return None,
+    };
+    let size_bits = shape.size.bytes() as u64 * 8;
+
+    let mut members = Vec::new();
+    for (idx, (field_name, field_ty)) in fields.enumerate() {
+        let offset_bytes = *offsets.get(idx)?;
+        let Some(member_ty) = debug_type_for_ty_at(&field_ty, depth + 1) else {
+            continue;
+        };
+        if member_ty.size_bits() == 0 {
+            continue;
+        }
+        members.push(DebugTypeMember {
+            name: field_name,
+            offset_bits: offset_bytes * 8,
+            ty: member_ty,
+        });
+    }
+
+    if members.is_empty() {
+        return None;
+    }
+
+    Some(DebugLocalTypeKind::Struct {
+        name,
+        size_bits,
+        members,
+    })
+}
+
+/// Total size of `ty` in bits from its layout, or `None` if unavailable.
+fn layout_size_bits(ty: &Ty) -> Option<u64> {
+    Some(ty.layout().ok()?.shape().size.bytes() as u64 * 8)
+}
+
+/// Evaluate a fixed array's length constant to a `u64`.
+fn array_len_const(len_const: &rustc_public::ty::TyConst) -> Option<u64> {
+    match len_const.kind() {
+        rustc_public::ty::TyConstKind::Value(_, alloc) => {
+            let mut arr = [0u8; 8];
+            for (i, byte) in alloc.bytes.iter().take(8).enumerate() {
+                arr[i] = (*byte)?;
+            }
+            Some(u64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+/// A short, human-readable name for a type, used only for composite display.
+fn short_ty_name(ty: &Ty) -> String {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Bool) => "bool".to_string(),
+        TyKind::RigidTy(RigidTy::Int(int_ty)) => int_name(int_ty).to_string(),
+        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => uint_name(uint_ty).to_string(),
+        TyKind::RigidTy(RigidTy::Float(float_ty)) => float_name(float_ty).to_string(),
+        TyKind::RigidTy(RigidTy::RawPtr(..)) | TyKind::RigidTy(RigidTy::Ref(..)) => {
+            "ptr".to_string()
+        }
+        TyKind::RigidTy(RigidTy::Adt(adt_def, _)) => adt_def.trimmed_name(),
+        _ => "_".to_string(),
+    }
+}
+
+fn int_name(ty: IntTy) -> &'static str {
+    match ty {
+        IntTy::Isize => "isize",
+        IntTy::I8 => "i8",
+        IntTy::I16 => "i16",
+        IntTy::I32 => "i32",
+        IntTy::I64 => "i64",
+        IntTy::I128 => "i128",
+    }
+}
+
+fn uint_name(ty: UintTy) -> &'static str {
+    match ty {
+        UintTy::Usize => "usize",
+        UintTy::U8 => "u8",
+        UintTy::U16 => "u16",
+        UintTy::U32 => "u32",
+        UintTy::U64 => "u64",
+        UintTy::U128 => "u128",
+    }
+}
+
+fn float_name(ty: FloatTy) -> &'static str {
+    match ty {
+        FloatTy::F16 => "f16",
+        FloatTy::F32 => "f32",
+        FloatTy::F64 => "f64",
+        FloatTy::F128 => "f128",
+    }
+}
+
+fn float_size_bits(ty: FloatTy) -> u64 {
+    match ty {
+        FloatTy::F16 => 16,
+        FloatTy::F32 => 32,
+        FloatTy::F64 => 64,
+        FloatTy::F128 => 128,
+    }
+}
+
+fn raw_pointer_name(pointee: Ty, mutability: mir::Mutability) -> String {
+    let mutability = match mutability {
+        mir::Mutability::Mut => "mut ",
+        mir::Mutability::Not => "const ",
+    };
+    format!("*{mutability}{}", simple_type_name(&pointee))
+}
+
+fn reference_name(pointee: Ty, mutability: mir::Mutability) -> String {
+    let mutability = match mutability {
+        mir::Mutability::Mut => "mut ",
+        mir::Mutability::Not => "",
+    };
+    format!("&{mutability}{}", simple_type_name(&pointee))
+}
+
+fn simple_type_name(ty: &Ty) -> &'static str {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Bool) => "bool",
+        TyKind::RigidTy(RigidTy::Int(int_ty)) => int_name(int_ty),
+        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => uint_name(uint_ty),
+        TyKind::RigidTy(RigidTy::Float(float_ty)) => float_name(float_ty),
+        _ => "_",
+    }
 }
 
 /// Emit one `mir.alloca` per non-ZST MIR local at the top of the entry block,
@@ -237,35 +891,68 @@ fn emit_entry_allocas(
     entry_block: Ptr<BasicBlock>,
     num_args: usize,
     value_map: &mut ValueMap,
+    debug_kind: DebugKind,
+    debug_source_scopes: Option<&DebugSourceScopeMap>,
+    reachable: &std::collections::BTreeSet<usize>,
 ) -> Option<Ptr<Operation>> {
     let mut prev_op: Option<Ptr<Operation>> = None;
+    let debug_locals = if debug_kind.variables_enabled() {
+        collect_debug_locals(ctx, body)
+    } else {
+        FxHashMap::default()
+    };
 
-    // Pre-scan the body once: for each local whose translated slot type is a
-    // pointer, infer the address space from the *writes* into it rather than
-    // trusting Rust's declared type (which loses addrspace info for
-    // references / raw pointers).
-    let slot_addr_spaces = SlotAddrSpaceMap::analyze(body);
+    // Translate local types once up front. The address-space analyzer uses
+    // each pointer local's declared lowering as the conservative fallback for
+    // writes it cannot classify, and the allocation loop reuses the same
+    // handles below.
+    let mut mir_types = Vec::with_capacity(body.locals().len());
+    for local_decl in body.locals() {
+        let mir_ty = if types::is_rust_type_zst(&local_decl.ty) {
+            None
+        } else {
+            types::translate_type(ctx, &local_decl.ty).ok()
+        };
+        mir_types.push(mir_ty);
+    }
+    let declared_addr_spaces: Vec<Option<u32>> = mir_types
+        .iter()
+        .map(|mir_ty| {
+            mir_ty
+                .as_ref()
+                .and_then(|mir_ty| values::pointer_addr_space(ctx, *mir_ty))
+        })
+        .collect();
+
+    // Pre-scan only rustc-reachable writes. A slot is narrowed to a concrete
+    // address space only when every reachable write agrees; unknown writes
+    // retain their declared lowering (normally generic address space zero).
+    let slot_addr_spaces =
+        SlotAddrSpaceMap::analyze(body, reachable, num_args, &declared_addr_spaces);
 
     for local_idx in 0..body.locals().len() {
         let local = mir::Local::from(local_idx);
-        let local_ty = &body.locals()[local].ty;
-        if types::is_rust_type_zst(local_ty) {
+        let Some(mir_ty) = mir_types[local_idx] else {
             continue;
-        }
-        let mir_ty = match types::translate_type(ctx, local_ty) {
-            Ok(t) => t,
-            Err(_) => continue,
         };
 
         // Override the Rust-declared addrspace with the inferred one for
         // pointer slots. Non-pointer slots are untouched by
         // `align_pointer_addr_space`.
-        let rust_declared =
-            values::pointer_addr_space(ctx, mir_ty).unwrap_or(address_space::GENERIC);
+        let rust_declared = declared_addr_spaces[local_idx].unwrap_or(address_space::GENERIC);
         let target = slot_addr_spaces.effective(local, rust_declared);
         let mir_ty = values::align_pointer_addr_space(ctx, mir_ty, target);
 
         let (op, slot) = ValueMap::emit_alloca(ctx, mir_ty, entry_block, prev_op);
+        if let Some(info) = debug_locals.get(&local) {
+            llvm_export::ops::set_debug_local_variable(ctx, op, info.variable.clone());
+            if debug_source_scopes
+                .is_some_and(|map| map.scopes.iter().any(|scope| scope.id == info.source_scope))
+            {
+                llvm_export::ops::set_debug_local_source_scope(ctx, op, info.source_scope);
+            }
+            op.deref_mut(ctx).set_loc(info.loc.clone());
+        }
         prev_op = Some(op);
         value_map.set_slot(local, slot);
     }
@@ -299,19 +986,58 @@ fn emit_entry_allocas(
 /// * `ctx` - Pliron IR context
 /// * `body` - MIR function body
 /// * `instance` - Monomorphized instance (with concrete generic args)
+/// * `rustc_mir_block_count` - Block count recorded from the rustc MIR body
+///   before conversion to public MIR
+/// * `rustc_mono_successors` - Exact per-block successor edges computed by
+///   rustc's monomorphization rules under the device runtime-check policy
 /// * `is_kernel` - Add `gpu_kernel` attribute for kernel entry points
+/// * `is_inline_always` - Add `alwaysinline` attribute (non-kernel functions
+///   marked `#[inline(always)]` in rustc)
 /// * `override_name` - Custom export name (defaults to instance name)
 pub fn translate_body(
     ctx: &mut Context,
     body: &mir::Body,
     instance: &mono::Instance,
+    rustc_mir_block_count: usize,
+    rustc_mono_successors: &[Vec<usize>],
     is_kernel: bool,
+    is_inline_always: bool,
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
+    debug_kind: DebugKind,
+    debug_source_scopes: Option<&DebugSourceScopeMap>,
 ) -> TranslationResult<Ptr<Operation>> {
+    // Establish and validate rustc's exact per-instance reachability before
+    // any whole-body semantic scan. Dead blocks must not influence function
+    // attributes, pointer-slot address spaces, or later code emission.
+    if let Err(error) =
+        validate_monomorphized_successors(body, rustc_mir_block_count, rustc_mono_successors)
+    {
+        return input_err_noloc!(TranslationErr::invalid_op(error));
+    }
+    let reachable = compute_reachable_blocks(body, rustc_mono_successors);
+
     // Create a value map to track MIR locals -> pliron IR values
     let num_locals = body.locals().len();
     let mut value_map = ValueMap::new(num_locals);
+
+    // Resolve the per-body unchecked-indexing policy. Like the dynamic-shared
+    // marker, the `#[kernel(unchecked_indexing)]` marker is scanned on any
+    // function: generic kernel expansion forwards it to the generated entry
+    // but also keeps the original in the `#[inline(always)]` implementation
+    // helper, and either body may be the one translated here. The whole-build
+    // environment switch additionally covers separately translated
+    // `#[device]` functions that carry no marker.
+    let unchecked_indexing = match detect_unchecked_indexing_config(body, &reachable) {
+        Ok(marker_enabled) => marker_enabled || unchecked_indexing_env_enabled(),
+        Err(error) => {
+            return input_err_noloc!(TranslationErr::invalid_op(error));
+        }
+    };
+    value_map.set_unchecked_indexing(unchecked_indexing);
+    if unchecked_indexing && std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+        eprintln!("  Unchecked indexing enabled: bounds-check asserts elided");
+    }
 
     // Get function argument types for the first block
     // In MIR, locals[0] is the return value, locals[1..arg_count+1] are function arguments
@@ -420,12 +1146,9 @@ pub fn translate_body(
         1,      // 1 region for function body
     );
 
-    // Set function location
-    // Use body span for location
-    let loc = Location::Named {
-        name: format!("{:?}", body.span),
-        child_loc: Box::new(Location::Unknown),
-    };
+    // Set the function location from rustc's body span. This becomes the
+    // default scope line for line-table debug info once LLVM export is enabled.
+    let loc = span_to_location(ctx, body.span);
     op_ptr.deref_mut(ctx).set_loc(loc);
 
     // Create MirFuncOp and set the function type attribute and symbol name
@@ -449,11 +1172,10 @@ pub fn translate_body(
             .get_operation()
             .deref_mut(ctx)
             .attributes
-            .0
-            .insert(key, kernel_attr.into());
+            .set(key, kernel_attr);
 
         // Detect compile-time cluster configuration from #[cluster(x,y,z)] attribute
-        if let Some(cluster_dims) = detect_cluster_config(body) {
+        if let Some(cluster_dims) = detect_cluster_config(body, &reachable) {
             use pliron::builtin::attributes::IntegerAttr;
             use pliron::builtin::types::Signedness;
             use pliron::utils::apint::APInt;
@@ -478,9 +1200,9 @@ pub fn translate_body(
             let z_key: Identifier = "cluster_dim_z".try_into().unwrap();
 
             let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
-            op_mut.attributes.0.insert(x_key, x_attr.into());
-            op_mut.attributes.0.insert(y_key, y_attr.into());
-            op_mut.attributes.0.insert(z_key, z_attr.into());
+            op_mut.attributes.set(x_key, x_attr);
+            op_mut.attributes.set(y_key, y_attr);
+            op_mut.attributes.set(z_key, z_attr);
 
             if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
                 eprintln!(
@@ -491,7 +1213,30 @@ pub fn translate_body(
         }
 
         // Detect compile-time launch bounds from #[launch_bounds(max, min)] attribute
-        if let Some(launch_bounds) = detect_launch_bounds_config(body) {
+        let launch_bounds = match detect_launch_bounds_config(body, &reachable) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                return input_err_noloc!(TranslationErr::invalid_op(error));
+            }
+        };
+
+        // Detect the exact block shape from #[launch_contract(block = (x,y,z))].
+        // The exporter emits this as reqntid and suppresses maxntid, which ptxas
+        // rejects alongside it.
+        let contract_block = match detect_contract_block_config(body, &reachable) {
+            Ok(block) => block,
+            Err(error) => {
+                return input_err_noloc!(TranslationErr::invalid_op(error));
+            }
+        };
+
+        if let (Some(bounds), Some(block)) = (launch_bounds, contract_block)
+            && let Err(error) = validate_block_against_bounds(bounds, block)
+        {
+            return input_err_noloc!(TranslationErr::invalid_op(error));
+        }
+
+        if let Some(launch_bounds) = launch_bounds {
             use pliron::builtin::attributes::IntegerAttr;
             use pliron::builtin::types::Signedness;
             use pliron::utils::apint::APInt;
@@ -508,14 +1253,14 @@ pub fn translate_body(
             let max_key: Identifier = "maxntid".try_into().unwrap();
 
             let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
-            op_mut.attributes.0.insert(max_key, max_attr.into());
+            op_mut.attributes.set(max_key, max_attr);
 
             // Only add minctasm if it's non-zero (specified)
             if launch_bounds.min_blocks > 0 {
                 let apint_min = APInt::from_u32(launch_bounds.min_blocks, width);
                 let min_attr = IntegerAttr::new(u32_ty, apint_min);
                 let min_key: Identifier = "minctasm".try_into().unwrap();
-                op_mut.attributes.0.insert(min_key, min_attr.into());
+                op_mut.attributes.set(min_key, min_attr);
             }
 
             if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
@@ -532,7 +1277,70 @@ pub fn translate_body(
                 }
             }
         }
+
+        if let Some(contract_block) = contract_block {
+            use pliron::builtin::attributes::IntegerAttr;
+            use pliron::builtin::types::Signedness;
+            use pliron::utils::apint::APInt;
+            use std::num::NonZero;
+
+            let u32_ty = pliron::builtin::types::IntegerType::get(ctx, 32, Signedness::Unsigned);
+            let width = NonZero::new(32).unwrap();
+
+            let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
+            for (key, value) in [
+                ("reqntid_x", contract_block.x),
+                ("reqntid_y", contract_block.y),
+                ("reqntid_z", contract_block.z),
+            ] {
+                let attr = IntegerAttr::new(u32_ty, APInt::from_u32(value, width));
+                let key: Identifier = key.try_into().unwrap();
+                op_mut.attributes.set(key, attr);
+            }
+
+            if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+                eprintln!(
+                    "  Launch contract block detected: reqntid={}x{}x{}",
+                    contract_block.x, contract_block.y, contract_block.z
+                );
+            }
+        }
     }
+
+    // Attribute macros may run before `#[kernel]`. Generic expansion forwards
+    // that marker to the entry but also keeps the original in its helper, so
+    // record markers on any function. mir-lower treats every marked local
+    // function as a propagation root and carries the minimum to its callees.
+    if let Some(alignment) = detect_dynamic_shared_alignment(body, &reachable) {
+        use pliron::builtin::attributes::IntegerAttr;
+        use pliron::builtin::types::Signedness;
+        use pliron::utils::apint::APInt;
+        use std::num::NonZero;
+
+        let u64_ty = pliron::builtin::types::IntegerType::get(ctx, 64, Signedness::Unsigned);
+        let value = APInt::from_u64(alignment.bytes, NonZero::new(64).unwrap());
+        let key: Identifier = "dynamic_shared_alignment".try_into().unwrap();
+        mir_func_op
+            .get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(key, IntegerAttr::new(u64_ty, value));
+
+        if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+            eprintln!(
+                "  Dynamic shared-memory contract alignment detected: {}",
+                alignment.bytes
+            );
+        }
+    }
+
+    if let Some(scope_map) = debug_source_scopes
+        && debug_kind.variables_enabled()
+    {
+        llvm_export::ops::set_debug_source_scope_map(ctx, op_ptr, scope_map);
+    }
+
+    set_alwaysinline_attr_from_flag(ctx, &mir_func_op, is_kernel, is_inline_always);
 
     // Get the function body region (region 0)
     let region_ptr = op_ptr.deref(ctx).get_region(0);
@@ -573,7 +1381,16 @@ pub fn translate_body(
     //
     // The `mem2reg` pass in `pipeline.rs` promotes the scalar slots back into
     // SSA before LLVM lowering.
-    let entry_last_op = emit_entry_allocas(ctx, body, block_map[0], num_args, &mut value_map);
+    let entry_last_op = emit_entry_allocas(
+        ctx,
+        body,
+        block_map[0],
+        num_args,
+        &mut value_map,
+        debug_kind,
+        debug_source_scopes,
+        &reachable,
+    );
 
     // -------------------------------------------------------------------------
     // PHASE 2: Translate reachable blocks
@@ -583,8 +1400,6 @@ pub fn translate_body(
     // ordering dependency and can be translated in a single index-order pass.
     // Unwind-only cleanup blocks are skipped here (see
     // [`non_unwind_successors`]) and patched with `mir.unreachable` below.
-    let reachable: std::collections::BTreeSet<usize> = compute_reachable_blocks(body);
-
     let mut blocks_processed: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for idx in reachable.iter().copied() {
@@ -599,6 +1414,7 @@ pub fn translate_body(
             block_ptr,
             &mut value_map,
             &block_map,
+            &rustc_mono_successors[idx],
             legaliser,
             entry_prev_op,
         )?;
@@ -624,4 +1440,145 @@ pub fn translate_body(
     }
 
     Ok(op_ptr)
+}
+
+/// Propagate `#[inline(always)]` as an LLVM `alwaysinline` function
+/// attribute. Kernel entry points are excluded because they're `.entry` in PTX
+/// and never callees, so marking them `alwaysinline` would be a no-op at best
+/// and rejected by LLVM at worst.
+fn set_alwaysinline_attr_from_flag(
+    ctx: &mut Context,
+    mir_func_op: &MirFuncOp,
+    is_kernel: bool,
+    is_inline_always: bool,
+) {
+    if is_inline_always && !is_kernel {
+        let attr = pliron::builtin::attributes::StringAttr::new("true".to_string());
+        let key: Identifier = "alwaysinline".try_into().unwrap();
+        mir_func_op
+            .get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(key, attr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pliron::{
+        basic_block::BasicBlock,
+        builtin::{
+            attributes::TypeAttr, op_interfaces::SymbolOpInterface, ops::ModuleOp,
+            types::FunctionType,
+        },
+        linked_list::ContainsLinkedList,
+        op::Op,
+        operation::Operation,
+    };
+
+    #[test]
+    fn collector_reachability_requires_the_same_public_mir_cfg() {
+        let valid = [vec![2], vec![], vec![3], vec![]];
+        assert!(validate_monomorphized_successor_shape(4, 4, &valid).is_ok());
+        assert!(validate_monomorphized_successor_shape(4, 5, &valid).is_err());
+        assert!(validate_monomorphized_successor_shape(4, 4, &valid[..3]).is_err());
+        assert!(
+            validate_monomorphized_successor_shape(4, 4, &[vec![4], vec![], vec![], vec![]])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_exact_block_may_not_need_more_threads_than_launch_bounds_allows() {
+        let block = |x, y, z| ContractBlock { x, y, z };
+        let bounds = |max_threads| LaunchBounds {
+            max_threads,
+            min_blocks: 0,
+        };
+
+        // The shapes the `cuda_module_contract` example declares: the maximum
+        // equals the required thread count on every axis product.
+        assert!(validate_block_against_bounds(bounds(256), block(256, 1, 1)).is_ok());
+        assert!(validate_block_against_bounds(bounds(64), block(8, 8, 1)).is_ok());
+        // A maximum above the requirement is redundant, and allowed.
+        assert!(validate_block_against_bounds(bounds(1024), block(16, 16, 1)).is_ok());
+
+        // A maximum below the requirement contradicts it. Without this the
+        // exporter would drop the maximum and emit the larger shape.
+        let error = validate_block_against_bounds(bounds(128), block(16, 16, 1))
+            .expect_err("256 threads exceed a 128-thread maximum");
+        assert!(error.contains("256 threads per block"), "{error}");
+        assert!(error.contains("at most 128"), "{error}");
+        assert!(validate_block_against_bounds(bounds(255), block(256, 1, 1)).is_err());
+
+        // The product is computed in u64, so a shape whose axes multiply past
+        // u32 is rejected rather than wrapping to a value under the maximum.
+        assert!(validate_block_against_bounds(bounds(1024), block(65_536, 65_536, 1)).is_err());
+    }
+
+    #[test]
+    fn inline_always_flag_reaches_llvm_func_attr_before_export() {
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+        let module_op = module.get_operation();
+        let module_region = module_op.deref(&ctx).get_region(0);
+        let module_block = {
+            let existing = {
+                let region = module_region.deref(&ctx);
+                region.iter(&ctx).next()
+            };
+            if let Some(block) = existing {
+                block
+            } else {
+                let block = BasicBlock::new(&mut ctx, None, vec![]);
+                block.insert_at_back(module_region, &ctx);
+                block
+            }
+        };
+
+        let func_type = FunctionType::get(&ctx, vec![], vec![]);
+        let func_type_attr = TypeAttr::new(func_type.into());
+        let mir_func = {
+            let op = Operation::new(
+                &mut ctx,
+                MirFuncOp::get_concrete_op_info(),
+                vec![],
+                vec![],
+                vec![],
+                1,
+            );
+            let func = MirFuncOp::new(&mut ctx, op, func_type_attr);
+            func.set_symbol_name(&mut ctx, "inline_helper".try_into().unwrap());
+            func
+        };
+
+        set_alwaysinline_attr_from_flag(&mut ctx, &mir_func, false, true);
+        mir_func.get_operation().insert_at_back(module_block, &ctx);
+
+        mir_lower::register(&mut ctx);
+        mir_lower::lower_mir_to_llvm(&mut ctx, module_op).expect("lowering succeeds");
+
+        let llvm_func = {
+            let block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+            block
+                .deref(&ctx)
+                .iter(&ctx)
+                .find_map(|op| Operation::get_op::<llvm_export::ops::FuncOp>(op, &ctx))
+                .expect("lowered LLVM function")
+        };
+
+        let key: Identifier = "alwaysinline".try_into().unwrap();
+        assert!(
+            llvm_func
+                .get_operation()
+                .deref(&ctx)
+                .attributes
+                .0
+                .contains_key(&key),
+            "`is_inline_always` must become an LLVM dialect alwaysinline attribute before export",
+        );
+    }
 }

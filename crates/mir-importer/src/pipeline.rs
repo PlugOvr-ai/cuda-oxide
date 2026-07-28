@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Compilation pipeline: MIR → `dialect-mir` → `dialect-llvm` → LLVM IR → PTX.
+//! Compilation pipeline: MIR → `dialect-mir` → LLVM dialect → LLVM IR → PTX.
 //!
 //! Orchestrates the full compilation flow from collected MIR functions to
 //! executable PTX code.
@@ -11,30 +11,49 @@
 //! # Pipeline Steps
 //!
 //! ```text
-//! ┌────────────┐  ┌────────────┐  ┌───────────┐  ┌────────────────┐  ┌────────────┐
-//! │ 1. Trans-  │─▶│ 2. Verify  │─▶│ 3. mem2reg│─▶│  4. Lower      │─▶│ 5. Export  │
-//! │    late to │  │ dialect-mir│  │   (slots  │  │ dialect-mir →  │  │ LLVM IR    │
-//! │ dialect-mir│  │            │  │    → SSA) │  │  dialect-llvm  │  │ → PTX (llc)│
-//! └────────────┘  └────────────┘  └───────────┘  └────────────────┘  └────────────┘
+//! MIR -> dialect-mir -> verify -> mem2reg -> annotated loop unroll
+//!     -> LLVM dialect -> LLVM IR -> PTX
 //! ```
+//!
+//! Builds with variable debug information skip `mem2reg` and loop unrolling so
+//! source variables remain in stable stack slots.
 //!
 //! # GPU Target Selection
 //!
 //! The pipeline auto-detects GPU features in the generated LLVM IR and selects
 //! an appropriate target:
 //!
-//! | Feature           | Target    | Architecture         |
-//! |-------------------|-----------|----------------------|
-//! | tcgen05/TMEM      | sm_100a   | Blackwell datacenter |
-//! | TMA multicast     | sm_100a   | Blackwell datacenter |
-//! | WGMMA             | sm_90a    | Hopper only          |
-//! | TMA/mbarrier      | sm_100    | Hopper+ compatible   |
-//! | Basic CUDA        | sm_80     | Ampere+ (max compat) |
+//! | Feature                       | Target  | Architecture         |
+//! |-------------------------------|---------|----------------------|
+//! | tcgen05/TMEM                  | sm_100a | Blackwell datacenter |
+//! | TMA multicast                 | sm_100a | Blackwell datacenter |
+//! | WGMMA                         | sm_90a  | Hopper only          |
+//! | TMA/mbarrier                  | sm_100  | Hopper+ compatible   |
+//! | bf16x2 add/sub/mul            | sm_90   | Hopper+ compatible   |
+//! | other bf16x2 ALU              | sm_80   | Ampere+ compatible   |
+//! | INT8 `mma.m16n8k32`           | sm_80   | PTX 7.0+             |
+//! | `cp.async` (non-bulk)         | sm_80   | Ampere+              |
+//! | Basic CUDA                    | sm_80   | Ampere+ (max compat) |
 //!
 //! Override with `CUDA_OXIDE_TARGET=<target>` environment variable.
 
-use pliron::common_traits::Verify;
+use cuda_oxide_codegen::__private::{
+    BackendOptions, ModuleArtifactKind, ModulePipelineRequest, OutputFiles, PipelineTrace,
+    append_to_module, compile_translated_module, verify_operation,
+};
+pub use cuda_oxide_codegen::__private::{DeviceExternAttrs, DeviceExternDecl, PipelineError};
+use llvm_export::export::DebugKind;
+pub use llvm_export::export::DeviceExternType;
+use pliron::context::Context;
+use pliron::identifier::Legaliser;
+use pliron::op::Op;
+use pliron::printable::Printable;
 use rustc_public::mir::mono::Instance;
+use std::path::Path;
+
+fn stderr_pipeline_trace(message: &str) {
+    eprintln!("{message}");
+}
 
 /// A function collected for GPU compilation.
 ///
@@ -45,88 +64,61 @@ use rustc_public::mir::mono::Instance;
 pub struct CollectedFunction {
     /// The monomorphized stable_mir instance (includes concrete generic args).
     pub instance: Instance,
+    /// Number of blocks in the rustc MIR body from which `instance.body()` is
+    /// converted. The importer verifies that conversion preserved the CFG.
+    pub rustc_mir_block_count: usize,
+    /// Exact per-block rustc successors for this monomorphized instance under
+    /// CUDA Oxide's device runtime-check policy.
+    pub rustc_mono_successors: Vec<Vec<usize>>,
     /// True if this is a GPU kernel entry point (has `#[kernel]` attribute).
     pub is_kernel: bool,
     /// The name to export in PTX. For kernels, this is the user-visible name.
     pub export_name: String,
+    /// rustc MIR source-scope data used to build inlined debug scopes.
+    pub debug_source_scopes: Option<llvm_export::ops::DebugSourceScopeMap>,
+    /// True if the function is marked `#[inline(always)]` in rustc's
+    /// `CodegenFnAttrs`. The stable_mir API does not expose inline hints, so
+    /// this is queried via `rustc_middle::TyCtxt::codegen_fn_attrs` in
+    /// `rustc-codegen-cuda` and threaded through.
+    ///
+    /// When true, the LLVM `alwaysinline` attribute is emitted on the
+    /// function definition. The existing matched LLVM middle-end (`opt -O2`),
+    /// when available, can then honor the attribute before PTX generation;
+    /// this flag does not add a separate mandatory inliner pass.
+    ///
+    /// This preserves Rust's inline intent for device helpers and avoids
+    /// making helper boundaries depend entirely on later optimizer heuristics.
+    pub is_inline_always: bool,
 }
 
-/// An external device function declaration (for FFI with external LTOIR).
-///
-/// Unlike `CollectedFunction`, these have no MIR body - they're just declarations
-/// that will be emitted as LLVM `declare` statements for nvJitLink to resolve
-/// when linking with external LTOIR (e.g., CCCL libraries).
-#[derive(Debug, Clone)]
-pub struct DeviceExternDecl {
-    /// The export name (the original function name, e.g., "cub_block_reduce_sum").
-    pub export_name: String,
-
-    /// Function parameter types (LLVM type strings like "float", "ptr", "i32").
-    pub param_types: Vec<String>,
-
-    /// Return type (LLVM type string like "float", "void", "i32").
-    pub return_type: String,
-
-    /// NVVM attributes for this function.
-    pub attrs: DeviceExternAttrs,
+/// Device artifact format produced by a successful pipeline run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilationArtifactKind {
+    /// Textual PTX assembly, loadable by the CUDA driver.
+    Ptx,
+    /// NVVM-compatible LLVM IR, intended for libNVVM/nvJitLink.
+    NvvmIr,
+    /// Binary LTOIR, intended for nvJitLink.
+    Ltoir,
+    /// Final cubin image, loadable by the CUDA driver.
+    Cubin,
 }
 
-/// NVVM attributes for device extern declarations.
-///
-/// NOTE: These attributes are currently **not emitted** to the LLVM IR output.
-/// When linking LTOIR via nvJitLink, the external library's LTOIR already contains
-/// proper attributes (convergent, nounwind, memory, etc.) on the function DEFINITIONS.
-/// nvJitLink uses the definition's attributes during LTO, making attributes on our
-/// declarations redundant.
-///
-/// This struct is retained for the pipeline API but values are not used in code generation.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct DeviceExternAttrs {
-    /// Function is convergent (all threads must execute together).
-    /// NOTE: Not currently emitted to LLVM IR.
-    pub is_convergent: bool,
-
-    /// Function is pure (no side effects, result depends only on inputs).
-    /// NOTE: Not currently emitted to LLVM IR.
-    pub is_pure: bool,
-
-    /// Function is read-only (only reads memory, doesn't write).
-    /// NOTE: Not currently emitted to LLVM IR.
-    pub is_readonly: bool,
-}
-
-// Implement AsDeviceExtern trait for dialect-llvm integration
-impl dialect_llvm::export::AsDeviceExtern for DeviceExternDecl {
-    fn as_device_extern(&self) -> dialect_llvm::export::DeviceExternDecl {
-        dialect_llvm::export::DeviceExternDecl {
-            export_name: self.export_name.clone(),
-            param_types: self.param_types.clone(),
-            return_type: self.return_type.clone(),
-            attrs: dialect_llvm::export::DeviceExternAttrs {
-                is_convergent: self.attrs.is_convergent,
-                is_pure: self.attrs.is_pure,
-                is_readonly: self.attrs.is_readonly,
-            },
-        }
-    }
-}
-use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
-use pliron::context::{Context, Ptr};
-use pliron::identifier::Legaliser;
-use pliron::linked_list::ContainsLinkedList;
-use pliron::op::Op;
-use pliron::operation::Operation;
-use pliron::printable::Printable;
-use std::path::Path;
-
-/// Output paths and target from successful compilation.
+/// Output paths, target, and artifact format from successful compilation.
 pub struct CompilationResult {
     /// Path to generated LLVM IR (`.ll` file).
     pub ll_path: std::path::PathBuf,
     /// Path to generated PTX assembly (`.ptx` file).
     pub ptx_path: std::path::PathBuf,
+    /// Path to the artifact that should be embedded or consumed by the caller.
+    pub artifact_path: std::path::PathBuf,
+    /// Format of `artifact_path`.
+    pub artifact_kind: CompilationArtifactKind,
     /// GPU target architecture used (e.g., `sm_90a`, `sm_80`).
     pub target: String,
+    /// Floating-point contraction policy that later compilation stages must
+    /// preserve.
+    pub allow_fma_contraction: bool,
 }
 
 /// Configuration for the compilation pipeline.
@@ -139,7 +131,7 @@ pub struct PipelineConfig {
     pub verbose: bool,
     /// Dump the `dialect-mir` module after translation (for debugging).
     pub show_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module after lowering (for debugging).
+    /// Dump the LLVM dialect module after lowering (for debugging).
     pub show_llvm_dialect: bool,
     /// Emit NVVM IR suitable for libNVVM or other NVVM-compatible tools.
     ///
@@ -152,9 +144,36 @@ pub struct PipelineConfig {
     ///
     /// The output can be compiled to LTOIR using `nvvmCompileProgram -gen-lto`.
     ///
-    /// Currently supports NVVM 20 dialect (Blackwell+). Architecture is
-    /// controlled by `--arch` flag.
+    /// Pre-Blackwell targets use the legacy LLVM 7 dialect; Blackwell and
+    /// newer targets use the modern opaque-pointer dialect. Architecture is
+    /// controlled by `target_arch` or `device_arch_hint` (normally populated
+    /// by `cargo oxide`). When an ordinary build switches to NVVM IR after
+    /// detecting libdevice, the pipeline may instead select the module's
+    /// feature-based target floor.
     pub emit_nvvm_ir: bool,
+    /// Explicit CUDA target used to choose NVVM IR syntax.
+    ///
+    /// Normally set by `cargo oxide --arch` or `CUDA_OXIDE_TARGET`.
+    pub target_arch: Option<String>,
+    /// Human-readable name for whatever set `target_arch`, used when a target
+    /// error has to say where the target came from.
+    ///
+    /// Defaults to `"PipelineConfig::target_arch"`. A caller that read the
+    /// target from somewhere the user would recognise sets its own label:
+    /// `rustc-codegen-cuda` reads `CUDA_OXIDE_TARGET` itself and says so.
+    /// Only meaningful when `target_arch` is `Some`.
+    pub target_arch_source: &'static str,
+    /// Detected architecture of the local GPU (`CUDA_OXIDE_DEVICE_ARCH`).
+    ///
+    /// Used only when no explicit target is provided.
+    pub device_arch_hint: Option<String>,
+    /// Device debug metadata tier.
+    pub debug_kind: DebugKind,
+    /// Whether ordinary floating-point multiply/add or multiply/subtract
+    /// expressions may contract into fused operations.
+    ///
+    /// Explicit fused operations, such as `f32::mul_add`, are unaffected.
+    pub allow_fma_contraction: bool,
 }
 
 impl Default for PipelineConfig {
@@ -166,22 +185,50 @@ impl Default for PipelineConfig {
             show_mir_dialect: false,
             show_llvm_dialect: false,
             emit_nvvm_ir: false,
+            target_arch: None,
+            target_arch_source: "PipelineConfig::target_arch",
+            device_arch_hint: None,
+            debug_kind: DebugKind::Off,
+            allow_fma_contraction: true,
         }
     }
+}
+
+/// Merges `config` over the environment-derived backend defaults.
+///
+/// Environment-derived compatibility options are read once at the rustc
+/// frontend boundary. Explicit pipeline configuration retains precedence.
+fn backend_options_for(config: &PipelineConfig) -> BackendOptions {
+    let mut backend_options = BackendOptions::from_env();
+    if config.target_arch.is_some() {
+        backend_options.target_arch = config.target_arch.clone();
+        // The label travels with the value it describes. Overriding the
+        // target and leaving `from_env`'s "CUDA_OXIDE_TARGET" in place made
+        // every target error blame an env var the caller may never have set.
+        backend_options.target_arch_source = config.target_arch_source;
+    }
+    if config.device_arch_hint.is_some() {
+        backend_options.device_arch_hint = config.device_arch_hint.clone();
+    }
+    backend_options.verbose = backend_options.verbose || config.verbose;
+    backend_options.no_fma = !config.allow_fma_contraction;
+    backend_options
 }
 
 /// Runs the full compilation pipeline on collected functions.
 ///
 /// # Pipeline Steps
 ///
-/// 1. Register the `dialect-mir`, `dialect-nvvm`, and `dialect-llvm` dialects
+/// 1. Register the `dialect-mir`, `dialect-nvvm`, and LLVM dialects
 /// 2. Translate each function's MIR body into `dialect-mir`
 /// 3. Verify the `dialect-mir` module
-/// 4. Run `pliron::opts::mem2reg` to promote slot allocas back into SSA
-/// 5. Lower `dialect-mir` → `dialect-llvm` (via `mir-lower`)
-/// 6. Verify the `dialect-llvm` module
-/// 7. Export `dialect-llvm` to a `.ll` file (including device extern declarations)
-/// 8. Invoke `llc` to generate PTX (or emit LTOIR/NVVM IR when requested)
+/// 4. Unless full variable-debug mode is enabled, run `mem2reg` to promote slot
+///    allocas back into SSA
+/// 5. In the same modes, unroll annotated loops and clean up changed functions
+/// 6. Lower `dialect-mir` → LLVM dialect (via `mir-lower`)
+/// 7. Verify the LLVM dialect module
+/// 8. Export the LLVM dialect to a `.ll` file (including device extern declarations)
+/// 9. Invoke `llc` to generate PTX (or emit LTOIR/NVVM IR when requested)
 ///
 /// # Target Selection
 ///
@@ -202,6 +249,8 @@ pub fn run_pipeline(
     device_externs: &[DeviceExternDecl],
     config: &PipelineConfig,
 ) -> Result<CompilationResult, PipelineError> {
+    prepare_output_dir(&config.output_dir)?;
+
     let mut ctx = Context::new();
 
     // Step 1: Register dialects
@@ -241,9 +290,14 @@ pub fn run_pipeline(
             &mut ctx,
             &body,
             &func.instance,
+            func.rustc_mir_block_count,
+            &func.rustc_mono_successors,
             func.is_kernel,
+            func.is_inline_always,
             Some(&func.export_name),
             &mut legaliser,
+            config.debug_kind,
+            func.debug_source_scopes.as_ref(),
         )
         .map_err(|e| {
             // Use .disp(&ctx) for rich error formatting with location and backtrace
@@ -268,716 +322,155 @@ pub fn run_pipeline(
         append_to_module(&ctx, module_op_ptr, func_op_ptr);
     }
 
-    // Step 4: Verify module. Dump BEFORE verify so module-level verification
-    // failures still surface the consolidated IR to the user.
-    if config.show_mir_dialect {
-        eprintln!("\n=== dialect-mir module (pre-verify) ===");
-        eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
-    }
-    if config.verbose {
-        eprintln!("\n=== Verifying dialect-mir module ===");
-    }
-    verify_operation(&ctx, module_op_ptr, "module")?;
-    if config.verbose {
-        eprintln!("dialect-mir verification successful ✓");
-    }
-
-    // Step 4.5: Run mem2reg (promote `mir.alloca` + `mir.load`/`mir.store`
-    // chains back to SSA values). This erases every promotable alloca and
-    // replaces each load with the reaching definition, leaving the subsequent
-    // `dialect-mir` → `dialect-llvm` lowering to handle only genuinely
-    // address-taken locals.
-    if config.verbose {
-        eprintln!("\n=== Running mem2reg ===");
-    }
-    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx).map_err(|e| {
-        PipelineError::Verification {
-            name: "mem2reg".to_string(),
-            message: e.disp(&ctx).to_string(),
-            operation: None,
-        }
-    })?;
-    if config.verbose {
-        eprintln!("mem2reg successful ✓");
-    }
-    if config.show_mir_dialect {
-        eprintln!("\n=== dialect-mir module (after mem2reg) ===");
-        eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
-    }
-    verify_operation(&ctx, module_op_ptr, "module post-mem2reg")?;
-
-    // Step 5: Lower dialect-mir → dialect-llvm.
-    if config.verbose {
-        eprintln!("\n=== Lowering dialect-mir → dialect-llvm ===");
-    }
-    lower_to_llvm(&mut ctx, module_op_ptr)?;
-
-    // Step 5.5: Add device extern declarations to the dialect-llvm module.
-    // These are needed before verification so calls to extern functions are valid.
-    if !device_externs.is_empty() {
-        if config.verbose {
-            eprintln!(
-                "\n=== Adding {} device extern declarations ===",
-                device_externs.len()
-            );
-        }
-        add_device_extern_declarations(&mut ctx, module_op_ptr, device_externs)?;
-    }
-
-    // Step 6: Verify the dialect-llvm module. Dump BEFORE verify so
-    // verification failures still surface the IR to the user.
-    if config.show_llvm_dialect {
-        eprintln!("\n=== dialect-llvm (pre-verify) ===");
-        eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
-    }
-    if config.verbose {
-        eprintln!("=== Verifying dialect-llvm module ===");
-    }
-    verify_operation(&ctx, module_op_ptr, "llvm module")?;
-    if config.verbose {
-        eprintln!("dialect-llvm verification successful ✓");
-    }
-
-    // Detect CUDA libdevice usage.
-    //
-    // Lowering the rustc float-math intrinsics emits `__nv_*` libdevice
-    // calls (e.g. `__nv_sinf`, `__nv_pow`). `llc` cannot resolve those — they
-    // need libNVVM + nvJitLink + `libdevice.10.bc`, which the example owns
-    // (see `examples/device_ffi_test/tools/`). When we see them we:
-    //   1. Force NVVM IR mode so the `.ll` is suitable for libNVVM input.
-    //   2. Skip the `llc → .ptx` step, because the resulting PTX would have
-    //      unresolved `__nv_*` extern calls and `cuModuleLoad` would reject
-    //      it.
-    // The example is then expected to feed the `.ll` through the LTOIR
-    // pipeline (compile_ltoir + link_ltoir) and load the resulting cubin.
-    let needs_libdevice = module_uses_libdevice(&ctx, module_op_ptr);
-    let emit_nvvm_ir = config.emit_nvvm_ir || needs_libdevice;
-    if needs_libdevice && !config.emit_nvvm_ir && config.verbose {
-        eprintln!(
-            "\n=== Detected CUDA libdevice (`__nv_*`) calls; \
-             auto-emitting NVVM IR (skip llc) ==="
-        );
-    }
-
-    // Step 7: Export to LLVM IR
-    if config.verbose {
-        let mode = if emit_nvvm_ir { "NVVM IR" } else { "PTX" };
-        eprintln!("\n=== Exporting to LLVM IR ({} mode) ===", mode);
-    }
     let ll_path = config.output_dir.join(format!("{}.ll", config.output_name));
-    let _llvm_ir = export_llvm_ir(&ctx, module_op_ptr, device_externs, &ll_path, emit_nvvm_ir)?;
-    if config.verbose {
-        eprintln!("LLVM IR written to {}", ll_path.display());
-    }
+    let ptx_path = config
+        .output_dir
+        .join(format!("{}.ptx", config.output_name));
+    let stale_artifacts = stale_compilation_artifact_paths(&config.output_dir, &config.output_name);
 
-    // Step 8: Generate PTX or stop at NVVM IR for libNVVM-owned paths.
-    if emit_nvvm_ir {
-        // Skip llc. Return a would-be ptx_path so callers see a stable shape;
-        // the file does not exist and the example must build its own cubin
-        // from `ll_path`.
-        let ptx_path = config
-            .output_dir
-            .join(format!("{}.ptx", config.output_name));
-        if config.verbose {
-            let reason = if needs_libdevice {
-                "libdevice present"
-            } else {
-                "NVVM IR requested"
-            };
-            eprintln!(
-                "\n=== Skipping llc ({}); consumer owns libNVVM/nvJitLink build ===",
-                reason
-            );
+    let backend_options = backend_options_for(config);
+
+    let request = ModulePipelineRequest::for_rust_pipeline(
+        device_externs,
+        config.emit_nvvm_ir,
+        &backend_options,
+        config.debug_kind,
+        OutputFiles {
+            llvm_ir: &ll_path,
+            ptx: &ptx_path,
+            stale_before_export: &stale_artifacts,
+        },
+        PipelineTrace {
+            verbose: config.verbose,
+            dump_mir: config.show_mir_dialect,
+            dump_llvm: config.show_llvm_dialect,
+            sink: Some(stderr_pipeline_trace),
+        },
+    );
+    let generated = compile_translated_module(&mut ctx, module_op_ptr, &request)?;
+
+    match generated.artifact_kind {
+        ModuleArtifactKind::NvvmIr => {
+            write_nvvm_compile_options_sidecar(
+                &config.output_dir,
+                &config.output_name,
+                config.allow_fma_contraction,
+                config.debug_kind,
+            )?;
+            // Publish the target last: its version marker is the completion record
+            // that says the sibling options file is required.
+            write_nvvm_target_sidecar(&config.output_dir, &config.output_name, &generated.target)?;
+            Ok(CompilationResult {
+                artifact_path: ll_path.clone(),
+                artifact_kind: CompilationArtifactKind::NvvmIr,
+                ll_path,
+                ptx_path,
+                target: generated.target,
+                allow_fma_contraction: config.allow_fma_contraction,
+            })
         }
-        Ok(CompilationResult {
+        ModuleArtifactKind::Ptx => Ok(CompilationResult {
+            artifact_path: ptx_path.clone(),
+            artifact_kind: CompilationArtifactKind::Ptx,
             ll_path,
             ptx_path,
-            target: "nvvm-ir".to_string(),
-        })
-    } else {
-        // PTX mode: invoke llc
-        if config.verbose {
-            eprintln!("\n=== Generating PTX ===");
-        }
-        let ptx_path = config
-            .output_dir
-            .join(format!("{}.ptx", config.output_name));
-        let target = generate_ptx(&ll_path, &ptx_path)?;
-        if config.verbose {
-            eprintln!(
-                "✓ PTX written to {} (target: {})",
-                ptx_path.display(),
-                target
-            );
-        }
-
-        Ok(CompilationResult {
-            ll_path,
-            ptx_path,
-            target,
-        })
+            target: generated.target,
+            allow_fma_contraction: config.allow_fma_contraction,
+        }),
     }
 }
 
-/// Returns true when lowering emitted CUDA libdevice calls.
+/// Ensures the configured output directory exists before any emission step.
 ///
-/// Float math intrinsics (sin, cos, exp, log, pow, …) lower to `__nv_*`
-/// entry points from `libdevice.10.bc`. `llc` cannot resolve these; they
-/// need libNVVM + nvJitLink + libdevice. When we see any `__nv_*` symbol
-/// the example owns the LTOIR build (see `examples/device_ffi_test/tools/`).
-fn module_uses_libdevice(ctx: &Context, module_op_ptr: Ptr<Operation>) -> bool {
-    op_uses_libdevice(ctx, module_op_ptr)
+/// The pipeline writes every generated artifact under `PipelineConfig::output_dir`.
+/// Creating the directory at the pipeline boundary lets callers provide fresh
+/// sidecar paths without separately seeding them first.
+fn prepare_output_dir(output_dir: &Path) -> Result<(), PipelineError> {
+    std::fs::create_dir_all(output_dir).map_err(|e| {
+        PipelineError::Export(format!(
+            "failed to create output directory {}: {}",
+            output_dir.display(),
+            e
+        ))
+    })
 }
 
-/// Recursively scan for declared or called CUDA libdevice functions.
-fn op_uses_libdevice(ctx: &Context, op_ptr: Ptr<Operation>) -> bool {
-    if let Some(func) = Operation::get_op::<dialect_llvm::ops::FuncOp>(op_ptr, ctx)
-        && func.get_symbol_name(ctx).starts_with("__nv_")
-    {
-        return true;
-    }
-
-    if let Some(call) = Operation::get_op::<dialect_llvm::ops::CallOp>(op_ptr, ctx)
-        && let CallOpCallable::Direct(callee) = call.callee(ctx)
-        && callee.to_string().starts_with("__nv_")
-    {
-        return true;
-    }
-
-    let op_ref = op_ptr.deref(ctx);
-    for region in op_ref.regions() {
-        let region_ref = region.deref(ctx);
-        for block in region_ref.iter(ctx) {
-            let block_ref = block.deref(ctx);
-            for child_op in block_ref.iter(ctx) {
-                if op_uses_libdevice(ctx, child_op) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// Recursively verifies an operation and all nested operations.
+/// Records the resolved NVVM target alongside the emitted `.ll`.
 ///
-/// On failure, attempts to find the innermost failing operation for better
-/// error messages.
-fn verify_operation(
-    ctx: &Context,
-    op_ptr: Ptr<Operation>,
-    name: &str,
+/// The `.target` sidecar carries the completion marker that tells the consumer
+/// the sibling `.options` file is present and required. These sidecars are a
+/// host artifact concern (`oxide-artifacts`), so they stay in `mir-importer`
+/// rather than the rustc-free `cuda-oxide-codegen` backend.
+fn write_nvvm_target_sidecar(
+    output_dir: &Path,
+    output_name: &str,
+    target: &str,
 ) -> Result<(), PipelineError> {
-    if let Err(e) = op_ptr.deref(ctx).verify(ctx) {
-        // Try to find specific failing operation
-        if let Some((err_op, err_msg)) = find_inner_verification_error(ctx, op_ptr) {
-            return Err(PipelineError::Verification {
-                name: name.to_string(),
-                message: err_msg,
-                operation: Some(err_op.deref(ctx).disp(ctx).to_string()),
-            });
-        }
-
-        // Use .disp(ctx) to get full error with location and backtrace
-        return Err(PipelineError::Verification {
-            name: name.to_string(),
-            message: e.disp(ctx).to_string(),
-            operation: None,
-        });
-    }
-    Ok(())
+    let path = output_dir.join(format!("{output_name}.target"));
+    std::fs::write(
+        &path,
+        format!(
+            "{target}\n{}\n",
+            oxide_artifacts::COMPILE_OPTIONS_TARGET_MARKER
+        ),
+    )
+    .map_err(|error| {
+        PipelineError::Export(format!(
+            "failed to record NVVM target in {}: {error}",
+            path.display()
+        ))
+    })
 }
 
-/// Inserts a function operation into the module's block.
-fn append_to_module(ctx: &Context, module_op_ptr: Ptr<Operation>, func_op_ptr: Ptr<Operation>) {
-    let region = module_op_ptr.deref(ctx).get_region(0).deref(ctx);
-    let block = region.iter(ctx).next().expect("Module should have a block");
-    func_op_ptr.insert_at_back(block, ctx);
-}
-
-/// Lowers `dialect-mir` operations to `dialect-llvm`.
-///
-/// Registers `dialect-llvm` and runs `mir-lower`'s `DialectConversion`-based
-/// pass, which converts each `dialect-mir`/`dialect-nvvm` op to its
-/// `dialect-llvm` equivalent.
-fn lower_to_llvm(ctx: &mut Context, module_op_ptr: Ptr<Operation>) -> Result<(), PipelineError> {
-    dialect_llvm::register(ctx);
-    mir_lower::register(ctx);
-
-    mir_lower::lower_mir_to_llvm(ctx, module_op_ptr)
-        .map_err(|e| PipelineError::Lowering(e.to_string()))
-}
-
-/// Adds device extern function declarations to the `dialect-llvm` module.
-///
-/// Creates `dialect-llvm` `FuncOp` declarations (without bodies) for each
-/// device extern function. These declarations ensure that calls to extern
-/// functions pass verification; the matching `declare` statements with
-/// attributes are emitted during LLVM IR export.
-fn add_device_extern_declarations(
-    ctx: &mut Context,
-    module_op_ptr: Ptr<Operation>,
-    device_externs: &[DeviceExternDecl],
+/// Records the compile-wide FMA and debug policies that downstream libNVVM and
+/// nvJitLink stages must preserve, next to the emitted `.ll`.
+fn write_nvvm_compile_options_sidecar(
+    output_dir: &Path,
+    output_name: &str,
+    allow_fma_contraction: bool,
+    debug_kind: DebugKind,
 ) -> Result<(), PipelineError> {
-    use dialect_llvm::ops::FuncOp;
-    use dialect_llvm::types::{FuncType, VoidType};
-    use pliron::identifier::Identifier;
-
-    // Get the module's block pointer first (this is a Ptr, not a Ref, so no borrow issues)
-    let block = {
-        let region = module_op_ptr.deref(ctx).get_region(0).deref(ctx);
-        region.iter(ctx).next().expect("Module should have a block")
+    let path = output_dir.join(format!("{output_name}.options"));
+    let debug_policy = match debug_kind {
+        DebugKind::Off => oxide_artifacts::ArtifactDebugPolicy::None,
+        DebugKind::LineTables => oxide_artifacts::ArtifactDebugPolicy::LineTables,
+        DebugKind::Full => oxide_artifacts::ArtifactDebugPolicy::Full,
     };
-
-    for decl in device_externs {
-        // Parse parameter types from strings
-        let param_types: Vec<_> = decl
-            .param_types
-            .iter()
-            .map(|t| llvm_type_string_to_pliron(ctx, t))
-            .collect();
-
-        // Parse return type - for void, use VoidType
-        let return_type = if decl.return_type == "void" {
-            VoidType::get(ctx).into()
-        } else {
-            llvm_type_string_to_pliron(ctx, &decl.return_type)
-        };
-
-        // Create function type (result, args, is_variadic)
-        let func_type = FuncType::get(ctx, return_type, param_types, false);
-
-        // Use the original export name (NOT the prefixed name).
-        // The MIR sees calls to `cuda_oxide_device_extern_<hash>_foo`, but
-        // mir-lower/convert/ops/call.rs strips the reserved prefix via
-        // `reserved_oxide_symbols::device_extern_base_name`, so the LLVM IR
-        // emits `call @foo(...)`. For that to resolve, we declare `@foo` here.
-        let func_ident: Identifier = decl
-            .export_name
-            .clone()
-            .try_into()
-            .unwrap_or_else(|_| "extern_func".try_into().unwrap());
-
-        // Create function declaration (no body = declaration)
-        let func_op = FuncOp::new(ctx, func_ident, func_type);
-
-        // Insert at the front of the module (declarations come before definitions)
-        func_op.get_operation().insert_at_front(block, ctx);
-    }
-
-    Ok(())
+    let options = oxide_artifacts::ArtifactCompileOptions::new()
+        .with_fma_contraction(allow_fma_contraction)
+        .with_debug_policy(debug_policy);
+    std::fs::write(&path, options.sidecar_text()).map_err(|error| {
+        PipelineError::Export(format!(
+            "failed to record NVVM compile options in {}: {error}",
+            path.display()
+        ))
+    })
 }
 
-/// Convert LLVM type string to pliron type.
-fn llvm_type_string_to_pliron(ctx: &mut Context, type_str: &str) -> Ptr<pliron::r#type::TypeObj> {
-    use dialect_llvm::types::PointerType;
-    use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
-
-    match type_str {
-        "float" => FP32Type::get(ctx).into(),
-        "double" => FP64Type::get(ctx).into(),
-        "half" => dialect_llvm::types::HalfType::get(ctx).into(),
-        "i1" => IntegerType::get(ctx, 1, Signedness::Signless).into(),
-        "i8" => IntegerType::get(ctx, 8, Signedness::Signless).into(),
-        "i16" => IntegerType::get(ctx, 16, Signedness::Signless).into(),
-        "i32" => IntegerType::get(ctx, 32, Signedness::Signless).into(),
-        "i64" => IntegerType::get(ctx, 64, Signedness::Signless).into(),
-        "i128" => IntegerType::get(ctx, 128, Signedness::Signless).into(),
-        _ => PointerType::get(ctx, 0).into(), // Default to ptr
-    }
+fn stale_compilation_artifact_paths(
+    output_dir: &Path,
+    output_name: &str,
+) -> Vec<std::path::PathBuf> {
+    [
+        "ll",
+        "linked.ll",
+        "linked.opt.ll",
+        "ptx",
+        "target",
+        "options",
+        "ltoir",
+        "cubin",
+        "cubin.target",
+    ]
+    .into_iter()
+    .map(|suffix| output_dir.join(format!("{output_name}.{suffix}")))
+    .collect()
 }
-
-/// Exports a `dialect-llvm` module to textual LLVM IR (`.ll` file).
-///
-/// Backend configuration is selected based on flags:
-/// - `emit_nvvm_ir`: Uses `NvvmExportConfig` for NVVM IR output
-/// - Otherwise: Uses default `PtxExportConfig` for standard PTX generation
-///
-/// Device extern declarations are emitted before the main module content.
-fn export_llvm_ir(
-    ctx: &Context,
-    module_op_ptr: Ptr<Operation>,
-    device_externs: &[DeviceExternDecl],
-    path: &Path,
-    emit_nvvm_ir: bool,
-) -> Result<String, PipelineError> {
-    let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
-        .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
-
-    let llvm_ir = if emit_nvvm_ir {
-        let config = dialect_llvm::export::NvvmExportConfig;
-        dialect_llvm::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
-    } else {
-        let config = dialect_llvm::export::PtxExportConfig;
-        dialect_llvm::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
-    };
-
-    std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
-
-    Ok(llvm_ir)
-}
-
-/// Checks for WGMMA instructions (Hopper sm_90a only, NOT forward-compatible).
-///
-/// WGMMA (Warpgroup Matrix Multiply-Accumulate) requires sm_90a specifically.
-/// These are NOT forward-compatible - only work on H100/H200.
-fn contains_wgmma_features(ll_path: &Path) -> bool {
-    if let Ok(contents) = std::fs::read_to_string(ll_path) {
-        contents.contains("wgmma.fence")
-            || contents.contains("wgmma.commit_group")
-            || contents.contains("wgmma.wait_group")
-            || contents.contains("wgmma.mma_async")
-    } else {
-        false
-    }
-}
-
-/// Checks for Thread Block Cluster instructions (sm_90+).
-///
-/// Cluster features require Hopper (sm_90) or newer:
-/// - Cluster special registers (%cluster_ctaid, %cluster_nctaid)
-/// - Cluster synchronization (cluster.sync)
-/// - Distributed shared memory (mapa.shared::cluster)
-fn contains_cluster_features(ll_path: &Path) -> bool {
-    if let Ok(contents) = std::fs::read_to_string(ll_path) {
-        // Cluster special registers
-        contents.contains("cluster_ctaid")
-            || contents.contains("cluster_nctaid")
-            // Cluster synchronization
-            || contents.contains("cluster.sync")
-            // Distributed shared memory
-            || contents.contains("mapa.shared::cluster")
-    } else {
-        false
-    }
-}
-
-/// Checks for TMA/mbarrier instructions (Hopper+ compatible with Blackwell).
-///
-/// These instructions work on BOTH Hopper and Blackwell:
-/// - TMA: Tensor Memory Accelerator bulk copies
-/// - mbarrier: Async hardware barriers with transaction tracking
-///
-/// Use sm_90 (not sm_90a) for forward compatibility with sm_120 (Blackwell).
-fn contains_tma_features(ll_path: &Path) -> bool {
-    if let Ok(contents) = std::fs::read_to_string(ll_path) {
-        // TMA instructions
-        contents.contains("cp.async.bulk.tensor")
-            // mbarrier with transaction tracking (Hopper+)
-            || contents.contains("mbarrier.arrive.expect_tx")
-            || contents.contains("mbarrier.try_wait")
-            // Proxy fence for async operations
-            || contents.contains("fence.proxy.async")
-    } else {
-        false
-    }
-}
-/// Checks for Blackwell tcgen05 instructions (sm_100a+).
-///
-/// These instructions require sm_100a/sm_120a (Blackwell) or newer:
-/// - tcgen05: Tensor Core Gen 5 (TMEM allocation, MMA, sync primitives)
-///
-/// Key differences from Hopper:
-/// - tcgen05 MMA is single-thread (vs WGMMA's 128 threads)
-/// - Uses Tensor Memory (TMEM) instead of registers
-/// - Different synchronization model (mbarrier-based)
-fn contains_blackwell_features(ll_path: &Path) -> bool {
-    if let Ok(contents) = std::fs::read_to_string(ll_path) {
-        // tcgen05 TMEM allocation/deallocation
-        contents.contains("tcgen05.alloc")
-            || contents.contains("tcgen05.dealloc")
-            || contents.contains("tcgen05.relinquish_alloc_permit")
-            // tcgen05 synchronization
-            || contents.contains("tcgen05.fence")
-            || contents.contains("tcgen05.commit")
-            // tcgen05 MMA instructions (ws and non-ws/cta_group forms)
-            || contents.contains("tcgen05.mma")
-            // tcgen05 data movement
-            || contents.contains("tcgen05.cp")
-    } else {
-        false
-    }
-}
-
-/// Checks for TMA multicast in LLVM IR (requires sm_100a).
-///
-/// TMA multicast (`cp.async.bulk.tensor...multicast::cluster`) is an
-/// architecture-specific extension that broadcasts a tile to all CTAs in a
-/// cluster. In the LLVM intrinsic, this is controlled by the `use_cta_mask`
-/// parameter (second-to-last i1 argument) being set to true.
-fn contains_tma_multicast(ll_path: &Path) -> bool {
-    if let Ok(contents) = std::fs::read_to_string(ll_path) {
-        contents
-            .lines()
-            .any(|line| line.contains("g2s.tile") && line.contains(", i1 1, i1"))
-    } else {
-        false
-    }
-}
-
-/// GPU features detected in LLVM IR that determine target selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetectedFeatures {
-    /// tcgen05/TMEM (Blackwell datacenter, sm_100a).
-    Blackwell,
-    /// TMA multicast (arch-specific extension, sm_100a).
-    TmaMulticast,
-    /// WGMMA (Hopper only, sm_90a - NOT forward-compatible).
-    Wgmma,
-    /// TMA/mbarrier (Hopper+ compatible).
-    Tma,
-    /// Thread Block Clusters (sm_90+, forward-compatible).
-    Cluster,
-    /// No special features (maximum compatibility, sm_80).
-    Basic,
-}
-
-/// Maps detected features to GPU target architecture.
-fn select_target(features: DetectedFeatures) -> &'static str {
-    match features {
-        DetectedFeatures::Blackwell => "sm_100a",
-        DetectedFeatures::TmaMulticast => "sm_100a",
-        DetectedFeatures::Wgmma => "sm_90a",
-        // TMA needs PTX 8.0+ which requires sm_90a or sm_100+.
-        // sm_90a is NOT forward-compatible to Blackwell, so use sm_100 which:
-        // - Generates PTX 8.6 (supports all TMA features)
-        // - Works on all Blackwell variants (sm_100, sm_120)
-        // - Hopper users can override with CUDA_OXIDE_TARGET=sm_90a
-        DetectedFeatures::Tma => "sm_100",
-        // Cluster features require sm_90+ but are forward-compatible.
-        // Use sm_90 for Hopper compatibility, works on Blackwell too.
-        DetectedFeatures::Cluster => "sm_90",
-        DetectedFeatures::Basic => "sm_80",
-    }
-}
-
-/// Generates PTX from LLVM IR using `llc`.
-///
-/// Tries `llc-22` then `llc-21` in order. LLVM 21+ is the minimum supported
-/// version: earlier `llc` releases reject the modern TMA / tcgen05 / WGMMA
-/// intrinsic signatures that cuda-oxide emits (e.g. the 10-operand
-/// `llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d` with `addrspace(7)` + CTA
-/// group parameter requires LLVM 21). If `CUDA_OXIDE_LLC` is set, it is used
-/// exclusively — power users can point this at an older `llc` at their own
-/// risk (most examples will still compile but modern intrinsics will not).
-/// Auto-detects GPU features to select target, or uses `CUDA_OXIDE_TARGET`
-/// if set.
-fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError> {
-    // Check for user-specified target override
-    let target_override = std::env::var("CUDA_OXIDE_TARGET").ok();
-
-    // Detect features (order matters: most specific first)
-    let detected = match (
-        contains_blackwell_features(ll_path),
-        contains_tma_multicast(ll_path),
-        contains_wgmma_features(ll_path),
-        contains_tma_features(ll_path),
-        contains_cluster_features(ll_path),
-    ) {
-        (true, _, _, _, _) => DetectedFeatures::Blackwell,
-        (_, true, _, _, _) => DetectedFeatures::TmaMulticast,
-        (_, _, true, _, _) => DetectedFeatures::Wgmma,
-        (_, _, _, true, _) => DetectedFeatures::Tma,
-        (_, _, _, _, true) => DetectedFeatures::Cluster,
-        _ => DetectedFeatures::Basic,
-    };
-
-    // Use override if provided, otherwise auto-detect
-    let target = match &target_override {
-        Some(t) => t.as_str(),
-        None => select_target(detected),
-    };
-
-    // Log target selection
-    if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        match &target_override {
-            Some(_) => eprintln!("Target: {} (from CUDA_OXIDE_TARGET)", target),
-            None => eprintln!("Target: {} (auto-detected: {:?})", target, detected),
-        }
-    }
-
-    let verbose = std::env::var("CUDA_OXIDE_VERBOSE").is_ok();
-
-    // Check for user-specified llc path override
-    if let Ok(llc_path) = std::env::var("CUDA_OXIDE_LLC") {
-        if verbose {
-            eprintln!("Using llc: {} (from CUDA_OXIDE_LLC)", llc_path);
-        }
-        let result = std::process::Command::new(&llc_path)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", target))
-            .arg(ll_path)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        return match result {
-            Ok(output) if output.status.success() => Ok(target.to_string()),
-            Ok(output) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={} failed:\n{}",
-                llc_path,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
-            Err(e) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={}: {}",
-                llc_path, e
-            ))),
-        };
-    }
-
-    // Try different llc versions (newest first for best atomics/scope support).
-    //
-    // LLVM 21 is the floor: older releases reject modern TMA / tcgen05 /
-    // WGMMA intrinsic signatures that cuda-oxide emits. Users on older
-    // distros can opt in to a specific `llc` via `CUDA_OXIDE_LLC`.
-    //
-    // Target reference:
-    //   - sm_100a: Blackwell datacenter (tcgen05/TMEM)
-    //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
-    //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
-    //   - sm_80:   Ampere+ (maximum compatibility)
-    let llc_candidates = [("llc-22", target), ("llc-21", target)];
-
-    let mut last_error = String::new();
-
-    for (llc_cmd, llc_target) in llc_candidates {
-        let result = std::process::Command::new(llc_cmd)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", llc_target))
-            .arg(ll_path)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                if verbose {
-                    eprintln!("Using llc: {} (auto-detected)", llc_cmd);
-                }
-                return Ok(llc_target.to_string());
-            }
-            Ok(output) => {
-                // llc ran but failed - capture the error
-                last_error = String::from_utf8_lossy(&output.stderr).to_string();
-            }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => continue,
-                _ => last_error = format!("{}: {}", llc_cmd, e),
-            },
-        }
-    }
-
-    match last_error.is_empty() {
-        true => Err(PipelineError::PtxGeneration(
-            "No working llc-21 or llc-22 found on PATH.\n\
-             cuda-oxide requires LLVM 21+ (earlier versions reject the TMA / \
-             tcgen05 / WGMMA intrinsic signatures we emit).\n\
-             Install with: sudo apt install llvm-21  (or llvm-22)\n\
-             Or set CUDA_OXIDE_LLC=/path/to/llc to use a specific binary."
-                .to_string(),
-        )),
-        false => Err(PipelineError::PtxGeneration(format!(
-            "llc failed:\n{}",
-            last_error.trim()
-        ))),
-    }
-}
-
-/// Recursively finds the innermost operation that failed verification.
-///
-/// Helps produce better error messages by pointing to the specific failing
-/// operation rather than just the containing module/function.
-fn find_inner_verification_error(
-    ctx: &Context,
-    op_ptr: Ptr<Operation>,
-) -> Option<(Ptr<Operation>, String)> {
-    let op = op_ptr.deref(ctx);
-
-    for region in op.regions() {
-        let region_ref = region.deref(ctx);
-        for block in region_ref.iter(ctx) {
-            let block_ref = block.deref(ctx);
-            for child_op in block_ref.iter(ctx) {
-                if let Some(err) = find_inner_verification_error(ctx, child_op) {
-                    return Some(err);
-                }
-            }
-        }
-    }
-
-    if let Err(e) = op.verify(ctx) {
-        // Use .disp(ctx) to get full error with location and backtrace
-        return Some((op_ptr, e.disp(ctx).to_string()));
-    }
-
-    None
-}
-
-/// Errors from pipeline execution, categorized by stage.
-#[derive(Debug)]
-pub enum PipelineError {
-    /// Function has no MIR body (shouldn't happen for collected functions).
-    NoBody(String),
-    /// MIR→Pliron IR translation failed.
-    Translation(String),
-    /// Pliron IR verification failed (includes failing operation if found).
-    Verification {
-        name: String,
-        message: String,
-        operation: Option<String>,
-    },
-    /// MIR→LLVM lowering failed.
-    Lowering(String),
-    /// LLVM IR export failed.
-    Export(String),
-    /// PTX generation via `llc` failed.
-    PtxGeneration(String),
-}
-
-impl std::fmt::Display for PipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoBody(name) => write!(f, "Function '{}' has no MIR body", name),
-            Self::Translation(msg) => write!(f, "Translation failed: {}", msg),
-            Self::Verification {
-                name,
-                message,
-                operation,
-            } => {
-                writeln!(f, "Verification failed for '{}':", name)?;
-                writeln!(f, "  {}", message)?;
-                if let Some(op) = operation {
-                    writeln!(f, "  Failed operation:\n{}", op)?;
-                }
-                Ok(())
-            }
-            Self::Lowering(msg) => write!(f, "Lowering failed: {}", msg),
-            Self::Export(msg) => write!(f, "Export failed: {}", msg),
-            Self::PtxGeneration(msg) => write!(f, "PTX generation failed: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for PipelineError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dialect_llvm::export::AsDeviceExtern;
-    use std::{fs, path::PathBuf};
-
-    fn write_temp_ll(name: &str, contents: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "cuda_oxide_mir_importer_{}_{}.ll",
-            std::process::id(),
-            name
-        ));
-        fs::write(&path, contents).expect("write temp LLVM IR");
-        path
-    }
+    use std::fs;
 
     #[test]
     fn test_pipeline_config_default_values() {
@@ -988,183 +481,249 @@ mod tests {
         assert!(!config.show_mir_dialect);
         assert!(!config.show_llvm_dialect);
         assert!(!config.emit_nvvm_ir);
+        assert_eq!(config.target_arch, None);
+        assert_eq!(config.device_arch_hint, None);
+        assert_eq!(config.debug_kind, DebugKind::Off);
     }
 
     #[test]
-    fn test_device_extern_decl_converts_to_export_decl() {
-        let decl = DeviceExternDecl {
-            export_name: "device_add".to_string(),
-            param_types: vec!["ptr".to_string(), "i32".to_string()],
-            return_type: "void".to_string(),
-            attrs: DeviceExternAttrs {
-                is_convergent: true,
-                is_pure: false,
-                is_readonly: true,
-            },
+    fn stale_artifact_invalidation_removes_every_competing_output() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_stale_artifacts_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for suffix in [
+            "ll",
+            "linked.ll",
+            "linked.opt.ll",
+            "ptx",
+            "target",
+            "options",
+            "ltoir",
+            "cubin",
+            "cubin.target",
+        ] {
+            fs::write(root.join(format!("kernel.{suffix}")), b"stale").unwrap();
+        }
+        let cached_cubin =
+            root.join(".oxide-artifacts/ltoir-cubin-cache/v1/entries/key/image.cubin");
+        fs::create_dir_all(cached_cubin.parent().unwrap()).unwrap();
+        fs::write(&cached_cubin, b"persistent cache entry").unwrap();
+
+        let config = PipelineConfig {
+            output_dir: root.clone(),
+            output_name: "kernel".to_string(),
+            verbose: false,
+            show_mir_dialect: false,
+            show_llvm_dialect: false,
+            emit_nvvm_ir: true,
+            target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
+            device_arch_hint: None,
+            debug_kind: DebugKind::Off,
+            allow_fma_contraction: true,
+        };
+        let result = run_pipeline(&[], &[], &config).expect("pipeline run");
+
+        assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
+        assert_ne!(fs::read(&result.ll_path).unwrap(), b"stale");
+        for suffix in [
+            "linked.ll",
+            "linked.opt.ll",
+            "ptx",
+            "ltoir",
+            "cubin",
+            "cubin.target",
+        ] {
+            assert!(!root.join(format!("kernel.{suffix}")).exists(), "{suffix}");
+        }
+        assert_ne!(fs::read(root.join("kernel.target")).unwrap(), b"stale");
+        assert_ne!(fs::read(root.join("kernel.options")).unwrap(), b"stale");
+        assert_eq!(
+            fs::read(&cached_cubin).unwrap(),
+            b"persistent cache entry",
+            "content-addressed cache entries must survive compiler cleanup"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_pipeline_creates_missing_output_dir_before_export() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_mir_importer_output_dir_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let output_dir = root.join("fresh").join("nested");
+        fs::remove_dir_all(&root).ok();
+        assert!(!output_dir.exists());
+
+        let config = PipelineConfig {
+            output_dir: output_dir.clone(),
+            output_name: "empty".to_string(),
+            verbose: false,
+            show_mir_dialect: false,
+            show_llvm_dialect: false,
+            emit_nvvm_ir: true,
+            target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
+            device_arch_hint: None,
+            debug_kind: DebugKind::Off,
+            allow_fma_contraction: true,
         };
 
-        let exported = decl.as_device_extern();
+        let result = run_pipeline(&[], &[], &config).expect("pipeline run");
 
-        assert_eq!(exported.export_name, "device_add");
-        assert_eq!(exported.param_types, ["ptr", "i32"]);
-        assert_eq!(exported.return_type, "void");
-        assert!(exported.attrs.is_convergent);
-        assert!(!exported.attrs.is_pure);
-        assert!(exported.attrs.is_readonly);
+        assert!(output_dir.is_dir());
+        assert!(result.ll_path.is_file());
+        assert_eq!(result.artifact_path, result.ll_path);
+        assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
+        assert_eq!(result.target, "sm_86");
+        assert_eq!(
+            fs::read_to_string(output_dir.join("empty.target")).unwrap(),
+            format!(
+                "sm_86\n{}\n",
+                oxide_artifacts::COMPILE_OPTIONS_TARGET_MARKER
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("empty.options")).unwrap(),
+            oxide_artifacts::ArtifactCompileOptions::new()
+                .with_fma_contraction(true)
+                .sidecar_text()
+        );
+
+        fs::remove_dir_all(&root).expect("clean up temp output dir");
     }
 
     #[test]
-    fn test_feature_detection_reads_llvm_ir_snippets() {
-        let path = write_temp_ll(
-            "features",
-            r#"
-                call void asm sideeffect "wgmma.fence.sync.aligned", ""()
-                call void @llvm.nvvm.tcgen05.alloc()
-                call void asm sideeffect "cluster.sync.aligned", ""()
-                call void asm sideeffect "cp.async.bulk.tensor.2d.shared::cluster.global", ""()
-            "#,
-        );
+    fn nvvm_sidecar_preserves_deferred_debug_policy() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_nvvm_debug_options_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&root).unwrap();
 
-        assert!(contains_wgmma_features(&path));
-        assert!(contains_blackwell_features(&path));
-        assert!(contains_cluster_features(&path));
-        assert!(contains_tma_features(&path));
+        for (name, debug_kind, expected_debug) in [
+            (
+                "off",
+                DebugKind::Off,
+                oxide_artifacts::ArtifactDebugPolicy::None,
+            ),
+            (
+                "lines",
+                DebugKind::LineTables,
+                oxide_artifacts::ArtifactDebugPolicy::LineTables,
+            ),
+            (
+                "full",
+                DebugKind::Full,
+                oxide_artifacts::ArtifactDebugPolicy::Full,
+            ),
+        ] {
+            write_nvvm_compile_options_sidecar(&root, name, false, debug_kind).unwrap();
+            let text = fs::read_to_string(root.join(format!("{name}.options"))).unwrap();
+            let options =
+                oxide_artifacts::ArtifactCompileOptions::from_sidecar_text(&text).unwrap();
+            assert!(!options.fma_contraction_enabled());
+            assert_eq!(options.debug_policy(), expected_debug);
+        }
 
-        let _ = fs::remove_file(path);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn test_tma_multicast_detection_requires_cta_mask() {
-        let multicast = write_temp_ll(
-            "tma_multicast",
-            "call void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile(i32 0, i1 1, i1 false)",
-        );
-        let unicast = write_temp_ll(
-            "tma_unicast",
-            "call void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile(i32 0, i1 0, i1 false)",
-        );
-
-        assert!(contains_tma_multicast(&multicast));
-        assert!(!contains_tma_multicast(&unicast));
-
-        let _ = fs::remove_file(multicast);
-        let _ = fs::remove_file(unicast);
-    }
-
-    #[test]
-    fn test_select_target_prefers_required_architecture() {
-        assert_eq!(select_target(DetectedFeatures::Blackwell), "sm_100a");
-        assert_eq!(select_target(DetectedFeatures::TmaMulticast), "sm_100a");
-        assert_eq!(select_target(DetectedFeatures::Wgmma), "sm_90a");
-        assert_eq!(select_target(DetectedFeatures::Tma), "sm_100");
-        assert_eq!(select_target(DetectedFeatures::Cluster), "sm_90");
-        assert_eq!(select_target(DetectedFeatures::Basic), "sm_80");
-    }
-
-    /// Build a minimal `dialect-llvm` module containing a single function
-    /// declaration named `name`. The module is intentionally empty otherwise;
-    /// the auto-detect logic only inspects the symbol name on declarations
-    /// and on direct call sites.
-    fn build_module_with_func_decl(ctx: &mut Context, name: &str) -> Ptr<Operation> {
-        use dialect_llvm::ops::FuncOp as LlvmFuncOp;
-        use dialect_llvm::types::FuncType as LlvmFuncType;
-        use pliron::basic_block::BasicBlock;
-        use pliron::builtin::ops::ModuleOp;
-        use pliron::builtin::types::{IntegerType, Signedness};
-
-        dialect_llvm::register(ctx);
-        let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
-        let module_ptr = module.get_operation();
-        let module_region = module_ptr.deref(ctx).get_region(0);
-
-        let module_block = {
-            let region_ref = module_region.deref(ctx);
-            if let Some(first_block) = region_ref.iter(ctx).next() {
-                first_block
-            } else {
-                drop(region_ref);
-                let new_block = BasicBlock::new(ctx, None, vec![]);
-                new_block.insert_at_back(module_region, ctx);
-                new_block
-            }
+    fn structured_device_extern_survives_pre_lowering_insertion() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_mir_importer_extern_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let config = PipelineConfig {
+            output_dir: root.clone(),
+            output_name: "extern_only".to_string(),
+            verbose: false,
+            show_mir_dialect: false,
+            show_llvm_dialect: false,
+            emit_nvvm_ir: true,
+            target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
+            device_arch_hint: None,
+            debug_kind: DebugKind::Off,
+            allow_fma_contraction: true,
         };
+        let externs = [DeviceExternDecl {
+            export_name: "consume_float".to_string(),
+            param_types: vec![DeviceExternType::pointer_to(DeviceExternType::Float32, 0)],
+            return_type: DeviceExternType::Void,
+            attrs: DeviceExternAttrs::default(),
+        }];
 
-        let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
-        let func_ty = LlvmFuncType::get(ctx, i32_ty.into(), vec![i32_ty.into()], false);
-        let func = LlvmFuncOp::new(ctx, name.try_into().unwrap(), func_ty);
-        func.get_operation().insert_at_back(module_block, ctx);
+        let result = run_pipeline(&[], &externs, &config).expect("pipeline run");
+        let ir = fs::read_to_string(result.ll_path).expect("read exported IR");
+        assert!(
+            ir.contains("declare void @consume_float(float*)"),
+            "structured pointee must survive through export:\n{ir}"
+        );
+        assert!(
+            !ir.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == "ptr"),
+            "legacy device-extern output must not contain opaque pointers:\n{ir}"
+        );
 
-        module_ptr
+        fs::remove_dir_all(&root).expect("clean up temp output dir");
     }
 
     #[test]
-    fn test_module_uses_libdevice_detects_nv_func_decl() {
-        let mut ctx = Context::new();
-        let module_ptr = build_module_with_func_decl(&mut ctx, "__nv_sqrtf");
-        assert!(
-            module_uses_libdevice(&ctx, module_ptr),
-            "module containing `__nv_*` function declaration must be flagged"
+    fn an_explicit_config_target_is_labelled_as_its_own_source() {
+        let config = PipelineConfig {
+            target_arch: Some("sm_86".to_string()),
+            ..PipelineConfig::default()
+        };
+        let options = backend_options_for(&config);
+        assert_eq!(options.target_arch.as_deref(), Some("sm_86"));
+        assert_eq!(options.target_arch_source, "PipelineConfig::target_arch");
+    }
+
+    #[test]
+    fn a_caller_supplied_label_survives_the_override() {
+        let config = PipelineConfig {
+            target_arch: Some("sm_86".to_string()),
+            target_arch_source: "cargo oxide --arch",
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            backend_options_for(&config).target_arch_source,
+            "cargo oxide --arch"
         );
     }
 
     #[test]
-    fn test_module_uses_libdevice_ignores_unrelated_funcs() {
-        let mut ctx = Context::new();
-        let module_ptr = build_module_with_func_decl(&mut ctx, "kernel_main");
-        assert!(
-            !module_uses_libdevice(&ctx, module_ptr),
-            "module without any `__nv_*` symbols must not be flagged"
-        );
-    }
-
-    #[test]
-    fn test_module_uses_libdevice_does_not_match_partial_prefix() {
-        // "__nvm_foo" starts with "__nv" but not "__nv_". The detection rule
-        // is the full `__nv_` prefix, so this must not trigger auto-detect.
-        let mut ctx = Context::new();
-        let module_ptr = build_module_with_func_decl(&mut ctx, "__nvm_foo");
-        assert!(
-            !module_uses_libdevice(&ctx, module_ptr),
-            "names starting with `__nv` but not `__nv_` must not be flagged"
-        );
-    }
-
-    /// `module_uses_libdevice` must also fire when the libdevice symbol
-    /// appears as the callee of a direct `CallOp` -- this is the realistic
-    /// case where a normal kernel calls `__nv_sqrtf`. The auto-detect
-    /// recursion has to walk through the module region and visit the
-    /// `CallOp` even when no enclosing `FuncOp` matches the prefix rule.
-    #[test]
-    fn test_module_uses_libdevice_detects_direct_nv_call() {
-        use dialect_llvm::ops::CallOp as LlvmCallOp;
-        use dialect_llvm::types::FuncType as LlvmFuncType;
-        use pliron::basic_block::BasicBlock;
-        use pliron::builtin::ops::ModuleOp;
-        use pliron::builtin::types::{IntegerType, Signedness};
-
-        let mut ctx = Context::new();
-        dialect_llvm::register(&mut ctx);
-
-        let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
-        let module_ptr = module.get_operation();
-        let module_region = module_ptr.deref(&ctx).get_region(0);
-        let module_block = BasicBlock::new(&mut ctx, None, vec![]);
-        module_block.insert_at_back(module_region, &ctx);
-
-        let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
-        let callee_ty = LlvmFuncType::get(&mut ctx, i32_ty.into(), vec![], false);
-        let callee_ident: pliron::identifier::Identifier = "__nv_sqrtf".try_into().unwrap();
-        let nv_call = LlvmCallOp::new(
-            &mut ctx,
-            CallOpCallable::Direct(callee_ident),
-            callee_ty,
-            vec![],
-        );
-        nv_call.get_operation().insert_at_back(module_block, &ctx);
-
-        assert!(
-            module_uses_libdevice(&ctx, module_ptr),
-            "direct call to a `__nv_*` symbol must be detected"
+    fn the_env_label_stands_when_the_config_sets_no_target() {
+        let config = PipelineConfig::default();
+        assert_eq!(config.target_arch, None);
+        assert_eq!(
+            backend_options_for(&config).target_arch_source,
+            "CUDA_OXIDE_TARGET"
         );
     }
 }

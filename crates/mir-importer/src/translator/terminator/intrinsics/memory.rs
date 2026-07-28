@@ -4,300 +4,30 @@
  */
 
 //! Memory access and conversion intrinsics.
-//!
-//! Handles shared memory indexing, matrix stores, and type conversions.
 
 use super::super::helpers::{emit_goto, emit_store_result_and_goto};
 use crate::error::{TranslationErr, TranslationResult};
-use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
+use crate::translator::{rvalue, types};
 use dialect_mir::attributes::MirCastKindAttr;
-use dialect_mir::ops::MirCastOp;
-use dialect_nvvm::ops::{
-    CvtF32x2Bf16x2Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp, StmatrixM8n8X4Op,
-    StmatrixM8n8X4TransOp,
-};
+use dialect_mir::ops::{MirCastOp, MirConstantOp, MirDivOp, MirSubOp};
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::types::{IntegerType, Signedness};
+use pliron::builtin::attributes::IntegerAttr;
+use pliron::builtin::types::IntegerType;
 use pliron::context::{Context, Ptr};
 use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
+use pliron::utils::apint::APInt;
+use pliron::value::Value;
 use rustc_public::mir;
-/// Emits `stmatrix.m8n8.x4`: Warp-cooperative matrix store (4 tiles).
-///
-/// Stores 4 matrix tiles (32 columns) to shared memory using the warp-cooperative
-/// stmatrix instruction. Each thread contributes its fragment data.
-///
-/// # Arguments
-///
-/// - `args[0]`: `*mut u8` - Destination pointer in shared memory
-/// - `args[1-4]`: `u32` - Register values (r0, r1, r2, r3)
-///
-/// # PTX Instruction
-///
-/// `stmatrix.sync.aligned.m8n8.x4.shared.b16`
-pub fn emit_stmatrix_m8n8_x4(
-    ctx: &mut Context,
-    body: &mir::Body,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if args.len() != 5 {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "stmatrix_m8n8_x4 expects 5 arguments (smem_ptr, r0, r1, r2, r3), got {}",
-                args.len()
-            ))
-        );
-    }
-
-    let mut last_op = prev_op;
-    let mut operands = Vec::with_capacity(5);
-
-    for arg in args.iter().take(5) {
-        let (val, last_op_after) =
-            rvalue::translate_operand(ctx, body, arg, value_map, block_ptr, last_op, loc.clone())?;
-        last_op = last_op_after;
-        operands.push(val);
-    }
-
-    let st_op = Operation::new(
-        ctx,
-        StmatrixM8n8X4Op::get_concrete_op_info(),
-        vec![],
-        operands,
-        vec![],
-        0,
-    );
-    st_op.deref_mut(ctx).set_loc(loc.clone());
-
-    if let Some(prev) = last_op {
-        st_op.insert_after(ctx, prev);
-    } else {
-        st_op.insert_at_front(block_ptr, ctx);
-    }
-
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, st_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported("stmatrix_m8n8_x4 call without target block".to_string())
-        )
-    }
-}
-
-/// Emit stmatrix_m8n8_x4_trans: Warp-cooperative matrix store with transpose.
-///
-/// This version uses the `.trans` modifier to transform data from fragment
-/// layout to row-major layout during the store operation.
-///
-/// Args: (smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3: u32)
-///       where each u32 contains 2 packed bf16 values
-/// Returns: void
-pub fn emit_stmatrix_m8n8_x4_trans(
-    ctx: &mut Context,
-    body: &mir::Body,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if args.len() != 5 {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "stmatrix_m8n8_x4_trans expects 5 arguments (smem_ptr, r0, r1, r2, r3), got {}",
-                args.len()
-            ))
-        );
-    }
-
-    let mut last_op = prev_op;
-    let mut operands = Vec::with_capacity(5);
-
-    for arg in args.iter().take(5) {
-        let (val, last_op_after) =
-            rvalue::translate_operand(ctx, body, arg, value_map, block_ptr, last_op, loc.clone())?;
-        last_op = last_op_after;
-        operands.push(val);
-    }
-
-    let st_op = Operation::new(
-        ctx,
-        StmatrixM8n8X4TransOp::get_concrete_op_info(),
-        vec![],
-        operands,
-        vec![],
-        0,
-    );
-    st_op.deref_mut(ctx).set_loc(loc.clone());
-
-    if let Some(prev) = last_op {
-        st_op.insert_after(ctx, prev);
-    } else {
-        st_op.insert_at_front(block_ptr, ctx);
-    }
-
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, st_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(
-                "stmatrix_m8n8_x4_trans call without target block".to_string()
-            )
-        )
-    }
-}
-
-/// Emit tcgen05_ld_16x256b_x8_pure: Pure TMEM load returning 32 f32 values.
-///
-/// Unlike emit_tcgen05_ld_16x256b_x8, this returns values in registers (no SMEM store).
-/// The result is a struct with 32 f32 values that can be used for subsequent operations.
-///
-/// Args: (tmem_addr: u32)
-pub fn emit_stmatrix_m8n8_x2(
-    ctx: &mut Context,
-    body: &mir::Body,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if args.len() != 3 {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "stmatrix_m8n8_x2 expects 3 arguments (smem_ptr, r0, r1), got {}",
-                args.len()
-            ))
-        );
-    }
-
-    let mut last_op = prev_op;
-    let mut operands = Vec::with_capacity(3);
-
-    for arg in args.iter().take(3) {
-        let (val, last_op_after) =
-            rvalue::translate_operand(ctx, body, arg, value_map, block_ptr, last_op, loc.clone())?;
-        last_op = last_op_after;
-        operands.push(val);
-    }
-
-    let st_op = Operation::new(
-        ctx,
-        StmatrixM8n8X2Op::get_concrete_op_info(),
-        vec![],
-        operands,
-        vec![],
-        0,
-    );
-    st_op.deref_mut(ctx).set_loc(loc.clone());
-
-    if let Some(prev) = last_op {
-        st_op.insert_after(ctx, prev);
-    } else {
-        st_op.insert_at_front(block_ptr, ctx);
-    }
-
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, st_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported("stmatrix_m8n8_x2 call without target block".to_string())
-        )
-    }
-}
-
-/// Emit stmatrix.m8n8.x2.trans - TRANSPOSE version matching cuBLAS STSM.16.MT88.2.
-///
-/// Args: (smem_ptr: *mut u8, r0: u32, r1: u32)
-///       where each u32 contains 2 packed bf16 values
-/// Returns: void
-pub fn emit_stmatrix_m8n8_x2_trans(
-    ctx: &mut Context,
-    body: &mir::Body,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if args.len() != 3 {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "stmatrix_m8n8_x2_trans expects 3 arguments (smem_ptr, r0, r1), got {}",
-                args.len()
-            ))
-        );
-    }
-
-    let mut last_op = prev_op;
-    let mut operands = Vec::with_capacity(3);
-
-    for arg in args.iter().take(3) {
-        let (val, last_op_after) =
-            rvalue::translate_operand(ctx, body, arg, value_map, block_ptr, last_op, loc.clone())?;
-        last_op = last_op_after;
-        operands.push(val);
-    }
-
-    let st_op = Operation::new(
-        ctx,
-        StmatrixM8n8X2TransOp::get_concrete_op_info(),
-        vec![],
-        operands,
-        vec![],
-        0,
-    );
-    st_op.deref_mut(ctx).set_loc(loc.clone());
-
-    if let Some(prev) = last_op {
-        st_op.insert_after(ctx, prev);
-    } else {
-        st_op.insert_at_front(block_ptr, ctx);
-    }
-
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, st_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(
-                "stmatrix_m8n8_x2_trans call without target block".to_string()
-            )
-        )
-    }
-}
-
-/// Emit cvt_f32x2_bf16x2: Convert two f32 to packed bf16x2.
-///
-/// Args: (a: f32, b: f32)
-pub fn emit_cvt_f32x2_bf16x2(
+use std::num::NonZeroUsize;
+/// Emits `core::intrinsics::volatile_load::<T>(ptr)`, which backs
+/// `core::ptr::read_volatile`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_volatile_load(
     ctx: &mut Context,
     body: &mir::Body,
     args: &[mir::Operand],
@@ -309,32 +39,130 @@ pub fn emit_cvt_f32x2_bf16x2(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    if args.len() != 2 {
+    use dialect_mir::ops::MirLoadOp;
+    use dialect_mir::types::MirPtrType;
+
+    if args.len() != 1 {
         return input_err!(
             loc.clone(),
             TranslationErr::unsupported(format!(
-                "cvt_f32x2_bf16x2 expects 2 arguments (a: f32, b: f32), got {}",
+                "volatile_load expects 1 argument (ptr), got {}",
                 args.len()
             ))
         );
     }
 
-    let mut last_op = prev_op;
-
-    // arg[0]: a (f32)
-    let (a_val, last_op_after) = rvalue::translate_operand(
+    let (ptr_val, last_op) = rvalue::translate_operand(
         ctx,
         body,
         &args[0],
         value_map,
         block_ptr,
-        last_op,
+        prev_op,
         loc.clone(),
     )?;
-    last_op = last_op_after;
 
-    // arg[1]: b (f32)
-    let (b_val, last_op_after) = rvalue::translate_operand(
+    let elem_ty = {
+        let ptr_ty = ptr_val.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+        match ptr_ty_obj.downcast_ref::<MirPtrType>() {
+            Some(mir_ptr) => mir_ptr.pointee,
+            None => {
+                return input_err!(
+                    loc.clone(),
+                    TranslationErr::unsupported(format!(
+                        "volatile_load: expected pointer operand, got {:?}",
+                        ptr_ty_obj
+                    ))
+                );
+            }
+        }
+    };
+
+    let load_op = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_val],
+        vec![],
+        0,
+    );
+    load_op.deref_mut(ctx).set_loc(loc.clone());
+    MirLoadOp::new(load_op).set_volatile(ctx, true);
+
+    if let Some(prev) = last_op {
+        load_op.insert_after(ctx, prev);
+    } else {
+        load_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let result = load_op.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        load_op,
+        value_map,
+        block_map,
+        loc,
+        "volatile_load call without target block",
+    )
+}
+
+/// Emits `core::intrinsics::volatile_store::<T>(ptr, value)`, which backs
+/// `core::ptr::write_volatile`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_volatile_store(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::MirStoreOp;
+    use dialect_mir::types::MirPtrType;
+
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "volatile_store expects 2 arguments (ptr, value), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (ptr_val, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    {
+        let ptr_ty = ptr_val.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+        if ptr_ty_obj.downcast_ref::<MirPtrType>().is_none() {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "volatile_store: expected pointer operand, got {:?}",
+                    ptr_ty_obj
+                ))
+            );
+        }
+    }
+
+    let (value, last_op) = rvalue::translate_operand(
         ctx,
         body,
         &args[1],
@@ -343,42 +171,351 @@ pub fn emit_cvt_f32x2_bf16x2(
         last_op,
         loc.clone(),
     )?;
-    last_op = last_op_after;
 
-    // Result is u32 (packed bf16x2); Rust-side signature is `u32` and the
-    // destination local is unsigned, so match that here to avoid the
-    // MirStoreOp verifier flagging a signless-vs-unsigned mismatch.
-    let u32_ty = IntegerType::get(ctx, 32, Signedness::Unsigned);
-
-    let cvt_op = Operation::new(
+    let store_op = Operation::new(
         ctx,
-        CvtF32x2Bf16x2Op::get_concrete_op_info(),
-        vec![u32_ty.into()],
-        vec![a_val, b_val],
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_val, value],
         vec![],
         0,
     );
-    cvt_op.deref_mut(ctx).set_loc(loc.clone());
+    store_op.deref_mut(ctx).set_loc(loc.clone());
+    MirStoreOp::new(store_op).set_volatile(ctx, true);
 
     if let Some(prev) = last_op {
-        cvt_op.insert_after(ctx, prev);
+        store_op.insert_after(ctx, prev);
     } else {
-        cvt_op.insert_at_front(block_ptr, ctx);
+        store_op.insert_at_front(block_ptr, ctx);
     }
 
-    let result = cvt_op.deref(ctx).get_result(0);
+    if let Some(target_idx) = target {
+        Ok(emit_goto(ctx, *target_idx, store_op, block_map, loc))
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported("volatile_store call without target block".to_string())
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PtrOffsetFromResult {
+    Signed,
+    Unsigned,
+}
+
+impl PtrOffsetFromResult {
+    fn result_type(
+        self,
+        ctx: &mut Context,
+    ) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
+        match self {
+            Self::Signed => types::get_isize_type(ctx),
+            Self::Unsigned => types::get_usize_type(ctx),
+        }
+    }
+
+    fn intrinsic_name(self) -> &'static str {
+        match self {
+            Self::Signed => "ptr_offset_from",
+            Self::Unsigned => "ptr_offset_from_unsigned",
+        }
+    }
+
+    fn missing_target_message(self) -> &'static str {
+        match self {
+            Self::Signed => "ptr_offset_from call without target block",
+            Self::Unsigned => "ptr_offset_from_unsigned call without target block",
+        }
+    }
+}
+
+/// Emits `core::intrinsics::ptr_offset_from::<T>(this, other) -> isize`.
+///
+/// Computes `(this.addr() - other.addr()) / size_of::<T>()`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_ptr_offset_from(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_ptr_offset_from_with_result(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        PtrOffsetFromResult::Signed,
+    )
+}
+
+/// Emits `core::intrinsics::ptr_offset_from_unsigned::<T>(this, other) -> usize`.
+///
+/// Computes `(this.addr() - other.addr()) / size_of::<T>()`. The intrinsic
+/// contract guarantees `this >= other` and an exact multiple.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_ptr_offset_from_unsigned(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_ptr_offset_from_with_result(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        PtrOffsetFromResult::Unsigned,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ptr_offset_from_with_result(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    result_kind: PtrOffsetFromResult,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "{} expects 2 arguments (this, other), got {}",
+                result_kind.intrinsic_name(),
+                args.len()
+            ))
+        );
+    }
+
+    let elem_size = pointee_size_bytes(body, &args[0], result_kind.intrinsic_name(), loc.clone())?;
+    let result_ty = result_kind.result_type(ctx);
+    let result_type = result_ty.to_handle();
+
+    let (this_ptr, op_after_this) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let this_addr = emit_pointer_expose_address(
+        ctx,
+        this_ptr,
+        result_type,
+        op_after_this,
+        block_ptr,
+        loc.clone(),
+    );
+
+    let (other_ptr, op_after_other) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        Some(this_addr),
+        loc.clone(),
+    )?;
+    let other_addr = emit_pointer_expose_address(
+        ctx,
+        other_ptr,
+        result_type,
+        op_after_other,
+        block_ptr,
+        loc.clone(),
+    );
+
+    let this_addr_val = this_addr.deref(ctx).get_result(0);
+    let other_addr_val = other_addr.deref(ctx).get_result(0);
+    let sub_op = Operation::new(
+        ctx,
+        MirSubOp::get_concrete_op_info(),
+        vec![result_type],
+        vec![this_addr_val, other_addr_val],
+        vec![],
+        0,
+    );
+    sub_op.deref_mut(ctx).set_loc(loc.clone());
+    sub_op.insert_after(ctx, other_addr);
+    let byte_diff = sub_op.deref(ctx).get_result(0);
+
+    let size_const = emit_integer_constant(ctx, result_ty, elem_size, sub_op, loc.clone())?;
+    let size_val = size_const.deref(ctx).get_result(0);
+
+    let div_op = Operation::new(
+        ctx,
+        MirDivOp::get_concrete_op_info(),
+        vec![result_type],
+        vec![byte_diff, size_val],
+        vec![],
+        0,
+    );
+    div_op.deref_mut(ctx).set_loc(loc.clone());
+    div_op.insert_after(ctx, size_const);
+    let result = div_op.deref(ctx).get_result(0);
+
     emit_store_result_and_goto(
         ctx,
         destination,
         result,
         target,
         block_ptr,
-        cvt_op,
+        div_op,
         value_map,
         block_map,
         loc,
-        "cvt_f32x2_bf16x2 call without target block",
+        result_kind.missing_target_message(),
     )
+}
+
+fn pointee_size_bytes(
+    body: &mir::Body,
+    operand: &mir::Operand,
+    intrinsic_name: &str,
+    loc: Location,
+) -> TranslationResult<u64> {
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let operand_ty = match operand {
+        mir::Operand::Copy(place) | mir::Operand::Move(place) => place.ty(body.locals()).ok(),
+        mir::Operand::Constant(constant) => Some(constant.const_.ty()),
+        mir::Operand::RuntimeChecks(_) => None,
+    };
+    let Some(operand_ty) = operand_ty else {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "{intrinsic_name}: cannot determine pointer operand type"
+            ))
+        );
+    };
+
+    let pointee = match operand_ty.kind() {
+        TyKind::RigidTy(RigidTy::RawPtr(pointee, _))
+        | TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => pointee,
+        other => {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "{intrinsic_name}: expected raw pointer or reference operand, got {other:?}"
+                ))
+            );
+        }
+    };
+
+    let layout = match pointee.layout() {
+        Ok(layout) => layout,
+        Err(err) => {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "{intrinsic_name}: failed to query pointee layout: {err:?}"
+                ))
+            );
+        }
+    };
+    let size = layout.shape().size.bytes() as u64;
+    if size == 0 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "{intrinsic_name}: zero-sized pointee type has no element distance"
+            ))
+        );
+    }
+    Ok(size)
+}
+
+fn emit_pointer_expose_address(
+    ctx: &mut Context,
+    ptr: Value,
+    result_type: pliron::r#type::TypeHandle,
+    insert_after: Option<Ptr<Operation>>,
+    block_ptr: Ptr<BasicBlock>,
+    loc: Location,
+) -> Ptr<Operation> {
+    let cast_op = Operation::new(
+        ctx,
+        MirCastOp::get_concrete_op_info(),
+        vec![result_type],
+        vec![ptr],
+        vec![],
+        0,
+    );
+    cast_op.deref_mut(ctx).set_loc(loc);
+    MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::PointerExposeAddress);
+    if let Some(prev) = insert_after {
+        cast_op.insert_after(ctx, prev);
+    } else {
+        cast_op.insert_at_front(block_ptr, ctx);
+    }
+    cast_op
+}
+
+fn emit_integer_constant(
+    ctx: &mut Context,
+    ty: pliron::r#type::TypedHandle<IntegerType>,
+    value: u64,
+    insert_after: Ptr<Operation>,
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    let value_i64 = i64::try_from(value).map_err(|_| {
+        pliron::input_error!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "ptr_offset_from pointee size {value} does not fit in isize"
+            ))
+        )
+    })?;
+    let bits = ty.deref(ctx).width() as usize;
+    let apint = APInt::from_i64(value_i64, NonZeroUsize::new(bits).unwrap());
+    let size_attr = IntegerAttr::new(ty, apint);
+    let const_op = Operation::new(
+        ctx,
+        MirConstantOp::get_concrete_op_info(),
+        vec![ty.to_handle()],
+        vec![],
+        vec![],
+        0,
+    );
+    const_op.deref_mut(ctx).set_loc(loc);
+    MirConstantOp::new(const_op).set_attr_value(ctx, size_attr);
+    const_op.insert_after(ctx, insert_after);
+    Ok(const_op)
 }
 
 /// Emits `SharedArray::index()`: Compute pointer to element in shared memory.

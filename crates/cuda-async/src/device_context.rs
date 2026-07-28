@@ -6,7 +6,7 @@
 //! Thread-local GPU device state, kernel cache, and scheduling policy management.
 //!
 //! Each thread maintains a set of [`AsyncDeviceContext`]s (one per device) via
-//! the [`DEVICE_CONTEXTS`] thread-local. A context bundles:
+//! the `DEVICE_CONTEXTS` thread-local. A context bundles:
 //!
 //! * A [`CudaContext`] for driver API calls.
 //! * A [`GlobalSchedulingPolicy`] for stream selection.
@@ -22,15 +22,15 @@
 use crate::error::{DeviceError, device_assert, device_error};
 use crate::scheduling_policies::{GlobalSchedulingPolicy, SchedulingPolicy, StreamPoolRoundRobin};
 use cuda_core::{CudaContext, CudaFunction, CudaModule, CudaStream};
+use rustc_hash::FxHashMap;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 /// Default CUDA device ordinal used when no explicit device is specified.
 pub const DEFAULT_DEVICE_ID: usize = 0;
 
-/// Default number of devices initialized by [`init_device_contexts_default`].
+/// Default number of devices initialized by `init_device_contexts_default`.
 pub const DEFAULT_NUM_DEVICES: usize = 1;
 
 /// Default number of streams in the [`StreamPoolRoundRobin`] policy.
@@ -49,7 +49,7 @@ pub trait FunctionKey: Hash {
 }
 
 /// Cached mapping from function hash keys to loaded `(module, function)` pairs.
-type DeviceFunctions = HashMap<String, (Arc<CudaModule>, Arc<CudaFunction>)>;
+type DeviceFunctions = FxHashMap<String, (Arc<CudaModule>, Arc<CudaFunction>)>;
 
 /// Per-device state: CUDA context, scheduling policy, deallocator stream, and
 /// compiled-kernel cache.
@@ -77,7 +77,7 @@ pub struct AsyncDeviceContexts {
     /// Currently selected default device ordinal.
     default_device: Cell<usize>,
     /// Lazily initialized map of device ordinal to context.
-    devices: Cell<Option<HashMap<usize, AsyncDeviceContext>>>,
+    devices: Cell<Option<FxHashMap<usize, AsyncDeviceContext>>>,
 }
 
 // Thread-local storage for per-device CUDA state.
@@ -105,13 +105,16 @@ pub fn init_device_contexts(
     num_devices: usize,
 ) -> Result<(), DeviceError> {
     DEVICE_CONTEXTS.with(|ctx| {
+        let devices = ctx.devices.take();
+        let is_uninitialized = devices.is_none();
+        ctx.devices.set(devices);
         device_assert(
             default_device_id,
-            ctx.devices.replace(None).is_none(),
+            is_uninitialized,
             "Context already initialized.",
         )
     })?;
-    let devices = HashMap::with_capacity(num_devices);
+    let devices = FxHashMap::with_capacity_and_hasher(num_devices, Default::default());
     DEVICE_CONTEXTS.with(|ctx| {
         ctx.default_device.set(default_device_id);
         ctx.devices.set(Some(devices));
@@ -141,14 +144,14 @@ pub fn new_device_context(
         context,
         deallocator_stream,
         policy: Arc::new(policy),
-        functions: HashMap::new(),
+        functions: FxHashMap::default(),
     })
 }
 
 /// Inserts a new device context into `hashmap`. Errors if the device is
 /// already present.
 fn init_device(
-    hashmap: &mut HashMap<usize, AsyncDeviceContext>,
+    hashmap: &mut FxHashMap<usize, AsyncDeviceContext>,
     device_id: usize,
     policy: GlobalSchedulingPolicy,
 ) -> Result<(), DeviceError> {
@@ -159,7 +162,7 @@ fn init_device(
 
 /// Initializes a device with the default round-robin policy.
 fn init_with_default_policy(
-    hashmap: &mut HashMap<usize, AsyncDeviceContext>,
+    hashmap: &mut FxHashMap<usize, AsyncDeviceContext>,
     device_id: usize,
 ) -> Result<(), DeviceError> {
     let policy =
@@ -326,4 +329,31 @@ pub fn get_cuda_function(
             .ok_or_else(|| device_error(device_id, "Failed to get cuda function."))?;
         Ok(Arc::clone(function))
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_duplicate_init_error(result: Result<(), DeviceError>) {
+        assert!(matches!(
+            result,
+            Err(DeviceError::Context {
+                device_id: 0,
+                message,
+            }) if message == "Context already initialized."
+        ));
+    }
+
+    #[test]
+    fn duplicate_init_preserves_existing_device_contexts() {
+        std::thread::spawn(|| {
+            init_device_contexts(0, 1).expect("initial context initialization should succeed");
+
+            assert_duplicate_init_error(init_device_contexts(0, 1));
+            assert_duplicate_init_error(init_device_contexts(0, 1));
+        })
+        .join()
+        .expect("test thread should not panic");
+    }
 }

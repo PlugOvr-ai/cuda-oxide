@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Call operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Call operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Handles function call lowering with ABI-level transformations:
 //! - Slice arguments flattened to (ptr, len) pairs
@@ -62,15 +62,23 @@
 //! mismatch.
 
 use crate::convert::types::{
-    convert_function_type, convert_type, is_kernel_func, is_zero_sized_type,
+    StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
+    is_zero_sized_type,
 };
 use crate::helpers;
-use dialect_llvm::op_interfaces::CastOpInterface;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::types as llvm_types;
 use dialect_mir::ops::{MirCallOp, MirFuncOp};
 use dialect_mir::rust_intrinsics;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
+use llvm_export::attributes::{
+    FCmpPredicateAttr, FastmathFlags, FastmathFlagsAttr, IntegerOverflowFlagsAttr,
+};
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, FloatBinArithOpWithFastMathFlags,
+    IntBinArithOpWithOverflowFlag,
+};
+use llvm_export::ops as llvm;
+use llvm_export::types as llvm_types;
+use llvm_export::types::PointerTypeExt;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::op_interfaces::{CallOpCallable, SymbolOpInterface};
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -84,7 +92,7 @@ use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
-use pliron::r#type::{TypeObj, Typed};
+use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use std::num::NonZeroUsize;
@@ -147,6 +155,38 @@ impl RustSaturatingIntrinsic {
     }
 }
 
+/// Internal placeholder for `core::intrinsics::exact_div`.
+///
+/// The caller has promised the divisor is non-zero and divides the dividend
+/// exactly, so this lowers to a plain `sdiv`/`udiv` with no zero check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RustExactDivIntrinsic;
+
+impl RustExactDivIntrinsic {
+    /// Convert an importer placeholder name back into the intrinsic it represents.
+    fn from_placeholder_callee(callee: &str) -> Option<Self> {
+        (callee == rust_intrinsics::CALLEE_EXACT_DIV).then_some(Self)
+    }
+}
+
+/// Internal placeholder for rustc bigint helper intrinsics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustBigIntIntrinsic {
+    /// `core::intrinsics::carrying_mul_add`: double-width
+    /// multiply-accumulate returning a `(low, high)` pair.
+    CarryingMulAdd,
+}
+
+impl RustBigIntIntrinsic {
+    /// Convert an importer placeholder name back into the intrinsic it represents.
+    fn from_placeholder_callee(callee: &str) -> Option<Self> {
+        match callee {
+            rust_intrinsics::CALLEE_CARRYING_MUL_ADD => Some(Self::CarryingMulAdd),
+            _ => None,
+        }
+    }
+}
+
 /// Internal placeholder for rustc float math intrinsics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RustFloatMathIntrinsic {
@@ -189,6 +229,37 @@ enum RustFloatMathIntrinsic {
     Fabs,
     CopysignF32,
     CopysignF64,
+    MaxNumNszF32,
+    MaxNumNszF64,
+    MinNumNszF32,
+    MinNumNszF64,
+    AsinF32,
+    AsinF64,
+    AcosF32,
+    AcosF64,
+    Atan2F32,
+    Atan2F64,
+    AtanF32,
+    AtanF64,
+    CbrtF32,
+    CbrtF64,
+    SinhF32,
+    SinhF64,
+    CoshF32,
+    CoshF64,
+    TanhF32,
+    TanhF64,
+    Expm1F32,
+    Expm1F64,
+    Log1pF32,
+    Log1pF64,
+    HypotF32,
+    HypotF64,
+    FaddFast,
+    FsubFast,
+    FmulFast,
+    FdivFast,
+    FremFast,
 }
 
 impl RustFloatMathIntrinsic {
@@ -234,6 +305,46 @@ impl RustFloatMathIntrinsic {
             rust_intrinsics::CALLEE_FABS => Some(Self::Fabs),
             rust_intrinsics::CALLEE_COPYSIGN_F32 => Some(Self::CopysignF32),
             rust_intrinsics::CALLEE_COPYSIGN_F64 => Some(Self::CopysignF64),
+            rust_intrinsics::CALLEE_MAXNUM_NSZ_F32 => Some(Self::MaxNumNszF32),
+            rust_intrinsics::CALLEE_MAXNUM_NSZ_F64 => Some(Self::MaxNumNszF64),
+            rust_intrinsics::CALLEE_MINNUM_NSZ_F32 => Some(Self::MinNumNszF32),
+            rust_intrinsics::CALLEE_MINNUM_NSZ_F64 => Some(Self::MinNumNszF64),
+            rust_intrinsics::CALLEE_ASIN_F32 => Some(Self::AsinF32),
+            rust_intrinsics::CALLEE_ASIN_F64 => Some(Self::AsinF64),
+            rust_intrinsics::CALLEE_ACOS_F32 => Some(Self::AcosF32),
+            rust_intrinsics::CALLEE_ACOS_F64 => Some(Self::AcosF64),
+            rust_intrinsics::CALLEE_ATAN2_F32 => Some(Self::Atan2F32),
+            rust_intrinsics::CALLEE_ATAN2_F64 => Some(Self::Atan2F64),
+            rust_intrinsics::CALLEE_ATAN_F32 => Some(Self::AtanF32),
+            rust_intrinsics::CALLEE_ATAN_F64 => Some(Self::AtanF64),
+            rust_intrinsics::CALLEE_CBRT_F32 => Some(Self::CbrtF32),
+            rust_intrinsics::CALLEE_CBRT_F64 => Some(Self::CbrtF64),
+            rust_intrinsics::CALLEE_SINH_F32 => Some(Self::SinhF32),
+            rust_intrinsics::CALLEE_SINH_F64 => Some(Self::SinhF64),
+            rust_intrinsics::CALLEE_COSH_F32 => Some(Self::CoshF32),
+            rust_intrinsics::CALLEE_COSH_F64 => Some(Self::CoshF64),
+            rust_intrinsics::CALLEE_TANH_F32 => Some(Self::TanhF32),
+            rust_intrinsics::CALLEE_TANH_F64 => Some(Self::TanhF64),
+            rust_intrinsics::CALLEE_EXPM1_F32 => Some(Self::Expm1F32),
+            rust_intrinsics::CALLEE_EXPM1_F64 => Some(Self::Expm1F64),
+            rust_intrinsics::CALLEE_LOG1P_F32 => Some(Self::Log1pF32),
+            rust_intrinsics::CALLEE_LOG1P_F64 => Some(Self::Log1pF64),
+            rust_intrinsics::CALLEE_HYPOT_F32 => Some(Self::HypotF32),
+            rust_intrinsics::CALLEE_HYPOT_F64 => Some(Self::HypotF64),
+            rust_intrinsics::CALLEE_FADD_FAST => Some(Self::FaddFast),
+            rust_intrinsics::CALLEE_FSUB_FAST => Some(Self::FsubFast),
+            rust_intrinsics::CALLEE_FMUL_FAST => Some(Self::FmulFast),
+            rust_intrinsics::CALLEE_FDIV_FAST => Some(Self::FdivFast),
+            rust_intrinsics::CALLEE_FREM_FAST => Some(Self::FremFast),
+            _ => None,
+        }
+    }
+
+    /// Whether this is Rust's NaN-ignoring scalar maximum/minimum operation.
+    fn minmax_nsz_predicate(self) -> Option<FCmpPredicateAttr> {
+        match self {
+            Self::MaxNumNszF32 | Self::MaxNumNszF64 => Some(FCmpPredicateAttr::OGE),
+            Self::MinNumNszF32 | Self::MinNumNszF64 => Some(FCmpPredicateAttr::OLE),
             _ => None,
         }
     }
@@ -242,7 +353,7 @@ impl RustFloatMathIntrinsic {
     fn libdevice_name(
         self,
         ctx: &Context,
-        result_ty: Ptr<TypeObj>,
+        result_ty: TypeHandle,
         loc: pliron::location::Location,
     ) -> Result<&'static str> {
         match self {
@@ -283,6 +394,52 @@ impl RustFloatMathIntrinsic {
             Self::Fabs => fabs_libdevice_name(ctx, result_ty, loc),
             Self::CopysignF32 => Ok("__nv_copysignf"),
             Self::CopysignF64 => Ok("__nv_copysign"),
+            // `f32::max` / `f32::min` (and the f64 forms) call the `_nsz`
+            // intrinsics, i.e. IEEE-754 maxNum/minNum with the "no signed
+            // zero" relaxation. They expand to an ordered compare/select
+            // sequence under every intrinsic backend (the caller routes them
+            // through `lower_float_minmax_nsz` before any symbol lookup), so
+            // they must never reach a libdevice name.
+            Self::MaxNumNszF32 | Self::MaxNumNszF64 | Self::MinNumNszF32 | Self::MinNumNszF64 => {
+                pliron::input_err!(
+                    loc,
+                    "float max/min intrinsics lower to a compare/select \
+                     expansion, never to libdevice"
+                )
+            }
+            Self::AsinF32 => Ok("__nv_asinf"),
+            Self::AsinF64 => Ok("__nv_asin"),
+            Self::AcosF32 => Ok("__nv_acosf"),
+            Self::AcosF64 => Ok("__nv_acos"),
+            Self::Atan2F32 => Ok("__nv_atan2f"),
+            Self::Atan2F64 => Ok("__nv_atan2"),
+            Self::AtanF32 => Ok("__nv_atanf"),
+            Self::AtanF64 => Ok("__nv_atan"),
+            Self::CbrtF32 => Ok("__nv_cbrtf"),
+            Self::CbrtF64 => Ok("__nv_cbrt"),
+            Self::SinhF32 => Ok("__nv_sinhf"),
+            Self::SinhF64 => Ok("__nv_sinh"),
+            Self::CoshF32 => Ok("__nv_coshf"),
+            Self::CoshF64 => Ok("__nv_cosh"),
+            Self::TanhF32 => Ok("__nv_tanhf"),
+            Self::TanhF64 => Ok("__nv_tanh"),
+            Self::Expm1F32 => Ok("__nv_expm1f"),
+            Self::Expm1F64 => Ok("__nv_expm1"),
+            Self::Log1pF32 => Ok("__nv_log1pf"),
+            Self::Log1pF64 => Ok("__nv_log1p"),
+            Self::HypotF32 => Ok("__nv_hypotf"),
+            Self::HypotF64 => Ok("__nv_hypot"),
+            Self::FaddFast | Self::FsubFast | Self::FmulFast | Self::FdivFast | Self::FremFast => {
+                // The `f*_fast` intrinsics lower directly to LLVM `fadd`/`fsub`/
+                // `fmul`/`fdiv`/`frem` with fast-math flags, not to a libdevice
+                // call. The caller (`convert_rust_float_math_intrinsic`) routes
+                // them through `lower_fast_binop` and never reaches this branch.
+                pliron::input_err!(
+                    loc,
+                    "f*_fast intrinsics have no libdevice equivalent; \
+                     they lower to llvm float binops with fast-math flags"
+                )
+            }
         }
     }
 
@@ -294,11 +451,112 @@ impl RustFloatMathIntrinsic {
             | Self::PowfF32
             | Self::PowfF64
             | Self::CopysignF32
-            | Self::CopysignF64 => 2,
+            | Self::CopysignF64
+            | Self::MaxNumNszF32
+            | Self::MaxNumNszF64
+            | Self::MinNumNszF32
+            | Self::MinNumNszF64
+            | Self::Atan2F32
+            | Self::Atan2F64
+            | Self::HypotF32
+            | Self::HypotF64
+            | Self::FaddFast
+            | Self::FsubFast
+            | Self::FmulFast
+            | Self::FdivFast
+            | Self::FremFast => 2,
             Self::FmaF32 | Self::FmaF64 | Self::FmuladdF32 | Self::FmuladdF64 => 3,
             _ => 1,
         }
     }
+
+    /// Return the LLVM intrinsic name for operations that can bypass
+    /// libdevice: the rounding family plus `fabs` and `copysign`.
+    ///
+    /// The NVPTX backend selects these without a libdevice call. Measured with
+    /// LLVM 21.1 `llc -march=nvptx64 -mcpu=sm_80`, counting only the body:
+    ///
+    /// | Intrinsic | PTX | Instructions |
+    /// |-----------|-----|--------------|
+    /// | `floor` | `cvt.rmi` | 1 |
+    /// | `ceil` | `cvt.rpi` | 1 |
+    /// | `trunc` | `cvt.rzi` | 1 |
+    /// | `roundeven` | `cvt.rni` | 1 |
+    /// | `round` | expanded sequence | 11 (f32), 8 (f64) |
+    /// | `fabs` | `abs` | 1 |
+    /// | `copysign` | `copysign` | 1 |
+    ///
+    /// `round` is the one exception, and deliberately so. It rounds halfway
+    /// cases away from zero, which is not one of the four hardware `cvt` modes
+    /// (`rni` is ties-to-even), so no single instruction can express it. LLVM
+    /// expands it inline into compare/select over `cvt.rzi` rather than
+    /// emitting a `roundf` libcall, so routing it here still removes the
+    /// libdevice call without introducing an unresolved symbol.
+    ///
+    /// Using LLVM intrinsics avoids a libdevice function call and removes the
+    /// libNVVM dependency for kernels that only use these operations.
+    ///
+    /// Scope: `max`/`min` deliberately return `None` here. They cannot use
+    /// `llvm.maxnum`/`llvm.minnum` at all, because under LLVM 21 those
+    /// propagate signaling NaNs and so contradict Rust's contract; they lower
+    /// as an ordered compare/select instead (`lower_float_minmax_nsz`, see
+    /// #390) and never reach this table.
+    ///
+    /// Naming: pliron identifiers cannot contain dots, so intrinsic symbols
+    /// use the underscore encoding (`llvm_floor_f32`) that the textual `.ll`
+    /// exporter decodes back to the dotted LLVM name (`llvm.floor.f32`),
+    /// exactly like the `llvm_ctpop_i*` bit-intrinsic family above.
+    fn llvm_intrinsic_name(
+        self,
+        ctx: &Context,
+        result_ty: TypeHandle,
+        loc: pliron::location::Location,
+    ) -> Result<Option<&'static str>> {
+        match self {
+            // Rounding: each maps to a single PTX `cvt` instruction, except
+            // `round`; see the note above.
+            Self::FloorF32 => Ok(Some("llvm_floor_f32")),
+            Self::FloorF64 => Ok(Some("llvm_floor_f64")),
+            Self::CeilF32 => Ok(Some("llvm_ceil_f32")),
+            Self::CeilF64 => Ok(Some("llvm_ceil_f64")),
+            Self::TruncF32 => Ok(Some("llvm_trunc_f32")),
+            Self::TruncF64 => Ok(Some("llvm_trunc_f64")),
+            Self::RoundF32 => Ok(Some("llvm_round_f32")),
+            Self::RoundF64 => Ok(Some("llvm_round_f64")),
+            Self::RoundevenF32 => Ok(Some("llvm_roundeven_f32")),
+            Self::RoundevenF64 => Ok(Some("llvm_roundeven_f64")),
+            // Sign operations: `llvm.fabs.*` / `llvm.copysign.*` select to
+            // single PTX `abs` / `copysign` instructions. `fabs` is the one
+            // placeholder that is generic over the float width, so its name
+            // dispatches on the result type.
+            Self::Fabs => fabs_llvm_intrinsic_name(ctx, result_ty, loc).map(Some),
+            Self::CopysignF32 => Ok(Some("llvm_copysign_f32")),
+            Self::CopysignF64 => Ok(Some("llvm_copysign_f64")),
+            _ => Ok(None),
+        }
+    }
+
+    /// Return the equivalent fast-math binop kind, if this intrinsic is one.
+    fn fast_binop(self) -> Option<FastFloatBinop> {
+        match self {
+            Self::FaddFast => Some(FastFloatBinop::Add),
+            Self::FsubFast => Some(FastFloatBinop::Sub),
+            Self::FmulFast => Some(FastFloatBinop::Mul),
+            Self::FdivFast => Some(FastFloatBinop::Div),
+            Self::FremFast => Some(FastFloatBinop::Rem),
+            _ => None,
+        }
+    }
+}
+
+/// Which `llvm.f*` binary op a `core::intrinsics::f*_fast` intrinsic lowers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastFloatBinop {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
@@ -345,8 +603,22 @@ pub fn convert(
         return convert_rust_saturating_intrinsic(ctx, rewriter, op, operands_info, intrinsic);
     }
 
+    if RustExactDivIntrinsic::from_placeholder_callee(&callee_name).is_some() {
+        return convert_rust_exact_div(ctx, rewriter, op, operands_info);
+    }
+
+    if let Some(RustBigIntIntrinsic::CarryingMulAdd) =
+        RustBigIntIntrinsic::from_placeholder_callee(&callee_name)
+    {
+        return convert_rust_carrying_mul_add(ctx, rewriter, op, operands_info);
+    }
+
     if let Some(intrinsic) = RustFloatMathIntrinsic::from_placeholder_callee(&callee_name) {
         return convert_rust_float_math_intrinsic(ctx, rewriter, op, intrinsic);
+    }
+
+    if callee_name == rust_intrinsics::CALLEE_SELECT_UNPREDICTABLE {
+        return convert_rust_select_unpredictable(ctx, rewriter, op);
     }
 
     let callee_ident: pliron::identifier::Identifier = {
@@ -366,12 +638,25 @@ pub fn convert(
         None
     };
 
+    let mut zst_replacement_type = None;
     let result_type = if let Some(mir_ty) = mir_result_ty_ptr {
-        let is_unit = mir_ty.deref(ctx).is::<MirTupleType>();
-        if is_unit {
+        // Only the empty tuple `()` is the unit type. `is::<MirTupleType>()`
+        // also matches `(T, U, ...)`, so we have to peek at the field count.
+        // Non-empty tuples take the convert_type path and end up as an LLVM
+        // struct return, same as named structs.
+        let is_unit = mir_ty
+            .deref(ctx)
+            .downcast_ref::<MirTupleType>()
+            .is_some_and(|t| t.get_types().is_empty());
+        let converted = convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+        if is_unit || is_zero_sized_type(ctx, converted) {
+            // NVPTX cannot carry a ZST in a function signature, so the call
+            // itself returns void. Keep the converted ZST type so any MIR uses
+            // of the result can be replaced with a typed undef below.
+            zst_replacement_type = Some(converted);
             llvm_types::VoidType::get(ctx).into()
         } else {
-            convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?
+            converted
         }
     } else {
         llvm_types::VoidType::get(ctx).into()
@@ -398,6 +683,31 @@ pub fn convert(
         flatten_arguments(ctx, rewriter, &args, operands_info, expected_param_tys)?;
 
     let func_type = llvm_types::FuncType::get(ctx, result_type, flattened_arg_types, false);
+
+    // Direct libdevice calls (`__nv_*`) originate from hand-written externs
+    // (e.g. khal_std's `Float::asin`/`acos` → `__nv_asinf`/`__nv_acosf`) that
+    // have no MIR body and therefore no emitted declaration. Without a module
+    // declaration the verifier rejects the call ("Symbol __nv_asinf not found").
+    // Declare it here with the call's signature, mirroring the float-math
+    // intrinsic path; the symbol is bound against libdevice at the cubin-link
+    // stage just like `__nv_expf`/`__nv_sqrtf`.
+    {
+        let resolved_name = resolve_device_extern_symbol(&callee_name);
+        let parent_block = op.deref(ctx).get_parent_block();
+        if resolved_name.starts_with("__nv_")
+            && let Some(parent_block) = parent_block
+        {
+            let loc = op.deref(ctx).loc();
+            helpers::ensure_intrinsic_declared(ctx, parent_block, &resolved_name, func_type)
+                .map_err(|e| {
+                    pliron::input_error!(
+                        loc,
+                        "Failed to declare libdevice extern {resolved_name}: {e}"
+                    )
+                })?;
+        }
+    }
+
     let llvm_call = llvm::CallOp::new(
         ctx,
         CallOpCallable::Direct(callee_ident),
@@ -409,10 +719,66 @@ pub fn convert(
     let is_void = result_type.deref(ctx).is::<llvm_types::VoidType>();
     if has_result && !is_void && llvm_call.get_operation().deref(ctx).get_num_results() > 0 {
         rewriter.replace_operation(ctx, op, llvm_call.get_operation());
+    } else if op.deref(ctx).has_use()
+        && let Some(zst_type) = zst_replacement_type
+    {
+        // The ABI intentionally erases ZST returns, but MIR may still use the
+        // typed result (return it again, pass it to another call, or project a
+        // zero-sized field). Preserve the side-effecting void call and replace
+        // only its value result with an undef of the converted ZST type.
+        let undef = llvm::UndefOp::new(ctx, zst_type);
+        rewriter.insert_operation(ctx, undef.get_operation());
+        rewriter.replace_operation(ctx, op, undef.get_operation());
     } else {
+        // The LLVM call has no usable result so the MIR op must be erased.
+        // This is safe for a result-less call or an unused ZST result. Any
+        // other live result means the result-type computation silently
+        // dropped a real value; report that instead of letting pliron's
+        // erase-with-uses invariant panic and escape into rustc as an ICE.
+        if op.deref(ctx).has_use() {
+            let loc = op.deref(ctx).loc();
+            return pliron::input_err!(
+                loc,
+                "mir.call lowering produced a void LLVM call but the MIR op \
+                 still has live uses; the return type was likely misclassified \
+                 (for example, a non-unit tuple treated as `()`)"
+            );
+        }
         rewriter.erase_operation(ctx, op);
     }
 
+    Ok(())
+}
+
+/// Lower the placeholder call for `select_unpredictable` to an LLVM `select`.
+///
+/// The importer emits `select_unpredictable(cond, true_val, false_val)` as a
+/// placeholder `mir.call` with exactly three operands. By this point the
+/// operands carry their converted LLVM types, so the `select` is built
+/// directly: its result type comes from `true_val` and matches both
+/// `false_val` and the intrinsic's return type. The Rust `bool` condition
+/// lowers to `i1`, which is what `SelectOp` requires. The `unpredictable`
+/// branch-weight hint is an optimization hint with no device semantics and
+/// is intentionally not represented.
+fn convert_rust_select_unpredictable(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+) -> Result<()> {
+    let loc = op.deref(ctx).loc();
+    if op.deref(ctx).get_num_results() != 1 {
+        return pliron::input_err!(loc, "select_unpredictable call must have one result");
+    }
+    let args: Vec<Value> = op.deref(ctx).operands().collect();
+    let [cond, true_val, false_val] = args.as_slice() else {
+        return pliron::input_err!(
+            loc,
+            "select_unpredictable expects exactly three operands (cond, true, false)"
+        );
+    };
+    let select = llvm::SelectOp::new(ctx, *cond, *true_val, *false_val);
+    rewriter.insert_operation(ctx, select.get_operation());
+    rewriter.replace_operation(ctx, op, select.get_operation());
     Ok(())
 }
 
@@ -606,7 +972,214 @@ fn convert_rust_saturating_intrinsic(
     Ok(())
 }
 
-/// Lower placeholder calls for rustc's `f32` / `f64` math intrinsics to libdevice.
+/// Convert `core::intrinsics::exact_div` to `llvm.sdiv` or `llvm.udiv`.
+///
+/// The intrinsic's contract is that the divisor is non-zero and divides the
+/// dividend with no remainder; both are the caller's obligation, and violating
+/// either is undefined behaviour. That is exactly the contract of a bare LLVM
+/// division, so no zero check or remainder correction is emitted.
+///
+/// Signedness comes from the pre-conversion MIR operand type, the same source
+/// `mir.div` uses, because the LLVM integer type is signless by the time the
+/// operand is rewritten.
+fn convert_rust_exact_div(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let loc = op.deref(ctx).loc();
+    if op.deref(ctx).get_num_results() != 1 {
+        return pliron::input_err!(loc, "exact_div call must have one result");
+    }
+
+    let args: Vec<Value> = op.deref(ctx).operands().collect();
+    let [dividend, divisor] = args[..] else {
+        return pliron::input_err!(loc, "exact_div requires a dividend and a divisor");
+    };
+
+    let is_signed = if let Some(int_ty) =
+        operands_info.lookup_most_recent_of_type::<IntegerType>(ctx, dividend)
+    {
+        int_ty.signedness() == Signedness::Signed
+    } else {
+        let live = dividend.get_type(ctx);
+        let live_ref = live.deref(ctx);
+        match live_ref.downcast_ref::<IntegerType>() {
+            // Signless lowers as unsigned, matching `mir.div`.
+            Some(int_ty) => int_ty.signedness() == Signedness::Signed,
+            None => return pliron::input_err!(loc, "expected integer type for exact_div"),
+        }
+    };
+
+    // Defensive only: rustc's `exact_div` signature is `(T, T) -> T`, so both
+    // operands already have the same width and this widen path never fires.
+    let dividend_ty = dividend.get_type(ctx);
+    let (divisor, _) = cast_integer_value_to_type(ctx, rewriter, divisor, dividend_ty, loc)?;
+
+    let llvm_op = if is_signed {
+        llvm::SDivOp::new(ctx, dividend, divisor).get_operation()
+    } else {
+        llvm::UDivOp::new(ctx, dividend, divisor).get_operation()
+    };
+    rewriter.insert_operation(ctx, llvm_op);
+    rewriter.replace_operation(ctx, op, llvm_op);
+    Ok(())
+}
+
+/// Lower the placeholder call for rustc's `carrying_mul_add` bigint intrinsic.
+///
+/// `core::intrinsics::carrying_mul_add(a, b, c, d)` computes `a * b + c + d`
+/// without losing any bits and returns the exact result split into a
+/// `(low_half, high_half)` tuple. The integer methods `carrying_mul_add`,
+/// `carrying_mul`, and `widening_mul` all funnel into this one intrinsic.
+/// An N-bit multiply-accumulate always fits in 2*N bits:
+/// even for the largest unsigned inputs,
+/// `(2^N - 1)^2 + 2 * (2^N - 1) == 2^(2N) - 1`.
+///
+/// The lowering widens all four operands to 2*N bits (zero-extending for
+/// unsigned types, sign-extending for signed types, matching the `as` casts
+/// in core's fallback implementation), computes the product-sum in 2*N-bit
+/// arithmetic, and splits the wide value:
+///
+/// ```text
+/// wide = ext(a) * ext(b) + ext(c) + ext(d)  : i2N
+/// low  = trunc(wide)                        : iN
+/// high = trunc(wide >> N)                   : iN
+/// result = { low, high }
+/// ```
+///
+/// A logical shift (`lshr`) is used for the high half even for signed types:
+/// core's fallback uses an arithmetic shift there, but the shifted value is
+/// immediately truncated to N bits, and bits [N, 2N) of the wide value are
+/// identical under either shift. The NVPTX backend pattern-matches this
+/// ext/mul/shift idiom into `mul.lo` / `mul.hi` / `mad` instructions, so the
+/// generated PTX is good.
+///
+/// 128-bit integers are rejected with a diagnostic: their lowering would
+/// need 256-bit intermediate arithmetic, which NVPTX cannot legalize.
+fn convert_rust_carrying_mul_add(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let loc = op.deref(ctx).loc();
+    if op.deref(ctx).get_num_results() != 1 {
+        return pliron::input_err!(loc, "Rust carrying_mul_add intrinsic must have one result");
+    }
+
+    let args: Vec<Value> = op.deref(ctx).operands().collect();
+    if args.len() != 4 {
+        return pliron::input_err!(
+            loc,
+            "Rust carrying_mul_add intrinsic requires four operands \
+             (multiplier, multiplicand, addend, carry)"
+        );
+    }
+
+    let elem_ty = args[0].get_type(ctx);
+    let width = integer_bit_width(ctx, elem_ty, loc.clone())?;
+    if width > 64 {
+        return pliron::input_err!(
+            loc,
+            "carrying_mul_add on {width}-bit integers is not yet supported on the device: \
+             the lowering needs {}-bit intermediate arithmetic, which NVPTX cannot legalize",
+            width * 2
+        );
+    }
+
+    // Rust preserves signedness in the original MIR type; the converted LLVM
+    // value is signless, so recover it from the pre-conversion operand type.
+    let is_signed = if let Some(int_ty) =
+        operands_info.lookup_most_recent_of_type::<IntegerType>(ctx, args[0])
+    {
+        int_ty.signedness() == Signedness::Signed
+    } else {
+        return pliron::input_err!(
+            loc,
+            "expected integer type for Rust carrying_mul_add intrinsic"
+        );
+    };
+
+    let wide_ty: TypeHandle = IntegerType::get(ctx, width * 2, Signedness::Signless).into();
+
+    // Widen every operand to 2*N bits with the signedness-appropriate extension.
+    let mut wide_args = Vec::with_capacity(4);
+    for &arg in &args {
+        let ext_op = if is_signed {
+            llvm::SExtOp::new(ctx, arg, wide_ty).get_operation()
+        } else {
+            // `nneg` is a poison-introducing optimization flag ("the operand
+            // is known non-negative"); we assert nothing and leave it unset.
+            llvm::ZExtOp::new_with_nneg(ctx, arg, wide_ty, false).get_operation()
+        };
+        rewriter.insert_operation(ctx, ext_op);
+        wide_args.push(ext_op.deref(ctx).get_result(0));
+    }
+
+    // wide = a * b + c + d, computed in 2*N bits (cannot overflow).
+    let flags = IntegerOverflowFlagsAttr::default();
+    let mul = llvm::MulOp::new_with_overflow_flag(ctx, wide_args[0], wide_args[1], flags.clone())
+        .get_operation();
+    rewriter.insert_operation(ctx, mul);
+    let product = mul.deref(ctx).get_result(0);
+    let add_c = llvm::AddOp::new_with_overflow_flag(ctx, product, wide_args[2], flags.clone())
+        .get_operation();
+    rewriter.insert_operation(ctx, add_c);
+    let sum_c = add_c.deref(ctx).get_result(0);
+    let add_d =
+        llvm::AddOp::new_with_overflow_flag(ctx, sum_c, wide_args[3], flags).get_operation();
+    rewriter.insert_operation(ctx, add_d);
+    let wide = add_d.deref(ctx).get_result(0);
+
+    // low = trunc(wide); high = trunc(wide >> N).
+    let low_op = llvm::TruncOp::new(ctx, wide, elem_ty).get_operation();
+    rewriter.insert_operation(ctx, low_op);
+    let low = low_op.deref(ctx).get_result(0);
+
+    let shift_amount = {
+        let wide_width = NonZeroUsize::new((width * 2) as usize).expect("width is non-zero");
+        let attr = IntegerAttr::new(
+            IntegerType::get(ctx, width * 2, Signedness::Signless),
+            APInt::from_u64(u64::from(width), wide_width),
+        );
+        let const_op = llvm::ConstantOp::new(ctx, attr.into());
+        rewriter.insert_operation(ctx, const_op.get_operation());
+        const_op.get_operation().deref(ctx).get_result(0)
+    };
+    let shr = llvm::LShrOp::new(ctx, wide, shift_amount).get_operation();
+    rewriter.insert_operation(ctx, shr);
+    let shifted = shr.deref(ctx).get_result(0);
+    let high_op = llvm::TruncOp::new(ctx, shifted, elem_ty).get_operation();
+    rewriter.insert_operation(ctx, high_op);
+    let high = high_op.deref(ctx).get_result(0);
+
+    // Pack the (low, high) tuple into the converted result struct.
+    let result_mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let result_ty = convert_type(ctx, result_mir_ty).map_err(anyhow_to_pliron)?;
+    let undef = llvm::UndefOp::new(ctx, result_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let struct_val = undef.get_operation().deref(ctx).get_result(0);
+
+    let insert_low = llvm::InsertValueOp::new(ctx, struct_val, low, vec![0]);
+    rewriter.insert_operation(ctx, insert_low.get_operation());
+    let struct_with_low = insert_low.get_operation().deref(ctx).get_result(0);
+
+    let insert_high = llvm::InsertValueOp::new(ctx, struct_with_low, high, vec![1]);
+    rewriter.insert_operation(ctx, insert_high.get_operation());
+
+    rewriter.replace_operation(ctx, op, insert_high.get_operation());
+    Ok(())
+}
+
+/// Lower placeholder calls for rustc's `f32` / `f64` math intrinsics.
+///
+/// Simple scalar operations go to LLVM intrinsics so the ordinary llc -> PTX
+/// path can lower them directly, and float `max`/`min` expand to an ordered
+/// compare/select. Transcendentals and other libdevice-owned operations still
+/// lower to `__nv_*` calls, which need libdevice linked at the IR level or
+/// the NVVM IR route.
 fn convert_rust_float_math_intrinsic(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -627,9 +1200,28 @@ fn convert_rust_float_math_intrinsic(
         );
     }
 
+    // `f*_fast` intrinsics lower to LLVM float binops with fast-math flags,
+    // not to a libdevice call. Route them off the libdevice path before any
+    // intrinsic-name lookup so polymorphic-over-T arithmetic on `f32` and
+    // `f64` both work without per-type intrinsic dispatch.
+    if let Some(binop) = intrinsic.fast_binop() {
+        return lower_fast_binop(ctx, rewriter, op, &args, binop, loc);
+    }
+
+    if let Some(predicate) = intrinsic.minmax_nsz_predicate() {
+        return lower_float_minmax_nsz(ctx, rewriter, op, &args, predicate);
+    }
+
     let result_mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
     let result_ty = convert_type(ctx, result_mir_ty).map_err(anyhow_to_pliron)?;
-    let intrinsic_name = intrinsic.libdevice_name(ctx, result_ty, loc.clone())?;
+
+    // The rounding and sign intrinsics have direct LLVM equivalents that the
+    // NVPTX backend selects without a libdevice call; everything else (and
+    // every op under the libNVVM backend) stays on libdevice. See
+    // `float_math_intrinsic_symbol` for the dispatch and
+    // `llvm_intrinsic_name` for the per-op PTX mapping and instruction counts.
+    let intrinsic_name = float_math_intrinsic_symbol(ctx, intrinsic, result_ty, loc.clone())?;
+
     let arg_types = args.iter().map(|arg| arg.get_type(ctx)).collect::<Vec<_>>();
     let func_ty = llvm_types::FuncType::get(ctx, result_ty, arg_types, false);
     let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
@@ -651,10 +1243,160 @@ fn convert_rust_float_math_intrinsic(
     Ok(())
 }
 
+/// Resolve the callee symbol a float-math intrinsic lowers to under the
+/// active intrinsic backend.
+///
+/// * [`IntrinsicBackend::LlvmNvptx`](crate::IntrinsicBackend::LlvmNvptx):
+///   rounding and sign ops use the native LLVM intrinsics (see
+///   [`RustFloatMathIntrinsic::llvm_intrinsic_name`]); everything else uses
+///   libdevice.
+/// * [`IntrinsicBackend::LibNvvm`](crate::IntrinsicBackend::LibNvvm): every
+///   op stays on libdevice. The legacy LLVM 7-based NVVM IR dialect predates
+///   `llvm.roundeven.*` (added in LLVM 11) and admits only a small intrinsic
+///   allow-list, so `__nv_*` calls are the only spelling that is portable
+///   across every libNVVM input dialect.
+///
+/// This dispatch mirrors the pre-lowering libdevice prediction in the
+/// pipeline (`is_libdevice_backed_placeholder` vs
+/// `is_backend_dependent_libdevice_placeholder` in
+/// `dialect_mir::rust_intrinsics`): a rounding or sign op emits a `__nv_*`
+/// symbol precisely when the LibNvvm backend was selected.
+fn float_math_intrinsic_symbol(
+    ctx: &Context,
+    intrinsic: RustFloatMathIntrinsic,
+    result_ty: TypeHandle,
+    loc: pliron::location::Location,
+) -> Result<&'static str> {
+    match crate::context::lowering_options(ctx).intrinsic_backend {
+        crate::IntrinsicBackend::LlvmNvptx => {
+            match intrinsic.llvm_intrinsic_name(ctx, result_ty, loc.clone())? {
+                Some(llvm_name) => Ok(llvm_name),
+                None => intrinsic.libdevice_name(ctx, result_ty, loc),
+            }
+        }
+        crate::IntrinsicBackend::LibNvvm => intrinsic.libdevice_name(ctx, result_ty, loc),
+    }
+}
+
+/// Lower Rust's NaN-ignoring `min` and `max` contract without libdevice.
+///
+/// LLVM 21's legacy `llvm.maxnum` / `llvm.minnum` intrinsics propagate a
+/// signaling NaN, whereas Rust requires either kind of NaN to be ignored when
+/// paired with a number. Mirror the definition in `core::intrinsics` exactly:
+/// select `y` when `x` is NaN or `y` compares at least/as-most `x`, otherwise
+/// select `x`. An unordered `y` comparison is false, so a NaN in `y` selects
+/// the numeric `x`.
+fn lower_float_minmax_nsz(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    args: &[Value],
+    ordered_predicate: FCmpPredicateAttr,
+) -> Result<()> {
+    let [x, y] = args else {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "Rust float min/max intrinsic requires two operands"
+        );
+    };
+
+    let x_is_nan = llvm::FCmpOp::new(ctx, FCmpPredicateAttr::UNO, *x, *x).get_operation();
+    set_empty_fastmath_flags(ctx, x_is_nan);
+    rewriter.insert_operation(ctx, x_is_nan);
+
+    let y_ordered_against_x = llvm::FCmpOp::new(ctx, ordered_predicate, *y, *x).get_operation();
+    set_empty_fastmath_flags(ctx, y_ordered_against_x);
+    rewriter.insert_operation(ctx, y_ordered_against_x);
+
+    let y_is_ordered_choice = y_ordered_against_x.deref(ctx).get_result(0);
+    let ordered_result = llvm::SelectOp::new(ctx, y_is_ordered_choice, *y, *x).get_operation();
+    rewriter.insert_operation(ctx, ordered_result);
+
+    let x_is_nan_value = x_is_nan.deref(ctx).get_result(0);
+    let ordered_result_value = ordered_result.deref(ctx).get_result(0);
+    let result = llvm::SelectOp::new(ctx, x_is_nan_value, *y, ordered_result_value).get_operation();
+    rewriter.insert_operation(ctx, result);
+    rewriter.replace_operation(ctx, op, result);
+    Ok(())
+}
+
+/// Attach empty fast-math flags to a float op.
+///
+/// Upstream `FCmpOp` carries the FastMathFlags interface, whose verifier
+/// requires the `llvm_fast_math_flags` attribute to be present (it is not
+/// set by `FCmpOp::new`). The min/max expansion must stay exactly IEEE
+/// ordered/unordered, so no relaxation flag is ever appropriate here.
+fn set_empty_fastmath_flags(ctx: &mut Context, op: Ptr<Operation>) {
+    let key: pliron::identifier::Identifier = "llvm_fast_math_flags".try_into().unwrap();
+    op.deref_mut(ctx)
+        .attributes
+        .set(key, FastmathFlagsAttr::default());
+}
+
+/// Lower a `core::intrinsics::f*_fast` placeholder call to the matching
+/// LLVM float binop with fast-math flags.
+///
+/// The `f*_fast` family is generic over `T: FloatPrimitive`; rustc gives it
+/// no MIR body, so the importer emitted a placeholder `mir.call` and any
+/// downstream attempt to resolve the call as a symbol fails LLVM module
+/// verification. Replacing the call with a binop here gives LLVM the explicit
+/// `fast` fast-math flag set promised by the Rust intrinsic contract, so f32
+/// and f64 monomorphizations both work without per-type intrinsic dispatch.
+/// A compilation-wide no-FMA request removes only the contraction permission;
+/// all other finite-input relaxations remain intact.
+fn fast_float_intrinsic_flags(ctx: &Context) -> FastmathFlagsAttr {
+    // pliron-llvm's `FastmathFlagsAttr::default()` is `FastmathFlags::empty()`;
+    // `core::intrinsics::f*_fast` needs the explicit LLVM `fast` flag group.
+    let mut flags = FastmathFlags::FAST;
+    if !crate::context::lowering_options(ctx).allow_fma_contraction {
+        flags.remove(FastmathFlags::CONTRACT);
+    }
+    flags.into()
+}
+
+fn lower_fast_binop(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    args: &[Value],
+    binop: FastFloatBinop,
+    loc: pliron::location::Location,
+) -> Result<()> {
+    let (lhs, rhs) = match args {
+        [a, b] => (*a, *b),
+        _ => {
+            return pliron::input_err!(loc, "f*_fast intrinsic call must have exactly 2 operands");
+        }
+    };
+
+    let flags = fast_float_intrinsic_flags(ctx);
+    let llvm_op = match binop {
+        FastFloatBinop::Add => {
+            llvm::FAddOp::new_with_fast_math_flags(ctx, lhs, rhs, flags).get_operation()
+        }
+        FastFloatBinop::Sub => {
+            llvm::FSubOp::new_with_fast_math_flags(ctx, lhs, rhs, flags).get_operation()
+        }
+        FastFloatBinop::Mul => {
+            llvm::FMulOp::new_with_fast_math_flags(ctx, lhs, rhs, flags).get_operation()
+        }
+        FastFloatBinop::Div => {
+            llvm::FDivOp::new_with_fast_math_flags(ctx, lhs, rhs, flags).get_operation()
+        }
+        FastFloatBinop::Rem => {
+            llvm::FRemOp::new_with_fast_math_flags(ctx, lhs, rhs, flags).get_operation()
+        }
+    };
+
+    rewriter.insert_operation(ctx, llvm_op);
+    rewriter.replace_operation(ctx, op, llvm_op);
+    Ok(())
+}
+
 /// Read the width from an integer type, or report a useful lowering error.
 fn integer_bit_width(
     ctx: &Context,
-    ty: Ptr<TypeObj>,
+    ty: TypeHandle,
     loc: pliron::location::Location,
 ) -> Result<u32> {
     let ty_ref = ty.deref(ctx);
@@ -664,10 +1406,29 @@ fn integer_bit_width(
     Ok(int_ty.width())
 }
 
+/// Return the LLVM `fabs` intrinsic for the concrete float type.
+fn fabs_llvm_intrinsic_name(
+    ctx: &Context,
+    ty: TypeHandle,
+    loc: pliron::location::Location,
+) -> Result<&'static str> {
+    let ty_ref = ty.deref(ctx);
+    if ty_ref.is::<FP32Type>() {
+        Ok("llvm_fabs_f32")
+    } else if ty_ref.is::<FP64Type>() {
+        Ok("llvm_fabs_f64")
+    } else {
+        pliron::input_err!(
+            loc,
+            "expected f32 or f64 type for Rust float math intrinsic"
+        )
+    }
+}
+
 /// Return the libdevice `fabs` entry point for the concrete float type.
 fn fabs_libdevice_name(
     ctx: &Context,
-    ty: Ptr<TypeObj>,
+    ty: TypeHandle,
     loc: pliron::location::Location,
 ) -> Result<&'static str> {
     let ty_ref = ty.deref(ctx);
@@ -706,7 +1467,7 @@ fn cast_integer_value_to_type(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     value: Value,
-    target_ty: Ptr<TypeObj>,
+    target_ty: TypeHandle,
     loc: pliron::location::Location,
 ) -> Result<(Value, Option<Ptr<Operation>>)> {
     let source_width = integer_bit_width(ctx, value.get_type(ctx), loc.clone())?;
@@ -719,10 +1480,10 @@ fn cast_integer_value_to_type(
     let cast_op = if source_width < target_width {
         let zext = llvm::ZExtOp::new(ctx, value, target_ty);
         let nneg_key: pliron::identifier::Identifier = "llvm_nneg_flag".try_into().unwrap();
-        zext.get_operation().deref_mut(ctx).attributes.0.insert(
-            nneg_key,
-            pliron::builtin::attributes::BoolAttr::new(false).into(),
-        );
+        zext.get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(nneg_key, pliron::builtin::attributes::BoolAttr::new(false));
         zext.get_operation()
     } else {
         llvm::TruncOp::new(ctx, value, target_ty).get_operation()
@@ -752,13 +1513,13 @@ fn flatten_arguments(
     rewriter: &mut DialectConversionRewriter,
     args: &[Value],
     operands_info: &OperandsInfo,
-    expected_param_tys: Option<&[Ptr<TypeObj>]>,
-) -> Result<(Vec<Value>, Vec<Ptr<TypeObj>>)> {
+    expected_param_tys: Option<&[TypeHandle]>,
+) -> Result<(Vec<Value>, Vec<TypeHandle>)> {
     let mut flattened_args = Vec::new();
     let mut flattened_arg_types = Vec::new();
 
     // Helper: pull the next expected param type, if any.
-    let take_expected = |flattened_arg_types: &Vec<Ptr<TypeObj>>| -> Option<Ptr<TypeObj>> {
+    let take_expected = |flattened_arg_types: &Vec<TypeHandle>| -> Option<TypeHandle> {
         let idx = flattened_arg_types.len();
         expected_param_tys.and_then(|tys| tys.get(idx).copied())
     };
@@ -768,10 +1529,7 @@ fn flatten_arguments(
 
         enum FlattenKind {
             Slice,
-            Struct {
-                field_types: Vec<Ptr<TypeObj>>,
-                mem_to_decl: Vec<usize>,
-            },
+            Struct { layout: StructLayoutInfo },
             None,
         }
 
@@ -781,8 +1539,7 @@ fn flatten_arguments(
                 FlattenKind::Slice
             } else if let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() {
                 FlattenKind::Struct {
-                    field_types: struct_ty.field_types.clone(),
-                    mem_to_decl: struct_ty.memory_order(),
+                    layout: StructLayoutInfo::of_struct(struct_ty),
                 }
             } else {
                 FlattenKind::None
@@ -824,19 +1581,19 @@ fn flatten_arguments(
                 flattened_args.push(len_val);
                 flattened_arg_types.push(len_ty);
             }
-            FlattenKind::Struct {
-                field_types,
-                mem_to_decl,
-            } => {
-                let mut llvm_idx = 0u32;
-                for mem_idx in 0..field_types.len() {
-                    let decl_idx = mem_to_decl[mem_idx];
-                    let llvm_field_ty =
-                        convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
-                    if is_zero_sized_type(ctx, llvm_field_ty) {
-                        continue;
-                    }
-                    let extract_op = llvm::ExtractValueOp::new(ctx, *arg, vec![llvm_idx])?;
+            FlattenKind::Struct { layout } => {
+                // Walk in memory order (the order `convert_function_type`
+                // flattens params in), extracting each non-ZST field from
+                // the slot the type converter placed it in, NOT from a
+                // running non-ZST count, which would land on `[N x i8]`
+                // padding slots for padded structs (issue #128).
+                let map = build_struct_slot_map(ctx, &layout).map_err(anyhow_to_pliron)?;
+                for &decl_idx in &layout.mem_to_decl {
+                    let Some(slot) = map.decl_to_llvm[decl_idx] else {
+                        continue; // ZST field: not passed.
+                    };
+                    let llvm_field_ty = map.field_llvm_types[decl_idx];
+                    let extract_op = llvm::ExtractValueOp::new(ctx, *arg, vec![slot])?;
                     rewriter.insert_operation(ctx, extract_op.get_operation());
                     let field_val = extract_op.get_operation().deref(ctx).get_result(0);
 
@@ -849,10 +1606,12 @@ fn flatten_arguments(
                     )?;
                     flattened_args.push(field_val);
                     flattened_arg_types.push(field_ty);
-                    llvm_idx += 1;
                 }
             }
             FlattenKind::None => {
+                if is_zero_sized_type(ctx, arg_ty) {
+                    continue;
+                }
                 let (final_arg, final_ty) = coerce_arg_to_param_ty(
                     ctx,
                     rewriter,
@@ -890,9 +1649,9 @@ fn coerce_arg_to_param_ty(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     arg: Value,
-    arg_ty: Ptr<TypeObj>,
-    expected_ty: Option<Ptr<TypeObj>>,
-) -> Result<(Value, Ptr<TypeObj>)> {
+    arg_ty: TypeHandle,
+    expected_ty: Option<TypeHandle>,
+) -> Result<(Value, TypeHandle)> {
     if let Some(expected_ty) = expected_ty {
         if arg_ty == expected_ty {
             return Ok((arg, arg_ty));
@@ -902,7 +1661,8 @@ fn coerce_arg_to_param_ty(
         if let (Some(src_as), Some(dst_as)) = (arg_addrspace, expected_addrspace)
             && src_as != dst_as
         {
-            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, dst_as);
+            let cast_ty = llvm_types::PointerType::get(ctx, dst_as).into();
+            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
             rewriter.insert_operation(ctx, cast_op.get_operation());
             let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
             return Ok((casted_val, expected_ty));
@@ -915,7 +1675,8 @@ fn coerce_arg_to_param_ty(
     if let Some(addrspace) = arg_addrspace
         && addrspace != ADDRSPACE_GENERIC
     {
-        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, ADDRSPACE_GENERIC);
+        let cast_ty = llvm_types::PointerType::get(ctx, ADDRSPACE_GENERIC).into();
+        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
         rewriter.insert_operation(ctx, cast_op.get_operation());
         let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
         let generic_ptr_ty = llvm_types::PointerType::get_generic(ctx);
@@ -926,7 +1687,7 @@ fn coerce_arg_to_param_ty(
 }
 
 /// Return the address space of `ty` if it is an LLVM pointer type.
-fn pointer_addrspace(ctx: &Context, ty: Ptr<TypeObj>) -> Option<u32> {
+fn pointer_addrspace(ctx: &Context, ty: TypeHandle) -> Option<u32> {
     ty.deref(ctx)
         .downcast_ref::<llvm_types::PointerType>()
         .map(|ptr_ty| ptr_ty.address_space())
@@ -956,7 +1717,7 @@ fn find_callee_arg_types(
     ctx: &mut Context,
     op: Ptr<Operation>,
     callee_ident: &pliron::identifier::Identifier,
-) -> Option<Vec<Ptr<TypeObj>>> {
+) -> Option<Vec<TypeHandle>> {
     let block = op.deref(ctx).get_parent_block()?;
     let func_op = block.deref(ctx).get_parent_op(ctx)?;
     let module_op = func_op.deref(ctx).get_parent_op(ctx)?;
@@ -1032,6 +1793,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_fma_policy_removes_only_contract_from_fast_float_intrinsics() {
+        let mut ctx = Context::new();
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: false,
+                intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
+            },
+        );
+
+        let flags = fast_float_intrinsic_flags(&ctx).0;
+        assert!(!flags.contains(FastmathFlags::CONTRACT));
+        assert!(flags.contains(FastmathFlags::REASSOC));
+        assert!(flags.contains(FastmathFlags::NNAN));
+        assert!(flags.contains(FastmathFlags::NINF));
+    }
+
+    #[test]
     fn test_resolve_device_extern_symbol() {
         use reserved_oxide_symbols::{device_extern_symbol, kernel_symbol};
 
@@ -1059,6 +1838,32 @@ mod tests {
         // (mutual-exclusion guarantee from reserved-oxide-symbols).
         let kernel_name = kernel_symbol("my_kernel");
         assert_eq!(resolve_device_extern_symbol(&kernel_name), kernel_name);
+    }
+
+    /// The `exact_div` placeholder is recognized, and nothing else is.
+    ///
+    /// The negative half matters: `unchecked_div` carries a weaker promise (the
+    /// divisor is non-zero, but the remainder is discarded), so folding it into
+    /// this path would silently drop the exactness obligation.
+    #[test]
+    fn test_exact_div_placeholder_round_trip() {
+        assert!(
+            RustExactDivIntrinsic::from_placeholder_callee(rust_intrinsics::CALLEE_EXACT_DIV)
+                .is_some()
+        );
+
+        for other in [
+            rust_intrinsics::CALLEE_SATURATING_ADD,
+            rust_intrinsics::CALLEE_SATURATING_SUB,
+            rust_intrinsics::CALLEE_CARRYING_MUL_ADD,
+            rust_intrinsics::CALLEE_SQRT_F32,
+            "core::intrinsics::unchecked_div",
+        ] {
+            assert!(
+                RustExactDivIntrinsic::from_placeholder_callee(other).is_none(),
+                "`{other}` must not be treated as exact_div"
+            );
+        }
     }
 
     /// Sample of the Rust float-math placeholder → libdevice symbol mapping.
@@ -1101,6 +1906,62 @@ mod tests {
                 rust_intrinsics::CALLEE_LOG2_F64,
                 RustFloatMathIntrinsic::Log2F64,
             ),
+            (
+                rust_intrinsics::CALLEE_MAXNUM_NSZ_F32,
+                RustFloatMathIntrinsic::MaxNumNszF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_MAXNUM_NSZ_F64,
+                RustFloatMathIntrinsic::MaxNumNszF64,
+            ),
+            (
+                rust_intrinsics::CALLEE_MINNUM_NSZ_F32,
+                RustFloatMathIntrinsic::MinNumNszF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_MINNUM_NSZ_F64,
+                RustFloatMathIntrinsic::MinNumNszF64,
+            ),
+            (
+                rust_intrinsics::CALLEE_ASIN_F32,
+                RustFloatMathIntrinsic::AsinF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ASIN_F64,
+                RustFloatMathIntrinsic::AsinF64,
+            ),
+            (
+                rust_intrinsics::CALLEE_ACOS_F32,
+                RustFloatMathIntrinsic::AcosF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ACOS_F64,
+                RustFloatMathIntrinsic::AcosF64,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN2_F32,
+                RustFloatMathIntrinsic::Atan2F32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN2_F64,
+                RustFloatMathIntrinsic::Atan2F64,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN_F32,
+                RustFloatMathIntrinsic::AtanF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN_F64,
+                RustFloatMathIntrinsic::AtanF64,
+            ),
+            (
+                rust_intrinsics::CALLEE_CBRT_F32,
+                RustFloatMathIntrinsic::CbrtF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_CBRT_F64,
+                RustFloatMathIntrinsic::CbrtF64,
+            ),
         ];
 
         for (name, expected) in cases {
@@ -1125,30 +1986,326 @@ mod tests {
         assert_eq!(RustFloatMathIntrinsic::PowiF32.arg_count(), 2);
         assert_eq!(RustFloatMathIntrinsic::PowfF64.arg_count(), 2);
         assert_eq!(RustFloatMathIntrinsic::CopysignF32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::AsinF32.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::AsinF64.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::AcosF32.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::AcosF64.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::Atan2F32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::Atan2F64.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::AtanF32.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::AtanF64.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::CbrtF32.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::CbrtF64.arg_count(), 1);
         assert_eq!(RustFloatMathIntrinsic::FmaF32.arg_count(), 3);
         assert_eq!(RustFloatMathIntrinsic::FmuladdF64.arg_count(), 3);
+        assert_eq!(RustFloatMathIntrinsic::MaxNumNszF32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::MaxNumNszF64.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::MinNumNszF32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::MinNumNszF64.arg_count(), 2);
     }
 
-    /// `Fabs` is the only float-math intrinsic whose libdevice name depends on
+    /// The LLVM 21 `maxnum`/`minnum` intrinsics do not match Rust's signaling
+    /// NaN behavior, so these variants use explicit compare/select lowering.
+    #[test]
+    fn test_float_math_minmax_nsz_predicates() {
+        assert_eq!(
+            RustFloatMathIntrinsic::MaxNumNszF32.minmax_nsz_predicate(),
+            Some(FCmpPredicateAttr::OGE)
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::MaxNumNszF64.minmax_nsz_predicate(),
+            Some(FCmpPredicateAttr::OGE)
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::MinNumNszF32.minmax_nsz_predicate(),
+            Some(FCmpPredicateAttr::OLE)
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::MinNumNszF64.minmax_nsz_predicate(),
+            Some(FCmpPredicateAttr::OLE)
+        );
+        assert_eq!(RustFloatMathIntrinsic::Fabs.minmax_nsz_predicate(), None);
+    }
+
+    #[test]
+    fn test_float_math_copysign_uses_llvm_and_transcendentals_use_libdevice() {
+        let ctx = Context::new();
+        let f32_ty = FP32Type::get(&ctx).into();
+        let f64_ty = FP64Type::get(&ctx).into();
+        let loc = pliron::location::Location::Unknown;
+
+        assert_eq!(
+            RustFloatMathIntrinsic::CopysignF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_copysign_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CopysignF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_copysign_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::SinF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// `Fabs` is the only float-math intrinsic whose LLVM name depends on
     /// the result type (the others are width-suffixed in the enum itself).
     /// Ensure both float widths are dispatched correctly and that anything
     /// else is rejected.
     #[test]
-    fn test_fabs_libdevice_name_dispatches_on_float_width() {
-        let mut ctx = Context::new();
+    fn test_fabs_llvm_intrinsic_name_dispatches_on_float_width() {
+        let ctx = Context::new();
         let f32_ty = FP32Type::get(&ctx).into();
         let f64_ty = FP64Type::get(&ctx).into();
-        let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let loc = pliron::location::Location::Unknown;
 
         assert_eq!(
-            fabs_libdevice_name(&ctx, f32_ty, loc.clone()).unwrap(),
+            fabs_llvm_intrinsic_name(&ctx, f32_ty, loc.clone()).unwrap(),
+            "llvm_fabs_f32"
+        );
+        assert_eq!(
+            fabs_llvm_intrinsic_name(&ctx, f64_ty, loc.clone()).unwrap(),
+            "llvm_fabs_f64"
+        );
+        assert!(fabs_llvm_intrinsic_name(&ctx, i32_ty, loc).is_err());
+    }
+
+    /// `llvm_intrinsic_name` returns direct LLVM intrinsic names for the
+    /// rounding and sign operations, which bypass libdevice. Everything else,
+    /// including the transcendentals, still returns `None`.
+    #[test]
+    fn test_llvm_intrinsic_name_routing() {
+        let ctx = Context::new();
+        let f32_ty = FP32Type::get(&ctx).into();
+        let f64_ty = FP64Type::get(&ctx).into();
+        let loc = pliron::location::Location::Unknown;
+
+        // fabs and copysign -> llvm.fabs.*/llvm.copysign.*, which the NVPTX
+        // backend selects to single `abs`/`copysign` PTX instructions.
+        assert_eq!(
+            RustFloatMathIntrinsic::Fabs
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_fabs_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::Fabs
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_fabs_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CopysignF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_copysign_f32")
+        );
+
+        // Rounding -> llvm.floor/ceil/trunc/round/roundeven.* in pliron's
+        // underscore encoding (the exporter prints the dotted LLVM name).
+        assert_eq!(
+            RustFloatMathIntrinsic::FloorF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_floor_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::FloorF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_floor_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CeilF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_ceil_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CeilF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_ceil_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::TruncF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_trunc_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::TruncF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_trunc_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_round_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_round_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundevenF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_roundeven_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundevenF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            Some("llvm_roundeven_f64")
+        );
+
+        // max/min return None: LLVM 21's maxnum/minnum propagate signaling
+        // NaNs, which contradicts Rust's contract. These use compare/select
+        // lowering instead and never reach the intrinsic tables (see #390).
+        assert_eq!(
+            RustFloatMathIntrinsic::MaxNumNszF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::MinNumNszF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc.clone())
+                .unwrap(),
+            None
+        );
+
+        // Transcendentals still return None (they need libdevice).
+        assert_eq!(
+            RustFloatMathIntrinsic::SinF32
+                .llvm_intrinsic_name(&ctx, f32_ty, loc.clone())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::SqrtF64
+                .llvm_intrinsic_name(&ctx, f64_ty, loc)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The resolved callee symbol follows the active intrinsic backend:
+    /// rounding and sign ops use the native LLVM intrinsics under
+    /// `LlvmNvptx` but stay on libdevice under `LibNvvm` (whose legacy
+    /// LLVM 7 dialect predates `llvm.roundeven.*`); transcendentals use
+    /// libdevice under both.
+    #[test]
+    fn float_math_symbol_dispatches_on_intrinsic_backend() {
+        let mut ctx = Context::new();
+        let f32_ty = FP32Type::get(&ctx).into();
+        let loc = pliron::location::Location::Unknown;
+
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: true,
+                intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
+            },
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::FloorF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "llvm_floor_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::RoundevenF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "llvm_roundeven_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::Fabs, f32_ty, loc.clone())
+                .unwrap(),
+            "llvm_fabs_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::CopysignF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "llvm_copysign_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::SinF32, f32_ty, loc.clone())
+                .unwrap(),
+            "__nv_sinf"
+        );
+
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: true,
+                intrinsic_backend: crate::IntrinsicBackend::LibNvvm,
+            },
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::FloorF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "__nv_floorf"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::RoundevenF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "__nv_rintf"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::Fabs, f32_ty, loc.clone())
+                .unwrap(),
             "__nv_fabsf"
         );
         assert_eq!(
-            fabs_libdevice_name(&ctx, f64_ty, loc.clone()).unwrap(),
-            "__nv_fabs"
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::CopysignF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "__nv_copysignf"
         );
-        assert!(fabs_libdevice_name(&ctx, i32_ty, loc).is_err());
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::SinF32, f32_ty, loc).unwrap(),
+            "__nv_sinf"
+        );
     }
 }

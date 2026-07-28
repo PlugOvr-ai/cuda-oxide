@@ -31,8 +31,8 @@ than building everything from scratch:
   We need a place to transform Rust MIR into something LLVM-shaped. pliron is
   an extensible IR framework inspired by LLVM's MLIR, but written in pure Rust.
   No C++ dependency, no CMake, no tablegen -- just `cargo build`. We define
-  three custom dialects here: one for MIR, one for LLVM IR, and one for
-  NVIDIA GPU intrinsics.
+  two custom dialects here (one for MIR, one for NVIDIA GPU intrinsics) and
+  consume the LLVM dialect from the upstream `pliron-llvm` crate.
 
 - **Backend: LLVM NVPTX.**
   NVIDIA has poured years of work into the NVPTX backend in LLVM. It knows
@@ -47,10 +47,14 @@ run the whole thing under Miri if you feel adventurous. Standard Rust tooling,
 all the way down.
 
 ```{note}
-`llc` is the one external binary. It comes from an LLVM installation with the
-NVPTX backend enabled; the CUDA Toolkit alone is not enough. All cuda-oxide
-stages up to LLVM IR emission are implemented in Rust; after the backend writes
-the `.ll` file, it invokes external LLVM `llc` to generate PTX.
+`llc` is the one external binary. The pinned Rust toolchain's `llvm-tools`
+component ships `llc` with the NVPTX backend enabled, so on a fresh clone
+`rustup component add llvm-tools` (already listed in `rust-toolchain.toml`)
+is the only step needed. A system LLVM 21+ install also works and serves as
+the fallback. The CUDA Toolkit alone is not enough — it does not include
+`llc`. All cuda-oxide stages up to LLVM IR emission are implemented in
+Rust; after the backend writes the `.ll` file, it invokes external LLVM
+`llc` to generate PTX.
 ```
 
 ---
@@ -65,8 +69,8 @@ Here is the full journey of a `#[kernel]` function, from source to silicon:
 
 The full compilation pipeline. Rust source enters the rustc frontend, passes
 through Stable MIR, is translated into `dialect-mir` (with `mem2reg` promoting
-allocas back into SSA), lowered to `dialect-llvm`, exported as textual LLVM IR,
-and finally compiled to PTX by the NVPTX backend.
+allocas back into SSA), applies annotated loop unrolling, lowers to the LLVM
+dialect, exports textual LLVM IR, and finally compiles to PTX.
 ```
 
 Stage by stage:
@@ -94,22 +98,25 @@ Stage by stage:
    `BinOp`, etc.). The initial form uses per-local `mir.alloca` slots with
    `mir.load`/`mir.store` for cross-block data flow; `pliron::opts::mem2reg`
    then promotes those slots back into SSA values.
+   [Compiler optimizations](compiler-optimizations.md), beginning with
+   annotated loop unrolling, run on that SSA form before lowering.
 
-5. **`dialect-llvm` (pliron).**
-   `mir-lower` transforms `dialect-mir` operations into `dialect-llvm`
+5. **LLVM dialect (pliron-llvm).**
+   `mir-lower` transforms `dialect-mir` operations into LLVM dialect
    operations: `llvm.alloca`, `llvm.load`, `llvm.store`,
    `llvm.getelementptr`, `llvm.call`, and friends. This is where
-   Rust-level concepts get flattened to machine-oriented IR.
+   Rust-level concepts get flattened to machine-oriented IR. The LLVM
+   dialect itself is provided by the upstream `pliron-llvm` crate.
 
 6. **LLVM IR (.ll file).**
-   The `dialect-llvm` printer serializes the IR into textual LLVM IR.
-   This is a plain `.ll` file -- you can read it, feed it to `opt`, or
-   diff it between compiler versions.
+   NVVM builds first use `nvvm-transforms` to convert modern LLVM operations
+   to the forms accepted by the selected libNVVM dialect. Ordinary PTX builds
+   skip that transform. The `llvm-export` printer then writes the textual
+   LLVM IR, which can be inspected or diffed between compiler versions.
 
-7. **PTX (.ptx file).**
-   `llc` with the NVPTX target compiles the `.ll` file to PTX assembly.
-   The result is a `.ptx` file ready to be loaded by the CUDA driver at
-   runtime.
+7. **GPU artifact.**
+   Ordinary builds use `llc` to compile the `.ll` file to PTX. NVVM builds use
+   libNVVM and nvJitLink to produce LTOIR and then a cubin.
 
 ---
 
@@ -122,9 +129,11 @@ cuda-oxide is split into focused crates. Here is every one and its role:
 | `rustc-codegen-cuda` | Custom rustc codegen backend -- intercepts `codegen_crate()`, splits host/device code  |
 | `mir-importer`       | Translates Stable MIR into `dialect-mir`, orchestrates the full pipeline               |
 | `dialect-mir`        | pliron dialect modeling Rust MIR semantics (places, rvalues, terminators)              |
-| `dialect-llvm`       | pliron dialect modeling LLVM IR + textual `.ll` export                                 |
+| `mir-transforms`     | Analyzes and optimizes `dialect-mir` before lowering; currently provides loop unrolling |
+| `nvvm-transforms`    | Converts lowered LLVM operations to the form accepted by the selected NVVM dialect     |
+| `llvm-export`        | Re-exports `pliron-llvm`'s LLVM dialect + cuda-oxide's textual `.ll` exporter          |
 | `dialect-nvvm`       | pliron dialect for NVIDIA GPU intrinsics (`tid`, `ntid`, barriers, TMA)                |
-| `mir-lower`          | Lowers `dialect-mir` to `dialect-llvm` -- the main transformation pass                 |
+| `mir-lower`          | Lowers `dialect-mir` to the LLVM dialect -- the main transformation pass               |
 | `cargo-oxide`        | CLI tool: `cargo oxide build`, `cargo oxide run`, `cargo oxide pipeline`               |
 | `cuda-device`        | Device-side API: intrinsics, `DisjointSlice`, barriers, shared memory, warp ops        |
 | `cuda-macros`        | Proc macros: `#[kernel]`, `#[device]`                                                  |
@@ -146,9 +155,11 @@ codegen backend, importer, and lowering passes. Dialect crates sit underneath,
 all built on pliron.
 ```
 
-`pliron` sits underneath all three dialect crates as the shared IR framework --
+`pliron` sits underneath the dialect crates as the shared IR framework --
 it provides the `Context`, `Module`, `Region`, `Block`, `Operation`, `Type`,
-and `Attribute` infrastructure. `rustc_public` provides the stable MIR types
+and `Attribute` infrastructure. The LLVM dialect comes from `pliron-llvm`
+(also built on pliron); `llvm-export` re-exports it and adds the textual `.ll`
+exporter. `rustc_public` provides the stable MIR types
 that `mir-importer` reads from rustc. The user-facing crates (`cuda-device`,
 `cuda-macros`, `cuda-host`, `cuda-core`, `cuda-async`) are independent of the
 compiler internals and depend only on each other.
@@ -174,9 +185,10 @@ add build complexity, slow down CI, and make contributor onboarding painful.
 With pliron, dialects are defined using standard Rust traits and derive macros,
 and the IR can be inspected with any Rust debugger.
 
-cuda-oxide defines three dialects on top of pliron: `dialect-mir` (models
-Rust MIR), `dialect-llvm` (models LLVM IR + textual export), and
-`dialect-nvvm` (NVIDIA GPU intrinsics).
+cuda-oxide defines two dialects on top of pliron: `dialect-mir` (models
+Rust MIR) and `dialect-nvvm` (NVIDIA GPU intrinsics). The LLVM dialect comes
+from the upstream `pliron-llvm` crate; cuda-oxide's `llvm-export` crate
+re-exports it and adds the textual `.ll` exporter.
 
 :::{seealso}
 For a deeper dive into pliron's architecture, see
@@ -241,7 +253,7 @@ created.
 Starting from each kernel, the backend walks the call graph to collect every
 device function the kernel transitively calls. This set of functions is handed
 to `mir-importer`, which runs the full pipeline (`dialect-mir` ->
-`dialect-llvm` -> `.ll` -> PTX). The result is a `.ptx` file written next to
+LLVM dialect -> `.ll` -> PTX). The result is a `.ptx` file written next to
 the host binary.
 
 **5. Always: delegate host code to the standard LLVM backend.**
@@ -295,7 +307,7 @@ handles before cuda-oxide ever sees the code:
 | :---------------- | :------------------------------------------------------------------------------------|
 | Type checking     | Catch errors before GPU compilation -- no cryptic PTX assembler failures             |
 | Lifetime tracking | Safety guarantees that span the host/device boundary                                 |
-| Borrow checking   | Prevent data races at compile time, even across GPU threads                          |
+| Borrow checking   | Enforce ordinary Rust aliasing; GPU-wide writes add `DisjointSlice` and launch proofs |
 | Monomorphization  | Generics "just work" on the GPU -- `map<f32, _>` becomes a concrete PTX kernel       |
 | MIR optimization  | Inlining, constant propagation, dead code elimination -- all applied before we begin |
 | Trait resolution  | Trait objects are resolved, vtables are gone, everything is static dispatch          |
@@ -326,9 +338,11 @@ The rest of this chapter zooms into each piece of the architecture:
 - **[The Code Generator: rustc-codegen-cuda](rustc-codegen-cuda.md)** -- the
   codegen backend that intercepts rustc.
 - **[MIR Importer](mir-importer.md)** -- translating Stable MIR into pliron.
+- **[Compiler Optimizations](compiler-optimizations.md)** -- how
+  `mir-transforms` analyzes and rewrites `dialect-mir`.
 - **[Pliron Dialects](mlir-dialects.md)** -- the three custom dialects and their
   operation sets.
-- **[The Lowering Pipeline](lowering-pipeline.md)** -- `dialect-mir` to
-  `dialect-llvm`, pass by pass.
+- **[The Lowering Pipeline](lowering-pipeline.md)** -- `dialect-mir` to the
+  LLVM dialect, pass by pass.
 - **[Adding New Intrinsics](adding-new-intrinsics.md)** -- a contributor's
   guide to extending the compiler.

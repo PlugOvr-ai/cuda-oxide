@@ -16,6 +16,10 @@
 //! 2. Terminator is translated last and emits zero-operand control-flow ops
 //!    (`mir.goto`, `mir.cond_br`, `mir.switch`, `mir.return`). Cross-block
 //!    data flow happens via the slots, not block arguments.
+//!
+//! Panic blocks are the one exception: a block that ends in a diverging call
+//! into `core::panicking` lowers to a device trap alone, statements included
+//! (see [`translate_block`]).
 
 use super::statement;
 use super::terminator;
@@ -38,6 +42,8 @@ use rustc_public::mir;
 /// * `block_ptr` - Target Pliron IR block (already created)
 /// * `value_map` - MIR local → alloca slot mapping
 /// * `block_map` - Block index → Pliron IR block mapping
+/// * `rustc_mono_successors` - Exact successors selected by rustc's
+///   monomorphization traversal for this block
 /// * `legaliser` - Shared identifier legaliser for name uniqueness
 /// * `entry_prev_op` - For the entry block only: the last op emitted by
 ///   `body::translate_body`'s alloca/store setup (see `emit_entry_allocas`),
@@ -52,10 +58,31 @@ pub fn translate_block(
     block_ptr: Ptr<BasicBlock>,
     value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
+    rustc_mono_successors: &[usize],
     legaliser: &mut Legaliser,
     entry_prev_op: Option<Ptr<Operation>>,
 ) -> TranslationResult<()> {
     let mut prev_op: Option<Ptr<Operation>> = entry_prev_op;
+
+    // A block that ends in a diverging call into `core::panicking` is lowered
+    // to `nvvm.trap` + `mir.unreachable`; the call itself is dropped, because
+    // no panic runtime exists on the device (see
+    // `terminator::is_dropped_panic_call`). Its statements exist only to build
+    // what that call would have consumed -- the message `&str`, the
+    // `format_args!` pieces -- and the block has no successor, so nothing they
+    // write can ever be read. Emitting the trap alone is what makes a panic
+    // carrying a message compile at all: a materialized `&str` constant has no
+    // device lowering, so translating those statements always fails.
+    //
+    // A store *through a pointer* in such a block is dropped along with the
+    // message. That stays inside the model cuda-oxide already uses for panics:
+    // the trap aborts the kernel, and the memory state of an aborted kernel is
+    // unspecified, so the store has no defined observer either way.
+    if terminator::is_dropped_panic_call(&mir_block.terminator) {
+        terminator::emit_dropped_panic_trap(ctx, &mir_block.terminator, block_ptr, prev_op);
+        return Ok(());
+    }
+
     for stmt in &mir_block.statements {
         let op_ptr =
             statement::translate_statement(ctx, body, stmt, value_map, block_ptr, prev_op)?;
@@ -70,6 +97,7 @@ pub fn translate_block(
         block_ptr,
         prev_op,
         block_map,
+        rustc_mono_successors,
         legaliser,
     )?;
 

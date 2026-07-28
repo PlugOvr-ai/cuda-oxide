@@ -1,11 +1,11 @@
 # mir-lower
 
-`dialect-mir` → `dialect-llvm` lowering pass for cuda-oxide.
+`dialect-mir` → LLVM dialect lowering pass for cuda-oxide.
 
-Converts [`dialect-mir`](../dialect-mir/) operations into
-[`dialect-llvm`](../dialect-llvm/) operations, with GPU-specific operations
-lowered to NVVM intrinsics or inline PTX assembly. This is the bridge
-between Rust semantics and LLVM's target-agnostic IR.
+Converts [`dialect-mir`](../dialect-mir/) operations into LLVM dialect
+operations (the LLVM dialect is provided by `pliron-llvm`), with GPU-specific
+operations lowered to NVVM intrinsics or inline PTX assembly. This is the
+bridge between Rust semantics and LLVM's target-agnostic IR.
 
 ## Pipeline Position
 
@@ -19,17 +19,17 @@ Rust Source Code
        │
        ▼
 ┌──────────────┐
-│ mir-importer │  (Stable MIR → dialect-mir, then mem2reg)
+│ mir-importer │  (Stable MIR → dialect-mir, mem2reg, annotated unroll)
 └──────┬───────┘
        │
        ▼
 ┌──────────────┐
-│  mir-lower   │  ◄── THIS CRATE (dialect-mir → dialect-llvm)
+│  mir-lower   │  ◄── THIS CRATE (dialect-mir → LLVM dialect)
 └──────┬───────┘
        │
        ▼
 ┌──────────────┐
-│ dialect-llvm │  (exports to LLVM IR)
+│ llvm-export  │  (exports to LLVM IR)
 └──────┬───────┘
        │
        ▼
@@ -48,11 +48,11 @@ automatically.
 
 For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 
-1. Creates a `dialect-llvm` function with a flattened type signature
+1. Creates an LLVM dialect function with a flattened type signature
 2. Propagates GPU kernel attributes (`gpu_kernel`, `maxntid`, etc.)
 3. Uses `inline_region` to move the `dialect-mir` blocks into the new function
 4. Builds an entry prologue that reconstructs aggregates (slices, structs)
-   from the flattened `dialect-llvm` arguments via `insertvalue`
+   from the flattened LLVM dialect arguments via `insertvalue`
 5. Branches to the original entry block with the reconstructed values
 
 ## Module Structure
@@ -81,7 +81,7 @@ For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 
 ### Type Converter (`convert/types.rs`)
 
-| `dialect-mir` Type   | `dialect-llvm` Type                                 |
+| `dialect-mir` Type   | LLVM dialect Type                                   |
 |----------------------|-----------------------------------------------------|
 | `mir.tuple`          | `llvm.struct` (anonymous, ZST fields dropped)       |
 | `mir.ptr`            | `llvm.ptr` with address space                       |
@@ -89,13 +89,14 @@ For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 | `mir.slice`          | `llvm.struct {ptr, i64}`                            |
 | `mir.disjoint_slice` | `llvm.struct {ptr, i64}` (same as slice)            |
 | `mir.struct`         | `llvm.struct` (padded if layout known, else flat)   |
-| `mir.enum`           | `llvm.struct {discriminant, variant_fields...}`     |
+| `mir.enum`           | `llvm.struct` matching rustc's byte layout          |
 
 ### GPU Intrinsic Converters (`convert/intrinsics/`)
 
 | Module     | Intrinsics                              | Strategy        | GPU       |
 |------------|-----------------------------------------|-----------------|-----------|
-| `basic`    | Thread/block IDs, `barrier0`            | LLVM intrinsics | All       |
+| `generated_intrinsics` | Admitted sreg, barrier, matrix, atomic, redux, and dot-product ops | Backend-selected | Varies |
+| `basic`    | Environment registers and threadfences  | LLVM/PTX        | All       |
 | `warp`     | Shuffle, vote, lane operations          | LLVM intrinsics | All       |
 | `debug`    | `vprintf`, clock, trap                  | LLVM intrinsics | All       |
 | `atomic`   | Scoped GPU + `core::sync` atomics       | LLVM intrinsics | sm_70+    |
@@ -113,14 +114,14 @@ For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 The lowering uses pliron's `DialectConversion` + `DialectConversionRewriter`
 rather than manual walk-and-replace. The framework manages:
 
-- **Value mapping**: source (`dialect-mir`) → target (`dialect-llvm`) value tracking
+- **Value mapping**: source (`dialect-mir`) → target (LLVM dialect) value tracking
 - **Type conversion**: registered via `can_convert_type` / `convert_type`
 - **Block argument patching**: automatic type conversion of block args
 - **Def-before-use ordering**: operations are visited in correct order
 
 Each converter function receives `(ctx, rewriter, op, operands_info)` and
 uses `rewriter.insert_operation()` / `rewriter.replace_operation_with_values()`
-to emit `dialect-llvm` operations.
+to emit LLVM dialect operations.
 
 ## Lowering Strategies
 
@@ -131,7 +132,7 @@ atomics, TMA):
 
 ```text
 dialect-mir/dialect-nvvm: nvvm.read_ptx_sreg_tid_x
-dialect-llvm:             call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+LLVM dialect:             call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 ```
 
 ### Inline PTX Assembly
@@ -142,7 +143,7 @@ moving warp-synchronous ops across control flow:
 
 ```text
 dialect-nvvm:  nvvm.tcgen05_mma_ws_f16
-dialect-llvm:  call void asm "tcgen05.mma.cta_group::1.kind::f16...", "..." #convergent
+LLVM dialect:  call void asm "tcgen05.mma.cta_group::1.kind::f16...", "..." #convergent
 ```
 
 ## Shared Memory Handling
@@ -157,10 +158,10 @@ dialect-llvm:  call void asm "tcgen05.mma.cta_group::1.kind::f16...", "..." #con
 
 - [pliron](https://github.com/vaivaswatha/pliron) — Pliron IR (MLIR-like) framework
 - [dialect-mir](../dialect-mir/) — Source dialect (pliron dialect modelling Rust MIR)
-- [dialect-llvm](../dialect-llvm/) — Target dialect (pliron dialect modelling LLVM IR)
+- [llvm-export](../llvm-export/) — pliron-llvm shim + textual `.ll` exporter
 - [dialect-nvvm](../dialect-nvvm/) — NVVM intrinsic ops
 
 ## Further Reading
 
 - [mir-importer](../mir-importer/) — produces `dialect-mir` from rustc
-- [dialect-llvm](../dialect-llvm/) — exports textual LLVM IR from a `dialect-llvm` module
+- [llvm-export](../llvm-export/) — exports textual LLVM IR from an LLVM dialect module

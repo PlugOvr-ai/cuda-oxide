@@ -12,7 +12,6 @@ from a fresh checkout. If you just want to run an example, the
 |:-----------------|:----------------------------- |:------------------------------------------------------------|
 | **Rust nightly** | `nightly-2026-04-03` (pinned) | Compiler toolchain with `rustc-dev` for the codegen backend |
 | **CUDA Toolkit** | 12.x+                         | Driver API, `nvcc`, PTX assembler                           |
-| **LLVM**         | 21+ with NVPTX backend        | `llc-21`/`llc-22` for LLVM IR → PTX lowering                |
 | **Clang**        | 21+ (`clang-21` pkg)          | `bindgen` in host `cuda-bindings` needs clang's headers     |
 | **Linux**        | Tested on Ubuntu 24.04        | Windows and macOS are not supported                         |
 | **GPU**          | sm_80, sm_90, sm_100a         | Hardware target                                             |
@@ -33,7 +32,7 @@ components. Rustup picks it up automatically:
 # rust-toolchain.toml (already in the repo root)
 [toolchain]
 channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer"]
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
 ```
 
 If you need to install manually:
@@ -58,11 +57,27 @@ nvcc --version   # should print 12.x or later
 If you are building on a system without a GPU (e.g. CI), the toolkit is still
 required for `ptxas` and header files, but you will not be able to run kernels.
 
-## Install LLVM
+## Install LLVM (usually optional)
 
-The codegen pipeline emits LLVM IR and invokes `llc` to produce PTX. LLVM 21
-or later is required — earlier `llc` releases reject the TMA / tcgen05 / WGMMA
-intrinsic signatures that cuda-oxide emits. The NVPTX backend must be enabled:
+The codegen pipeline emits LLVM IR and invokes `llc` to produce PTX. The
+pinned Rust toolchain (`nightly-2026-04-03`) already ships LLVM 22 with the
+NVPTX backend enabled via the `llvm-tools` component, so the recommended
+path is:
+
+```bash
+rustup component add llvm-tools
+```
+
+The component is already listed in `rust-toolchain.toml`, so on a fresh
+clone rustup installs it automatically; running the command above is the
+one-shot fix for older clones. The pipeline auto-detects this `llc` at
+`<sysroot>/lib/rustlib/<host>/bin/llc`.
+
+If you would rather use a system LLVM (for a specific patch level, or
+because you already have one installed), the pipeline falls back to
+`llc-22` / `llc-21` on `PATH`. LLVM 21 is the minimum — earlier releases
+reject the TMA / tcgen05 / WGMMA intrinsic signatures that cuda-oxide
+emits.
 
 ```bash
 # Ubuntu / Debian
@@ -82,9 +97,14 @@ sudo ./llvm.sh 21
 llc-21 --version | grep nvptx
 ```
 
-You should see `nvptx64 - NVIDIA PTX 64-bit` in the target list. The pipeline
-auto-discovers `llc-22` and `llc-21` on `PATH` (in that order); to pin a
-specific binary set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
+You should see `nvptx64 - NVIDIA PTX 64-bit` in the target list.
+
+To pin a specific binary (rustup's, a distro's, or a custom build), set
+`CUDA_OXIDE_LLC=/path/to/llc`. The pipeline's full resolution order is:
+
+1. `$CUDA_OXIDE_LLC` (if set)
+2. The Rust toolchain's `llvm-tools` llc
+3. `llc-22`, then `llc-21`, then bare `llc` on `PATH`
 
 ```{note}
 Older `llc` binaries (LLVM 20 and earlier) will compile simpler kernels when
@@ -124,10 +144,10 @@ build process. `cargo-oxide` handles building it transparently.
 ## Install cargo-oxide
 
 `cargo-oxide` is the cargo subcommand that drives the full compilation
-pipeline. Inside the repo, it works via a workspace alias. For standalone use:
+pipeline. Inside the repo, it works via a workspace alias. For standalone use, install it with the pinned nightly toolchain:
 
 ```bash
-cargo install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
 ```
 
 On first run, `cargo-oxide` automatically fetches and builds the codegen backend
@@ -155,8 +175,17 @@ and prints a success message.
 # Build and run an example
 cargo oxide run <example>
 
+# Print generated PTX only
+cargo oxide inspect <example>
+
 # Show the full compilation pipeline (MIR → LLVM IR → PTX)
 cargo oxide pipeline <example>
+
+# Remove local build outputs and generated artifacts
+cargo oxide clean
+
+# Run under NVIDIA Compute Sanitizer
+cargo oxide sanitize <example> --tool memcheck
 
 # Debug with cuda-gdb
 cargo oxide debug <example> --tui
@@ -205,9 +234,9 @@ cuda-oxide/
 │   ├── cargo-oxide/          # Cargo subcommand
 │   ├── rustc-codegen-cuda/   # Codegen backend (not a workspace member)
 │   ├── mir-importer/         # MIR → Pliron IR translation
-│   ├── mir-lower/            # `dialect-mir` → `dialect-llvm` lowering
+│   ├── mir-lower/            # `dialect-mir` → LLVM dialect lowering
 │   ├── dialect-mir/          # pliron dialect modelling Rust MIR
-│   ├── dialect-llvm/         # pliron dialect modelling LLVM IR (+ export)
+│   ├── llvm-export/          # shim re-exporting pliron-llvm + textual .ll export
 │   ├── dialect-nvvm/         # NVVM intrinsics dialect
 │   ├── libnvvm-sys/          # dlopen bindings to libNVVM
 │   ├── nvjitlink-sys/        # dlopen bindings to nvJitLink
@@ -219,9 +248,11 @@ cuda-oxide/
 ## Troubleshooting
 
 `llc` not found or missing NVPTX
-: Ensure LLVM 21+ is installed and `llc-21` (or `llc-22`) is on your `PATH`.
-  The pipeline probes `llc-22` → `llc-21` in order; alternatively set
-  `CUDA_OXIDE_LLC=/usr/bin/llc-21` to point at a specific binary.
+: The fastest fix is `rustup component add llvm-tools` — the pinned
+  toolchain's `llc` is LLVM 22 with NVPTX enabled and is auto-picked up.
+  Otherwise install a system LLVM 21+ (`sudo apt install llvm-21`); the
+  pipeline probes the rustup `llc` first, then `llc-22` → `llc-21` on
+  `PATH`. To pin a specific binary set `CUDA_OXIDE_LLC=/path/to/llc`.
 
 `Intrinsic has incorrect argument type!` (from `llc`)
 : Your `llc` is older than LLVM 21 and cannot lower the modern TMA / tcgen05

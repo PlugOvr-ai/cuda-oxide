@@ -229,9 +229,10 @@ registers and then use `stmatrix` to write to shared memory:
 
 ```rust
 use cuda_device::tcgen05::{
+    cvt_f32x2_bf16x2,
     tcgen05_ld_16x256b_pure,
     tcgen05_load_wait,
-    stmatrix_m8n8_x4,
+    stmatrix_m8n8_x2,
     TmemF32x4,
 };
 
@@ -240,8 +241,12 @@ unsafe {
     let regs: TmemF32x4 = tcgen05_ld_16x256b_pure(tmem.raw_address());
     tcgen05_load_wait();
 
-    // Store from registers to shared memory (warp-collective)
-    stmatrix_m8n8_x4(smem_ptr, regs[0], regs[1], regs[2], regs[3]);
+    // Convert four f32 accumulators into two registers of packed bf16 values.
+    let packed0 = cvt_f32x2_bf16x2(regs[0], regs[1]);
+    let packed1 = cvt_f32x2_bf16x2(regs[2], regs[3]);
+
+    // Store two 8×8 matrices from registers (warp-collective).
+    stmatrix_m8n8_x2(smem_ptr, packed0, packed1);
 }
 ```
 
@@ -303,6 +308,17 @@ This is the kernel structure that cuBLAS and CUTLASS use internally. With
 cuda-oxide, you can build this same structure in Rust — using `SharedArray`
 for tiles, `ManagedBarrier` for synchronization, and the MMA APIs for
 compute.
+
+The [`gemm_sol`
+example](https://github.com/NVlabs/cuda-oxide/tree/main/crates/rustc-codegen-cuda/examples/gemm_sol)
+is the worked-out reference. Its 4-stage `cta_group::2` pipeline reaches
+**868 TFLOPS at 4096³ — 57.8 % of `cublasLtMatmul` SoL — on B200 (148 SMs)**.
+Absolute throughput scales with SM count on smaller Blackwell datacenter
+SKUs (e.g., on an 80-SM variant the same kernel runs at ~204 TFLOPS / ~46 %
+SoL — see the per-phase tables in the example's README for both
+configurations). The example measures the cublasLt baseline live via
+`bench/cublaslt_bench`, so its "% of SoL" column is always relative to the
+host GPU's cublasLt peak rather than a fixed B200 number.
 
 :::{seealso}
 - [Shared Memory and Synchronization](shared-memory-and-synchronization.md) —

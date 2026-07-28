@@ -32,7 +32,7 @@
 //! | `MatchAllSyncI64` | `llvm.nvvm.match.all.sync.i64p`   | 64-bit variant               |
 
 use crate::convert::intrinsics::common::*;
-use dialect_llvm::types as llvm_types;
+use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -131,6 +131,59 @@ pub(crate) fn convert_shuffle_f32(
     Ok(())
 }
 
+/// Convert a 64-bit shuffle op to convergent inline PTX.
+///
+/// PTX `shfl.sync` only moves 32-bit registers (no `.b64` form, no
+/// `@llvm.nvvm.shfl.sync.*.i64` intrinsic), so a 64-bit shuffle is two 32-bit
+/// shuffles. We emit a single inline-PTX block that unpacks the value into
+/// `{lo, hi}` halves with `mov.b64`, runs `shfl.sync.<mode>.b32` on each half
+/// with the shared lane and membermask operands, then repacks the result.
+/// Keeping both halves in one compiler-visible convergent block prevents code
+/// motion between them. Hardware still executes two sequential `b32` shuffles.
+///
+/// The shfl `c` (clamp/segmentation) operand is baked into the template per
+/// mode: `31` for idx/bfly/down and `0` for up — exactly the value the 32-bit
+/// intrinsic path passes (see [`convert_shuffle_i32`]).
+///
+/// Operand layout: `[mask, value, lane_or_delta]`. Inline-asm operand order is
+/// `$0`=result, `$1`=value (i64, `l`), `$2`=lane/delta (i32, `r`),
+/// `$3`=membermask (i32, `r`).
+pub(crate) fn convert_shuffle_i64(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+    mode: &str,
+    clamp: i32,
+) -> Result<()> {
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 3 {
+        return pliron::input_err_noloc!(
+            "Warp shuffle i64 requires 3 operands [mask, value, lane_or_delta]"
+        );
+    }
+    let (mask, val, lane_or_delta) = (operands[0], operands[1], operands[2]);
+
+    let asm_template = format!(
+        "{{ .reg .b32 lo; .reg .b32 hi; mov.b64 {{lo, hi}}, $1; \
+         shfl.sync.{mode}.b32 lo, lo, $2, {clamp}, $3; \
+         shfl.sync.{mode}.b32 hi, hi, $2, {clamp}, $3; \
+         mov.b64 $0, {{lo, hi}}; }}"
+    );
+    let asm_op = inline_asm_convergent(
+        ctx,
+        rewriter,
+        i64_ty.into(),
+        vec![val, lane_or_delta, mask],
+        &asm_template,
+        "=l,l,r,r",
+    );
+    rewriter.replace_operation(ctx, op, asm_op);
+    Ok(())
+}
+
 /// Convert vote operation to LLVM intrinsic call.
 ///
 /// Operand layout: `[mask, predicate]`. See `convert_shuffle_i32` for
@@ -151,7 +204,7 @@ pub(crate) fn convert_vote(
     }
     let (mask, predicate) = (operands[0], operands[1]);
 
-    let result_ty: Ptr<pliron::r#type::TypeObj> = if intrinsic_name.contains("ballot") {
+    let result_ty: pliron::r#type::TypeHandle = if intrinsic_name.contains("ballot") {
         i32_ty.into()
     } else {
         i1_ty.into()
@@ -181,7 +234,7 @@ pub(crate) fn convert_match_any(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
     intrinsic_name: &str,
-    value_ty: Ptr<pliron::r#type::TypeObj>,
+    value_ty: pliron::r#type::TypeHandle,
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
@@ -201,6 +254,46 @@ pub(crate) fn convert_match_any(
         intrinsic_name,
         func_ty,
         vec![mask, value],
+    )?;
+    rewriter.replace_operation(ctx, op, call_op);
+    Ok(())
+}
+
+/// Convert a `redux.sync.add` op to its LLVM intrinsic call.
+///
+/// Op operand layout is `[mask, value]` (matching the other `*_sync`
+/// collectives), but the LLVM intrinsic signature is `(src, membermask)`, so
+/// we forward the operands flipped as `[value, mask]`. Result is i32.
+pub(crate) fn convert_redux(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+    intrinsic_name: &str,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("redux requires 2 operands [mask, value]");
+    }
+    let (mask, value) = (operands[0], operands[1]);
+
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        i32_ty.into(),
+        vec![i32_ty.into(), i32_ty.into()],
+        false,
+    );
+
+    // LLVM intrinsic wants (src, membermask): flip to [value, mask].
+    let call_op = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        intrinsic_name,
+        func_ty,
+        vec![value, mask],
     )?;
     rewriter.replace_operation(ctx, op, call_op);
     Ok(())
@@ -268,9 +361,9 @@ pub(crate) fn convert_match_all(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
     intrinsic_name: &str,
-    value_ty: Ptr<pliron::r#type::TypeObj>,
+    value_ty: pliron::r#type::TypeHandle,
 ) -> Result<()> {
-    use dialect_llvm::ops::ExtractValueOp;
+    use llvm_export::ops::ExtractValueOp;
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
@@ -301,5 +394,103 @@ pub(crate) fn convert_match_all(
     let mask_result = extract_op.get_operation().deref(ctx).get_result(0);
 
     rewriter.replace_operation_with_values(ctx, op, vec![mask_result]);
+    Ok(())
+}
+
+/// Convert `elect.sync` through LLVM's typed NVVM intrinsic.
+pub(crate) fn convert_elect_sync_typed(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+    intrinsic_name: &str,
+) -> Result<()> {
+    use llvm_export::ops::ExtractValueOp;
+
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 1 {
+        return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
+    }
+
+    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i1_ty.into()]);
+    let func_ty = llvm_types::FuncType::get(ctx, struct_ty.into(), vec![i32_ty.into()], false);
+    let call = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        intrinsic_name,
+        func_ty,
+        vec![operands[0]],
+    )?;
+    let result = call.deref(ctx).get_result(0);
+    let leader = ExtractValueOp::new(ctx, result, vec![0])
+        .map_err(|error| pliron::input_error_noloc!("elect.sync extractvalue: {}", error))?;
+    rewriter.insert_operation(ctx, leader.get_operation());
+    let elected = ExtractValueOp::new(ctx, result, vec![1])
+        .map_err(|error| pliron::input_error_noloc!("elect.sync extractvalue: {}", error))?;
+    rewriter.insert_operation(ctx, elected.get_operation());
+    let leader = leader.get_operation().deref(ctx).get_result(0);
+    let elected = elected.get_operation().deref(ctx).get_result(0);
+    rewriter.replace_operation_with_values(ctx, op, vec![leader, elected]);
+    Ok(())
+}
+
+/// Convert `elect.sync` to convergent inline PTX.
+///
+/// PTX `elect.sync d|p, membermask;` writes the leader lane id into `d` and the
+/// per-lane "I am the leader" predicate into `p`. Inline asm can't yield a
+/// `.pred` directly, so we `selp.b32` it into a 0/1 register and truncate to i1.
+/// The op has two results — leader (i32) and is_elected (i1) — bound to the two
+/// asm outputs. The single operand (the membermask) is the asm input; either
+/// result may be unused at the call site and is then removed by LLVM DCE.
+pub(crate) fn convert_elect_sync_inline(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    use llvm_export::ops::ExtractValueOp;
+
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 1 {
+        return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
+    }
+    let mask = operands[0];
+
+    // Two register outputs: $0 = leader lane id, $1 = predicate materialized as
+    // 0/1; $2 = membermask input. The `.pred p` is scoped to the asm block.
+    let asm_template = "{ .reg .pred p; elect.sync $0|p, $2; selp.b32 $1, 1, 0, p; }";
+    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i32_ty.into()]);
+    let asm_op = inline_asm_convergent(
+        ctx,
+        rewriter,
+        struct_ty.into(),
+        vec![mask],
+        asm_template,
+        "=r,=r,r",
+    );
+    let struct_result = asm_op.deref(ctx).get_result(0);
+
+    // Field 0 → leader lane id (result 0). Field 1 → predicate as 0/1 i32,
+    // truncated to the i1 is_elected result (result 1).
+    let leader = {
+        let extract_op = ExtractValueOp::new(ctx, struct_result, vec![0])
+            .map_err(|e| pliron::input_error_noloc!("elect.sync extractvalue: {}", e))?;
+        rewriter.insert_operation(ctx, extract_op.get_operation());
+        extract_op.get_operation().deref(ctx).get_result(0)
+    };
+    let elected_i32 = {
+        let extract_op = ExtractValueOp::new(ctx, struct_result, vec![1])
+            .map_err(|e| pliron::input_error_noloc!("elect.sync extractvalue: {}", e))?;
+        rewriter.insert_operation(ctx, extract_op.get_operation());
+        extract_op.get_operation().deref(ctx).get_result(0)
+    };
+    let is_elected = trunc_to_i1(ctx, rewriter, elected_i32);
+
+    rewriter.replace_operation_with_values(ctx, op, vec![leader, is_elected]);
     Ok(())
 }

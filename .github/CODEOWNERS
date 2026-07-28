@@ -1,0 +1,2 @@
+# Low-level CUDA FFI changes require review from the cuda-bindings maintainer.
+/crates/cuda-bindings/ @nihalpasham

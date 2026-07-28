@@ -9,6 +9,7 @@
 //! bypassing the old category sub-enum dispatch.
 
 use pliron::{
+    builtin::ops::ConstantOp,
     context::Context,
     derive::op_interface_impl,
     irbuild::{
@@ -19,55 +20,25 @@ use pliron::{
     result::Result,
 };
 
-use dialect_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
+use llvm_export::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
 
 use crate::conversion_interface::MirToLlvmConversion;
 
 use dialect_mir::ops::{
     MirAddOp, MirAllocaOp, MirArrayElementAddrOp, MirAssertOp, MirBitAndOp, MirBitOrOp,
-    MirBitXorOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp, MirCheckedSubOp,
-    MirCondBranchOp, MirConstantOp, MirConstructArrayOp, MirConstructEnumOp, MirConstructStructOp,
-    MirConstructTupleOp, MirDivOp, MirEnumPayloadOp, MirEqOp, MirExtractArrayElementOp,
-    MirExtractFieldOp, MirFieldAddrOp, MirFloatConstantOp, MirGeOp, MirGetDiscriminantOp,
-    MirGotoOp, MirGtOp, MirInsertFieldOp, MirLeOp, MirLoadOp, MirLtOp, MirMulOp, MirNeOp, MirNegOp,
-    MirNotOp, MirPtrOffsetOp, MirRefOp, MirRemOp, MirReturnOp, MirShlOp, MirShrOp,
-    MirStorageDeadOp, MirStorageLiveOp, MirStoreOp, MirSubOp, MirUndefOp, MirUnreachableOp,
+    MirBitXorOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp, MirCheckedSubOp, MirCmpOp,
+    MirCondBranchOp, MirConstantOp, MirConstructArrayOp, MirConstructEnumOp, MirConstructSliceOp,
+    MirConstructStructOp, MirConstructTupleOp, MirDbgValueOp, MirDivOp, MirEnumPayloadOp, MirEqOp,
+    MirExtractArrayElementOp, MirExtractFieldOp, MirFieldAddrOp, MirFloatConstantOp, MirGeOp,
+    MirGetDiscriminantOp, MirGotoOp, MirGtOp, MirInsertFieldOp, MirLeOp, MirLoadOp, MirLtOp,
+    MirMemcpyOp, MirMemmoveOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp,
+    MirRemOp, MirReturnOp, MirSetDiscriminantOp, MirShlOp, MirShrOp, MirStorageDeadOp,
+    MirStorageLiveOp, MirStoreOp, MirSubOp, MirUndefOp, MirUnreachableOp, MirUnrollHintOp,
 };
 use dialect_nvvm::ops::{
-    ActiveMaskOp, BarWarpSyncOp, Barrier0Op, BreakpointOp, ClcQueryGetFirstCtaidXOp,
-    ClcQueryGetFirstCtaidYOp, ClcQueryGetFirstCtaidZOp, ClcQueryIsCanceledOp,
-    ClcTryCancelMulticastOp, ClcTryCancelOp, ClusterSyncOp, CpAsyncBulkCommitGroupOp,
-    CpAsyncBulkTensorG2sTile1dOp, CpAsyncBulkTensorG2sTile2dMulticastCg2Op,
-    CpAsyncBulkTensorG2sTile2dMulticastOp, CpAsyncBulkTensorG2sTile2dOp,
-    CpAsyncBulkTensorG2sTile3dOp, CpAsyncBulkTensorG2sTile4dOp, CpAsyncBulkTensorG2sTile5dOp,
-    CpAsyncBulkTensorS2gTile1dOp, CpAsyncBulkTensorS2gTile2dOp, CpAsyncBulkTensorS2gTile3dOp,
-    CpAsyncBulkTensorS2gTile4dOp, CpAsyncBulkTensorS2gTile5dOp, CpAsyncBulkWaitGroupOp,
-    CpAsyncBulkWaitGroupReadOp, CvtF32x2Bf16x2Op, DsmemReadU32Op, FenceProxyAsyncSharedCtaOp,
-    MapaSharedClusterOp, MatchAllSyncI32Op, MatchAllSyncI64Op, MatchAnySyncI32Op,
-    MatchAnySyncI64Op, MbarrierArriveClusterOp, MbarrierArriveExpectTxSharedOp,
-    MbarrierArriveSharedOp, MbarrierInitSharedOp, MbarrierInvalSharedOp, MbarrierTestWaitSharedOp,
-    MbarrierTryWaitParitySharedOp, MbarrierTryWaitSharedOp, NanosleepOp, NvvmAtomicCmpxchgOp,
-    NvvmAtomicLoadOp, NvvmAtomicRmwOp, NvvmAtomicStoreOp, PmEventOp, ReadPtxSregClock64Op,
-    ReadPtxSregClockOp, ReadPtxSregClusterCtaidXOp, ReadPtxSregClusterCtaidYOp,
-    ReadPtxSregClusterCtaidZOp, ReadPtxSregClusterIdxOp, ReadPtxSregClusterNctaidXOp,
-    ReadPtxSregClusterNctaidYOp, ReadPtxSregClusterNctaidZOp, ReadPtxSregCtaidXOp,
-    ReadPtxSregCtaidYOp, ReadPtxSregCtaidZOp, ReadPtxSregEnvReg1Op, ReadPtxSregEnvReg2Op,
-    ReadPtxSregLaneIdOp, ReadPtxSregNclusterIdOp, ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp,
-    ReadPtxSregNctaidZOp, ReadPtxSregNtidXOp, ReadPtxSregNtidYOp, ReadPtxSregNtidZOp,
-    ReadPtxSregTidXOp, ReadPtxSregTidYOp, ReadPtxSregTidZOp, ShflSyncBflyF32Op, ShflSyncBflyI32Op,
-    ShflSyncDownF32Op, ShflSyncDownI32Op, ShflSyncIdxF32Op, ShflSyncIdxI32Op, ShflSyncUpF32Op,
-    ShflSyncUpI32Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp, StmatrixM8n8X4Op,
-    StmatrixM8n8X4TransOp, Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op,
-    Tcgen05CommitMulticastCg2Op, Tcgen05CommitOp, Tcgen05CommitSharedClusterCg2Op,
-    Tcgen05CommitSharedClusterOp, Tcgen05CpSmemToTmemCg2Op, Tcgen05CpSmemToTmemOp,
-    Tcgen05DeallocCg2Op, Tcgen05DeallocOp, Tcgen05FenceAfterThreadSyncOp,
-    Tcgen05FenceBeforeThreadSyncOp, Tcgen05Ld16x256bPureOp, Tcgen05Ld16x256bX8PureOp,
-    Tcgen05LoadWaitOp, Tcgen05MmaF16Cg2Op, Tcgen05MmaF16Op, Tcgen05MmaWsBf16Op, Tcgen05MmaWsF16Op,
-    Tcgen05MmaWsTf32Op, Tcgen05RelinquishAllocPermitCg2Op, Tcgen05RelinquishAllocPermitOp,
-    Tcgen05StoreWaitOp, ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp, TrapOp,
-    VoteSyncAllOp, VoteSyncAnyOp, VoteSyncBallotOp, VprintfOp, WgmmaCommitGroupSyncAlignedOp,
-    WgmmaFenceSyncAlignedOp, WgmmaMakeSmemDescOp, WgmmaMmaM64N64K16F32Bf16Op,
-    WgmmaWaitGroupSyncAlignedOp, MmaSyncM16N8K8F32Tf32Op,
+    AssertFailOp, InlinePtxOp, MmaSyncM16N8K8F32Tf32Op, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
+    NvvmAtomicRmwOp, NvvmAtomicStoreOp, ReadPtxSregClusterIdxOp, ReadPtxSregNclusterIdOp,
+    VprintfOp, WgmmaMakeSmemDescOp, WgmmaMmaM64N64K16F32Bf16Op,
 };
 
 // ---- Arithmetic ops --------------------------------------------------------
@@ -348,6 +319,23 @@ impl MirToLlvmConversion for MirGeOp {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for MirCmpOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::arithmetic::convert_three_way_cmp(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for MirEqOp {
     fn convert(
         &self,
@@ -382,7 +370,7 @@ impl MirToLlvmConversion for MirNeOp {
             operands_info,
             ICmpPredicateAttr::NE,
             ICmpPredicateAttr::NE,
-            FCmpPredicateAttr::ONE,
+            FCmpPredicateAttr::UNE,
         )
     }
 }
@@ -414,6 +402,30 @@ impl MirToLlvmConversion for MirStoreOp {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for MirMemcpyOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::memory::convert_memcpy(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirMemmoveOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::memory::convert_memmove(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for MirLoadOp {
     fn convert(
         &self,
@@ -422,6 +434,18 @@ impl MirToLlvmConversion for MirLoadOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::ops::memory::convert_load(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirDbgValueOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::memory::convert_dbg_value(ctx, rewriter, self.get_operation(), operands_info)
     }
 }
 
@@ -460,6 +484,23 @@ impl MirToLlvmConversion for MirConstantOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::ops::constants::convert_integer(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+/// A `builtin.constant` that `sccp` materialised carries a signed/unsigned MIR
+/// integer type; normalise it to a signless constant, exactly like `mir.constant`.
+/// Only a non-signless `builtin.constant` reaches here (see `can_convert_op`), so
+/// the emitted signless constant is final and the conversion converges.
+#[op_interface_impl]
+impl MirToLlvmConversion for ConstantOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let value = self.get_value(ctx);
+        super::ops::constants::convert_builtin_constant(ctx, rewriter, self.get_operation(), value)
     }
 }
 
@@ -572,6 +613,23 @@ impl MirToLlvmConversion for MirConstructTupleOp {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for MirConstructSliceOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::aggregate::convert_construct_slice(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for MirConstructArrayOp {
     fn convert(
         &self,
@@ -648,6 +706,23 @@ impl MirToLlvmConversion for MirEnumPayloadOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::ops::aggregate::convert_enum_payload(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirSetDiscriminantOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::aggregate::convert_set_discriminant(
             ctx,
             rewriter,
             self.get_operation(),
@@ -804,287 +879,34 @@ impl MirToLlvmConversion for MirStorageDeadOp {
     }
 }
 
+// Safety net: the loop-unroll pass consumes every `mir.unroll_hint` before
+// lowering, so one should never reach here. But if unrolling is skipped (e.g.
+// a debug build that bypasses the pass), drop the hint rather than fail the
+// conversion: it carries no runtime semantics, only a request to unroll.
+#[op_interface_impl]
+impl MirToLlvmConversion for MirUnrollHintOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        rewriter.erase_operation(ctx, self.get_operation());
+        Ok(())
+    }
+}
+
 // ---- NVVM Basic ops --------------------------------------------------------
 
 #[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregTidXOp {
+impl MirToLlvmConversion for InlinePtxOp {
     fn convert(
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_tid_x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregTidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_tid_y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregCtaidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ctaid_x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregCtaidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ctaid_y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNtidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNtidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregTidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_tid_z",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregCtaidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ctaid_z",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNtidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_z",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNctaidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNctaidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregNctaidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_z",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregEnvReg1Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_envreg1",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregEnvReg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_envreg2",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregLaneIdOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_laneid",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Barrier0Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_barrier0(
+        super::intrinsics::asm::convert_inline_ptx(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1094,125 +916,14 @@ impl MirToLlvmConversion for Barrier0Op {
 }
 
 #[op_interface_impl]
-impl MirToLlvmConversion for ThreadfenceBlockOp {
+impl MirToLlvmConversion for AssertFailOp {
     fn convert(
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_threadfence_block(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ThreadfenceOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_threadfence(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ThreadfenceSystemOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::basic::convert_threadfence_system(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-// ---- NVVM Debug ops --------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClockOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::debug::convert_clock(ctx, rewriter, self.get_operation(), operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClock64Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::debug::convert_clock64(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for TrapOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::debug::convert_trap(ctx, rewriter, self.get_operation(), operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for BreakpointOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::debug::convert_breakpoint(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for PmEventOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::debug::convert_pm_event(
+        super::intrinsics::debug::convert_assertfail(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1238,116 +949,6 @@ impl MirToLlvmConversion for VprintfOp {
     }
 }
 
-// ---- NVVM Cluster ops ------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterCtaidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_ctaid.x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterCtaidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_ctaid.y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterCtaidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_ctaid.z",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterNctaidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_nctaid.x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterNctaidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_nctaid.y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ReadPtxSregClusterNctaidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%cluster_nctaid.z",
-        )
-    }
-}
-
 #[op_interface_impl]
 impl MirToLlvmConversion for ReadPtxSregClusterIdxOp {
     fn convert(
@@ -1356,12 +957,11 @@ impl MirToLlvmConversion for ReadPtxSregClusterIdxOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
+        super::intrinsics::cluster::convert_cluster_idx(
             ctx,
             rewriter,
             self.get_operation(),
             operands_info,
-            "%cluster_idx",
         )
     }
 }
@@ -1374,564 +974,7 @@ impl MirToLlvmConversion for ReadPtxSregNclusterIdOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sreg(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "%nclusterid",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClusterSyncOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_cluster_sync(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MapaSharedClusterOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_mapa_shared_cluster(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for DsmemReadU32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::cluster::convert_dsmem_read_u32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-// ---- NVVM Warp ops ---------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncIdxI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_idx_i32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncBflyI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_bfly_i32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncDownI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_down_i32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncUpI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_up_i32",
-            0,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncIdxF32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_f32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_idx_f32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncBflyF32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_f32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_bfly_f32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncDownF32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_f32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_down_f32",
-            31,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ShflSyncUpF32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_shuffle_f32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_shfl_sync_up_f32",
-            0,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for VoteSyncAllOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_vote(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_vote_all_sync",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for VoteSyncAnyOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_vote(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_vote_any_sync",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for VoteSyncBallotOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_vote(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_vote_ballot_sync",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MatchAnySyncI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        let i32_ty = pliron::builtin::types::IntegerType::get(
-            ctx,
-            32,
-            pliron::builtin::types::Signedness::Signless,
-        );
-        super::intrinsics::warp::convert_match_any(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_match_any_sync_i32",
-            i32_ty.into(),
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MatchAnySyncI64Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        let i64_ty = pliron::builtin::types::IntegerType::get(
-            ctx,
-            64,
-            pliron::builtin::types::Signedness::Signless,
-        );
-        super::intrinsics::warp::convert_match_any(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_match_any_sync_i64",
-            i64_ty.into(),
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MatchAllSyncI32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        let i32_ty = pliron::builtin::types::IntegerType::get(
-            ctx,
-            32,
-            pliron::builtin::types::Signedness::Signless,
-        );
-        super::intrinsics::warp::convert_match_all(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_match_all_sync_i32p",
-            i32_ty.into(),
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ActiveMaskOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_active_mask(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for BarWarpSyncOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::warp::convert_bar_warp_sync(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MatchAllSyncI64Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        let i64_ty = pliron::builtin::types::IntegerType::get(
-            ctx,
-            64,
-            pliron::builtin::types::Signedness::Signless,
-        );
-        super::intrinsics::warp::convert_match_all(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_match_all_sync_i64p",
-            i64_ty.into(),
-        )
-    }
-}
-
-// ---- NVVM Mbarrier ops -----------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierInitSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_init(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierArriveSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_arrive(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierArriveExpectTxSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_arrive_expect_tx(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierTestWaitSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_test_wait(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierTryWaitSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_try_wait(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierTryWaitParitySharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_try_wait_parity(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierInvalSharedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_inval(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for FenceProxyAsyncSharedCtaOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_fence_proxy_async(ctx, rewriter, operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for MbarrierArriveClusterOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_arrive_cluster(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for NanosleepOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::mbarrier::convert_nanosleep(
+        super::intrinsics::cluster::convert_num_clusters(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1941,52 +984,6 @@ impl MirToLlvmConversion for NanosleepOp {
 }
 
 // ---- NVVM WGMMA ops --------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for WgmmaFenceSyncAlignedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::wgmma::convert_fence(ctx, rewriter, self.get_operation(), operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for WgmmaCommitGroupSyncAlignedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::wgmma::convert_commit_group(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for WgmmaWaitGroupSyncAlignedOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::wgmma::convert_wait_group(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
 
 #[op_interface_impl]
 impl MirToLlvmConversion for WgmmaMakeSmemDescOp {
@@ -2034,746 +1031,7 @@ impl MirToLlvmConversion for MmaSyncM16N8K8F32Tf32Op {
     }
 }
 
-// ---- NVVM Tcgen05 ops ------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05AllocOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_alloc(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05DeallocOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_dealloc(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05RelinquishAllocPermitOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_relinquish_alloc_permit(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05FenceBeforeThreadSyncOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_fence_before_thread_sync(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05FenceAfterThreadSyncOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_fence_after_thread_sync(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CommitOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_commit(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CommitSharedClusterOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_commit_shared_cluster(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05MmaWsF16Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_mma_ws(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "f16",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05MmaWsBf16Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_mma_ws(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "bf16",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05MmaWsTf32Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_mma_ws(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "tf32",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05MmaF16Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_mma_f16(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CpSmemToTmemOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_cp_smem_to_tmem(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05Ld16x256bX8PureOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_ld_16x256b_x8_pure(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05Ld16x256bPureOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_ld_16x256b_pure(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CvtF32x2Bf16x2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_cvt_f32x2_bf16x2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05LoadWaitOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_load_wait(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05StoreWaitOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_store_wait(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05AllocCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_alloc_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05DeallocCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_dealloc_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05RelinquishAllocPermitCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_relinquish_alloc_permit_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05MmaF16Cg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_mma_f16_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CommitCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_commit_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CommitSharedClusterCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_commit_shared_cluster_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CommitMulticastCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_commit_multicast_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for Tcgen05CpSmemToTmemCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tcgen05::convert_cp_smem_to_tmem_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-// ---- NVVM TMA ops ----------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile1dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            1,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile2dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            2,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile2dMulticastOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            2,
-            true,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile2dMulticastCg2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s_multicast_cg2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile3dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            3,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile4dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            4,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorG2sTile5dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_g2s(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            5,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorS2gTile1dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_s2g(ctx, rewriter, self.get_operation(), operands_info, 1)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorS2gTile2dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_s2g(ctx, rewriter, self.get_operation(), operands_info, 2)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorS2gTile3dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_s2g(ctx, rewriter, self.get_operation(), operands_info, 3)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorS2gTile4dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_s2g(ctx, rewriter, self.get_operation(), operands_info, 4)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkTensorS2gTile5dOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_s2g(ctx, rewriter, self.get_operation(), operands_info, 5)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkCommitGroupOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_commit_group(ctx, rewriter, operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkWaitGroupOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_wait_group(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for CpAsyncBulkWaitGroupReadOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::tma::convert_wait_group(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            true,
-        )
-    }
-}
-
-// ---- NVVM Stmatrix ops -----------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for StmatrixM8n8X4Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::stmatrix::convert_m8n8_x4(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for StmatrixM8n8X4TransOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::stmatrix::convert_m8n8_x4_trans(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for StmatrixM8n8X2Op {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::stmatrix::convert_m8n8_x2(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for StmatrixM8n8X2TransOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::stmatrix::convert_m8n8_x2_trans(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
+// ---- NVVM WMMA ops ---------------------------------------------------------
 
 // ---- NVVM Atomic ops -------------------------------------------------------
 
@@ -2841,115 +1099,6 @@ impl MirToLlvmConversion for NvvmAtomicCmpxchgOp {
             rewriter,
             self.get_operation(),
             operands_info,
-        )
-    }
-}
-
-// ---- NVVM CLC ops ----------------------------------------------------------
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcTryCancelOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_try_cancel(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            false,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcTryCancelMulticastOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_try_cancel(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            true,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcQueryIsCanceledOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_query_is_canceled(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcQueryGetFirstCtaidXOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_query_get_first_ctaid(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "x",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcQueryGetFirstCtaidYOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_query_get_first_ctaid(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "y",
-        )
-    }
-}
-
-#[op_interface_impl]
-impl MirToLlvmConversion for ClcQueryGetFirstCtaidZOp {
-    fn convert(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        super::intrinsics::clc::convert_query_get_first_ctaid(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "z",
         )
     }
 }

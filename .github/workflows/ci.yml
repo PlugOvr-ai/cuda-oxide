@@ -1,0 +1,25 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-gate-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    uses: ./.github/workflows/fmt.yml
+
+  clippy:
+    uses: ./.github/workflows/clippy.yml
+
+  unit-tests:
+    uses: ./.github/workflows/unit-tests.yml
+
+  cargo-deny:
+    uses: ./.github/workflows/cargo-deny.yml

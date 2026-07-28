@@ -7,8 +7,9 @@ the host to customize GPU behavior, all without runtime overhead.
 
 ## Generic kernels
 
-A kernel can be generic over types and trait bounds, just like any Rust function.
-The compiler monomorphizes each instantiation into a separate PTX entry point:
+A kernel can be generic over types, const values, and trait bounds, just like
+any Rust function. The compiler monomorphizes each specialization into a
+separate PTX entry point:
 
 ```rust
 use cuda_device::{kernel, thread, DisjointSlice};
@@ -33,22 +34,27 @@ pub fn scale<T: Copy + Mul<Output = T>>(
 Each monomorphization produces a distinct PTX entry point. Non-generic kernels
 keep their plain function name. Generic kernels (including closure-generic
 kernels) get a `_TID_<hex32>` suffix where `<hex32>` is rustc's stable
-type-id hash of the *tuple* of generic arguments, rendered as 32 lowercase
-hex characters:
+type-id hash of the concrete generated kernel function item, rendered as 32
+lowercase hex characters:
 
 | Instantiation             | PTX entry point name |
 |:--------------------------|:---------------------|
 | `vecadd` (non-generic)    | `vecadd`             |
 | `scale::<f32>`            | `scale_TID_<hex32>`  |
 | `scale::<MyType>`         | `scale_TID_<hex32>`  |
+| `tile::<4>`               | `tile_TID_<hex32>`   |
+| `tile::<8>`               | `tile_TID_<hex32>`   |
 | `map::<f32, _>` (closure) | `map_TID_<hex32>`    |
 
-Both the host launcher and the device backend ask the same rustc invocation
-for the same hash, so the strings match byte-for-byte. Hashing the tuple
-(not each argument independently) keeps the on-wire name a fixed length
-regardless of how many generic parameters the kernel takes. Borrow
-lifetimes are erased before hashing, so `&'a T` and `&'static T` produce
-the same hash for the same shape `T`.
+Both the host launcher and the device backend ask the pinned rustc toolchain
+for the same `FnDef` hash within one unified build, so the strings match
+byte-for-byte. The function item contains its definition plus every ordered
+type and const argument. The on-wire name therefore remains fixed-length
+regardless of generic arity. Borrow lifetimes are erased before hashing, so
+they do not create duplicate GPU code.
+
+Treat the suffix as a build artifact, not a permanent ABI: host code and PTX
+must be built together with cuda-oxide's pinned rustc toolchain.
 
 ### Launching generic kernels
 
@@ -59,20 +65,157 @@ entry point:
 ```rust
 use cuda_core::LaunchConfig;
 
-module
-    .scale::<f32>(
+// SAFETY: config is 1D and both buffers cover every launched index.
+unsafe {
+    module.scale::<f32>(
         &stream,
         LaunchConfig::for_num_elems(N as u32),
         2.0f32,
         &input_dev,
         &mut output_dev,
     )
-    .expect("Launch failed");
+}
+.expect("Launch failed");
 ```
 
 The generated method forces monomorphization of `scale::<f32>` so the
 instantiation appears in the compiled PTX even though it is never called
 directly on the CPU.
+
+### Compile-time kernel policies
+
+A policy type groups tuning choices for one generic kernel:
+
+```rust
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+
+use cuda_core::LaunchConfig1D;
+use cuda_device::{
+    cuda_module, kernel, launch_bounds, launch_contract, thread, DisjointSlice,
+};
+
+trait TransformPolicy {
+    const MAX_THREADS: u32;
+    const MIN_BLOCKS: u32;
+    const UNROLL: u32;
+}
+
+enum Small {}
+impl TransformPolicy for Small {
+    const MAX_THREADS: u32 = 64;
+    const MIN_BLOCKS: u32 = 2;
+    const UNROLL: u32 = 2;
+}
+
+enum Wide {}
+impl TransformPolicy for Wide {
+    const MAX_THREADS: u32 = 256;
+    const MIN_BLOCKS: u32 = 1;
+    const UNROLL: u32 = 4;
+}
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    #[kernel]
+    #[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+    #[launch_contract(domain = 1)]
+    pub fn transform<P: TransformPolicy>(mut output: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        if let Some(value) = output.get_mut(index) {
+            let mut step = 0;
+            #[unroll(P::UNROLL)]
+            while step < 8 {
+                *value = value.rotate_left(1);
+                step += 1;
+            }
+        }
+    }
+}
+
+let launch = module
+    .prepare_transform::<Small>(LaunchConfig1D::new(1, 64, 0))
+    .expect("valid Small launch");
+module
+    .transform::<Small>(&stream, &launch, &mut output)
+    .expect("launch Small kernel");
+
+let wide_launch = module
+    .prepare_transform::<Wide>(LaunchConfig1D::new(1, 256, 0))
+    .expect("valid Wide launch");
+module
+    .transform::<Wide>(&stream, &wide_launch, &mut output)
+    .expect("launch Wide kernel");
+```
+
+`Small` and `Wide` produce separate PTX kernels. The policy is not a kernel
+argument, and the GPU does not choose a policy at runtime.
+
+A policy can also carry metadata-only descriptions:
+
+```rust
+use cuda_device::config::{
+    Atom, AtomKind, Block, Global, RowMajor, Shape1, Thread, Tile,
+};
+
+type BlockTile = Tile<Shape1<1024>, RowMajor, Global, Block>;
+
+enum Rotate {}
+impl AtomKind for Rotate {}
+type ElementOp = Atom<Rotate, Shape1<1>, Thread>;
+```
+
+`BlockTile` describes 1,024 row-major global-memory elements handled by a
+block. `ElementOp` names a one-element operation handled by a thread; a kernel
+library decides what `Rotate` does. Neither type allocates memory, calculates
+an address, or runs an operation.
+
+`MAX_THREADS` is a maximum, not an exact block size. The prepared launch for
+`Small` accepts at most 64 threads per block; `Wide` accepts at most 256. Use
+`block = (x, y, z)` in `#[launch_contract]` only when the shape must be exact.
+`MIN_BLOCKS` is a compiler occupancy hint, not a requested grid size.
+
+`UNROLL = 4` groups four loop iterations. It does not stop the loop after four
+iterations, and remaining iterations are still handled.
+
+Generic policy expressions currently need Rust's `generic_const_exprs`
+feature. Other named constants used in a contracted `launch_bounds` maximum
+must be visible at module scope.
+
+### Const-generic kernels
+
+Const parameters work on kernel and device-function entry points:
+
+```rust
+#[kernel]
+pub fn add_value<const VALUE: u32>(mut output: DisjointSlice<u32>) {
+    let index = thread::index_1d();
+    if let Some(element) = output.get_mut(index) {
+        *element += VALUE;
+    }
+}
+```
+
+```text
+add_value::<4> -> add_value_TID_<hash A>
+add_value::<8> -> add_value_TID_<hash B>
+```
+
+Use ordinary Rust turbofish syntax on the generated launch method:
+
+```rust
+// SAFETY: config matches the kernels' 1D indexing and output bounds.
+unsafe {
+    module.add_value::<4>(&stream, config, &mut output)?;
+    module.add_value::<{ Config::VALUE }>(&stream, config, &mut output)?;
+}
+```
+
+The older `#[kernel(f32, i32)]` convenience form only supports one type
+parameter. For const or mixed generics, use bare `#[kernel]` and specialize at
+the launch site.
 
 ## Host closures as kernel arguments
 
@@ -95,9 +238,11 @@ Launch with a closure:
 
 ```rust
 let factor = 3i32;
-module
-    .map::<_>(&stream, config, move |x| x * factor, &input_dev, &mut output_dev)
-    .expect("Launch failed");
+// SAFETY: config is 1D and both buffers cover every launched index.
+unsafe {
+    module.map::<_>(&stream, config, move |x| x * factor, &input_dev, &mut output_dev)
+}
+.expect("Launch failed");
 ```
 
 ### How closure arguments travel
@@ -131,8 +276,8 @@ stays aligned.
 ### PTX naming for closures
 
 A closure-generic kernel gets the same `_TID_<hex32>` suffix as any other
-generic kernel. The closure's anonymous type is one of the entries in the
-hashed tuple, so two distinct closure literals -- even ones with the
+generic kernel. The closure's anonymous type is part of the concrete function
+item, so two distinct closure literals -- even ones with the
 same `Fn` signature -- produce two distinct entry points:
 
 | Closure                                | PTX entry point   |
@@ -239,8 +384,8 @@ pub mod kernels {
 use my_kernels::kernels;
 
 let module = kernels::load(&ctx)?;
-module
-    .vecadd(&stream, config, &a, &b, &mut c)
+// SAFETY: config is 1D and all three buffers cover every launched index.
+unsafe { module.vecadd(&stream, config, &a, &b, &mut c) }
     .expect("Launch failed");
 ```
 

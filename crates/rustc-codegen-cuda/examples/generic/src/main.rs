@@ -57,6 +57,32 @@ mod kernels {
             *c_elem = a[idx_raw] + b[idx_raw];
         }
     }
+
+    #[inline(never)]
+    fn apply_unary<T, F>(f: F, x: T) -> T
+    where
+        F: FnOnce(T) -> T,
+    {
+        f(x)
+    }
+
+    /// Generic kernel whose body defines a captured closure.
+    ///
+    /// rustc prepends the parent generic args before a closure's fixed
+    /// `[kind, sig, tupled_upvars]` suffix. The importer must read the upvars
+    /// tuple from the suffix, not from a hard-coded substitution index.
+    #[kernel]
+    pub fn closure_capture<T>(bias: T, scale: T, input: &[T], mut out: DisjointSlice<T>)
+    where
+        T: Copy + Add<Output = T> + Mul<Output = T>,
+    {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let transform = move |x: T| (x + bias) * scale;
+            *out_elem = apply_unary(transform, input[idx_raw]);
+        }
+    }
 }
 
 // =============================================================================
@@ -92,15 +118,17 @@ fn main() {
         let mut output_dev =
             DeviceBuffer::<f32>::zeroed(&stream, N).expect("Failed to alloc f32 output");
 
-        module
-            .scale::<f32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale::<f32>(
                 &stream,
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut output_dev,
             )
-            .expect("scale::<f32> launch failed");
+        }
+        .expect("scale::<f32> launch failed");
 
         let output_host = output_dev
             .to_host_vec(&stream)
@@ -120,15 +148,17 @@ fn main() {
         let mut output_dev =
             DeviceBuffer::<i32>::zeroed(&stream, N).expect("Failed to alloc i32 output");
 
-        module
-            .scale::<i32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale::<i32>(
                 &stream,
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut output_dev,
             )
-            .expect("scale::<i32> launch failed");
+        }
+        .expect("scale::<i32> launch failed");
 
         let output_host = output_dev
             .to_host_vec(&stream)
@@ -139,5 +169,69 @@ fn main() {
         assert_eq!(errors, 0, "scale::<i32> produced {errors} errors");
     }
 
-    println!("\n✓ SUCCESS: typed generic launches worked for f32 and i32");
+    println!("Launching closure_capture::<f32> kernel...");
+    {
+        let bias: f32 = 1.25;
+        let scale: f32 = 0.5;
+        let input_data: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let input_dev =
+            DeviceBuffer::from_host(&stream, &input_data).expect("Failed to copy f32 input");
+        let mut output_dev =
+            DeviceBuffer::<f32>::zeroed(&stream, N).expect("Failed to alloc f32 output");
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.closure_capture::<f32>(
+                &stream,
+                LaunchConfig::for_num_elems(N as u32),
+                bias,
+                scale,
+                &input_dev,
+                &mut output_dev,
+            )
+        }
+        .expect("closure_capture::<f32> launch failed");
+
+        let output_host = output_dev
+            .to_host_vec(&stream)
+            .expect("Failed to copy f32 output back");
+        let errors = (0..N)
+            .filter(|&i| (output_host[i] - (input_data[i] + bias) * scale).abs() > 1e-5)
+            .count();
+        assert_eq!(errors, 0, "closure_capture::<f32> produced {errors} errors");
+    }
+
+    println!("Launching closure_capture::<i32> kernel...");
+    {
+        let bias: i32 = 7;
+        let scale: i32 = 2;
+        let input_data: Vec<i32> = (0..N as i32).collect();
+        let input_dev =
+            DeviceBuffer::from_host(&stream, &input_data).expect("Failed to copy i32 input");
+        let mut output_dev =
+            DeviceBuffer::<i32>::zeroed(&stream, N).expect("Failed to alloc i32 output");
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.closure_capture::<i32>(
+                &stream,
+                LaunchConfig::for_num_elems(N as u32),
+                bias,
+                scale,
+                &input_dev,
+                &mut output_dev,
+            )
+        }
+        .expect("closure_capture::<i32> launch failed");
+
+        let output_host = output_dev
+            .to_host_vec(&stream)
+            .expect("Failed to copy i32 output back");
+        let errors = (0..N)
+            .filter(|&i| output_host[i] != (input_data[i] + bias) * scale)
+            .count();
+        assert_eq!(errors, 0, "closure_capture::<i32> produced {errors} errors");
+    }
+
+    println!("\n✓ SUCCESS: typed generic launches and captured closures worked for f32 and i32");
 }
