@@ -93,9 +93,7 @@ fn main() {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    module
-        .mma_tile(stream.as_ref(), cfg, &a_dev, &b_dev, &mut d_dev)
-        .expect("launch");
+    unsafe { module.mma_tile(stream.as_ref(), cfg, &a_dev, &b_dev, &mut d_dev) }.expect("launch");
     stream.synchronize().unwrap();
 
     let got = d_dev.to_host_vec(&stream).unwrap();
