@@ -1921,6 +1921,210 @@ pub mod gpu {
         }
     }
 
+    // =========================================================================
+    // Pack a batch of row-major [k][n] matrices into f16 pairs as
+    // [batch][n][ceil(k/2)] — the column-packed form the B fragment wants,
+    // with the batch stride folded into the index so one launch covers every
+    // attention head.
+    // =========================================================================
+    #[kernel]
+    pub fn pack_f16_cols_batched(
+        src: &[f32],
+        k: u32,
+        n: u32,
+        kpairs: u32,
+        mut dst: DisjointSlice<u32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+        if let Some(o) = dst.get_mut(idx) {
+            let per = n * kpairs;
+            let b = i / per;
+            let rem = i % per;
+            let col = rem / kpairs;
+            let k0 = (rem % kpairs) * 2;
+            let base = b * k * n;
+            let lo = src[(base + k0 * n + col) as usize];
+            let hi = if k0 + 1 < k {
+                src[(base + (k0 + 1) * n + col) as usize]
+            } else {
+                0.0f32
+            };
+            *o = pack_f16x2(lo, hi);
+        }
+    }
+
+    // =========================================================================
+    // Batched f16 tensor-core GEMM: C[b] = A[b] * B[b] for every b in one
+    // launch, blockIdx.z selecting the batch.
+    //
+    //   Attention matmuls are small — 197x64x197 per head — so running them
+    //   one head per launch leaves the grid nearly empty and pays a launch
+    //   plus a pack per head. Folding the batch into gridDim.z gives a grid
+    //   twelve times larger and one launch for the lot.
+    //
+    //   K is short here, so there is no split; the result is written straight
+    //   out with no partials and no reduction pass.
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_f16_tc_batched_w8(
+        m: u32,
+        n: u32,
+        k: u32,
+        a_packed: &[u32],
+        b_packed: &[u32],
+        kpairs: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2;
+        let tig = lane & 3;
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let bat = thread::blockIdx_z();
+
+        let a_base = bat * m * kpairs;
+        let b_base = bat * n * kpairs;
+
+        let mut acc = [[0.0f32; 4]; 4];
+        let mut areg = [0u32; 2];
+        let mut breg = [0u32; 2];
+
+        let mut q = 0u32;
+        #[unroll]
+        while q < 2 {
+            let e = tid + q * 256;
+            let r = e >> 3;
+            let kk = (e & 7) * 2;
+            let gr = row0 + r;
+            let gc = col0 + r;
+            areg[q as usize] = if gr < m && kk < k {
+                a_packed[(a_base + gr * kpairs + kk / 2) as usize]
+            } else {
+                0u32
+            };
+            breg[q as usize] = if gc < n && kk < k {
+                b_packed[(b_base + gc * kpairs + kk / 2) as usize]
+            } else {
+                0u32
+            };
+            q += 1;
+        }
+        let mut q2 = 0u32;
+        #[unroll]
+        while q2 < 2 {
+            let e = tid + q2 * 256;
+            unsafe {
+                AS[e as usize] = areg[q2 as usize];
+                BS[e as usize] = breg[q2 as usize];
+            }
+            q2 += 1;
+        }
+        thread::sync_threads();
+
+        let mut buf = 0u32;
+        let mut k0 = 0u32;
+        while k0 < k {
+            let k_next = k0 + 16;
+
+            if k_next < k {
+                let mut qn = 0u32;
+                #[unroll]
+                while qn < 2 {
+                    let e = tid + qn * 256;
+                    let r = e >> 3;
+                    let kk = (e & 7) * 2;
+                    let g0 = k_next + kk;
+                    let gr = row0 + r;
+                    let gc = col0 + r;
+                    areg[qn as usize] = if gr < m && g0 < k {
+                        a_packed[(a_base + gr * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                    breg[qn as usize] = if gc < n && g0 < k {
+                        b_packed[(b_base + gc * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                    qn += 1;
+                }
+            }
+
+            let base = buf * 512;
+            let arow = (warp & 3) * 16;
+            let ncol_base = (warp >> 2) * 32;
+            let a0 = unsafe { AS[(base + (arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[(base + (arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 4 {
+                let ncol = ncol_base + t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(base + ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(base + ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+
+            if k_next < k {
+                let other = (buf ^ 1) * 512;
+                let mut qs = 0u32;
+                #[unroll]
+                while qs < 2 {
+                    let e = tid + qs * 256;
+                    unsafe {
+                        AS[(other + e) as usize] = areg[qs as usize];
+                        BS[(other + e) as usize] = breg[qs as usize];
+                    }
+                    qs += 1;
+                }
+            }
+            thread::sync_threads();
+            buf ^= 1;
+            k0 = k_next;
+        }
+
+        let plane = bat * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 4 {
+            let gc = col0 + (warp >> 2) * 32 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + (warp & 3) * 16 + gid + half * 8;
+                if gr < m {
+                    let base_o = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *out.get_unchecked_mut((base_o + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *out.get_unchecked_mut((base_o + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
     #[kernel]
     pub fn conv2d_f16_tc_splitk(
         m: u32,

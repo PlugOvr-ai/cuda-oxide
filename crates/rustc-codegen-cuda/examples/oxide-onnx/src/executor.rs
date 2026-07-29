@@ -2246,6 +2246,77 @@ impl OnnxExecutor {
         // The weights of a linear layer live in B; caching their packed f16
         // form is only sound for tensors that outlive the run.
         let b_static = self.weights.contains_key(&node.input[1]);
+
+        // Attention runs the same small GEMM once per head. Done one launch at
+        // a time it leaves the grid nearly empty — 197x64x197 is sixteen
+        // blocks — and repeats the operand packing per head. Folding the batch
+        // into gridDim.z gives one launch with a grid `batch` times larger.
+        if batch > 1 && !b_static && m >= 32 && n >= 32 && k >= 16 && k % 16 == 0 {
+            let kpairs = k.div_ceil(2);
+            let a_all = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(a_ptr, batch * m * k, self.ctx.clone())
+            });
+            let b_all = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(b_ptr, batch * k * n, self.ctx.clone())
+            });
+            let mut a_packed = unsafe {
+                DeviceBuffer::<u32>::uninitialized_async(&self.stream, batch * m * kpairs)
+            }
+            .map_err(|e| anyhow!("batched A scratch: {:?}", e))?;
+            let mut b_packed = unsafe {
+                DeviceBuffer::<u32>::uninitialized_async(&self.stream, batch * n * kpairs)
+            }
+            .map_err(|e| anyhow!("batched B scratch: {:?}", e))?;
+            unsafe {
+                self.module.pack_f16_rows(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((batch * m * kpairs) as u32),
+                    &a_all,
+                    k as u32,
+                    kpairs as u32,
+                    &mut a_packed,
+                )
+            }
+            .map_err(|e| anyhow!("batched A pack: {:?}", e))?;
+            unsafe {
+                self.module.pack_f16_cols_batched(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((batch * n * kpairs) as u32),
+                    &b_all,
+                    k as u32,
+                    n as u32,
+                    kpairs as u32,
+                    &mut b_packed,
+                )
+            }
+            .map_err(|e| anyhow!("batched B pack: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64).max(1),
+                    (m as u32).div_ceil(64).max(1),
+                    batch as u32,
+                ),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.module.sgemm_f16_tc_batched_w8(
+                    &self.stream,
+                    cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    &a_packed,
+                    &b_packed,
+                    kpairs as u32,
+                    &mut out,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_f16_tc_batched launch: {:?}", e))?;
+            tensors.insert(&out_name, out, out_shape);
+            return Ok(());
+        }
+
         for bi in 0..batch {
             let a_g = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(
