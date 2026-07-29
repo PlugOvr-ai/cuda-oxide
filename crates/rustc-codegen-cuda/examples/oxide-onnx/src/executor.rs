@@ -603,21 +603,39 @@ impl OnnxExecutor {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
+            // Pack the activation once, rather than letting every block that
+            // shares a row of A redo the same conversions during staging —
+            // 12x over for a ViT projection, and the dominant instruction cost
+            // of the B-packed kernel.
+            let mut a_packed =
+                unsafe { DeviceBuffer::<u32>::uninitialized_async(&self.stream, m * kpairs) }
+                    .map_err(|e| anyhow!("f16 A scratch: {:?}", e))?;
             unsafe {
-                self.module.sgemm_f16_tc_splitk_bpacked(
+                self.module.pack_f16_rows(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((m * kpairs) as u32),
+                    a,
+                    k as u32,
+                    kpairs as u32,
+                    &mut a_packed,
+                )
+            }
+            .map_err(|e| anyhow!("f16 A pack: {:?}", e))?;
+            unsafe {
+                self.module.sgemm_f16_tc_splitk_abpacked(
                     &self.stream,
                     gemm_cfg,
                     m as u32,
                     n as u32,
                     k as u32,
                     k_per_split as u32,
-                    a,
+                    &a_packed,
                     &b_packed,
                     kpairs as u32,
                     &mut partials,
                 )
             }
-            .map_err(|e| anyhow!("sgemm_f16_tc_bpacked launch: {:?}", e))?;
+            .map_err(|e| anyhow!("sgemm_f16_tc_abpacked launch: {:?}", e))?;
             let bias_operand = bias.unwrap_or(a);
             unsafe {
                 self.module.reduce_splits(
