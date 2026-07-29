@@ -2220,6 +2220,18 @@ impl OnnxExecutor {
             (eb.buf().cu_deviceptr(), eb.shape().clone())
         };
 
+        let a_perm = attr_i(node, "oxide_a_perm", 0);
+        let b_perm = attr_i(node, "oxide_b_perm", 0);
+
+        // With a transpose absorbed, the shapes describe the tensors as they
+        // sit in memory rather than as the MatMul sees them, so the logical
+        // problem and the operand strides are recovered here instead.
+        if a_perm != 0 || b_perm != 0 {
+            return self.matmul_strided(
+                node, tensors, &out_name, a_ptr, &a_shape, b_ptr, &b_shape, a_perm, b_perm,
+            );
+        }
+
         let m = a_shape[a_shape.len() - 2];
         let k = a_shape[a_shape.len() - 1];
         let n = b_shape[b_shape.len() - 1];
@@ -2252,45 +2264,17 @@ impl OnnxExecutor {
         // blocks — and repeats the operand packing per head. Folding the batch
         // into gridDim.z gives one launch with a grid `batch` times larger.
         let fused_bias = attr_i(node, "oxide_bias", 0) != 0 && node.input.len() > 2;
+
+        // Attention runs the same small GEMM once per head. Done one launch at
+        // a time it leaves the grid nearly empty and repeats the operand
+        // packing per head; the batch rides in gridDim.z instead.
         if batch > 1 && !fused_bias && !b_static && m >= 32 && n >= 32 && k >= 16 && k % 16 == 0 {
-            let kpairs = k.div_ceil(2);
             let a_all = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(a_ptr, batch * m * k, self.ctx.clone())
             });
             let b_all = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(b_ptr, batch * k * n, self.ctx.clone())
             });
-            let mut a_packed = unsafe {
-                DeviceBuffer::<u32>::uninitialized_async(&self.stream, batch * m * kpairs)
-            }
-            .map_err(|e| anyhow!("batched A scratch: {:?}", e))?;
-            let mut b_packed = unsafe {
-                DeviceBuffer::<u32>::uninitialized_async(&self.stream, batch * n * kpairs)
-            }
-            .map_err(|e| anyhow!("batched B scratch: {:?}", e))?;
-            unsafe {
-                self.module.pack_f16_rows(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((batch * m * kpairs) as u32),
-                    &a_all,
-                    k as u32,
-                    kpairs as u32,
-                    &mut a_packed,
-                )
-            }
-            .map_err(|e| anyhow!("batched A pack: {:?}", e))?;
-            unsafe {
-                self.module.pack_f16_cols_batched(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((batch * n * kpairs) as u32),
-                    &b_all,
-                    k as u32,
-                    n as u32,
-                    kpairs as u32,
-                    &mut b_packed,
-                )
-            }
-            .map_err(|e| anyhow!("batched B pack: {:?}", e))?;
             let cfg = LaunchConfig {
                 grid_dim: (
                     (n as u32).div_ceil(64).max(1),
@@ -2301,19 +2285,24 @@ impl OnnxExecutor {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                self.module.sgemm_f16_tc_batched_w8(
+                self.module.sgemm_f16_tc_bmm_strided(
                     &self.stream,
                     cfg,
                     m as u32,
                     n as u32,
                     k as u32,
-                    &a_packed,
-                    &b_packed,
-                    kpairs as u32,
+                    &a_all,
+                    &b_all,
+                    (m * k) as u32,
+                    k as u32,
+                    (k * n) as u32,
+                    1,
+                    n as u32,
+                    0,
                     &mut out,
                 )
             }
-            .map_err(|e| anyhow!("sgemm_f16_tc_batched launch: {:?}", e))?;
+            .map_err(|e| anyhow!("sgemm_f16_tc_bmm_strided launch: {:?}", e))?;
             tensors.insert(&out_name, out, out_shape);
             return Ok(());
         }
@@ -2366,6 +2355,95 @@ impl OnnxExecutor {
         }
 
         tensors.insert(&out_name, out, out_shape);
+        Ok(())
+    }
+
+    /// `MatMul` with one or both operands read through an absorbed transpose.
+    ///
+    /// `oxide_a_perm` / `oxide_b_perm` name the permutation that the graph no
+    /// longer performs; here it becomes a set of strides. Only a leading batch
+    /// dimension of 1 is handled, which is what the fusion pass enforces —
+    /// beyond that the batch and head indices stop combining into one stride.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_strided(
+        &self,
+        node: &NodeProto,
+        tensors: &mut TensorMap,
+        out_name: &str,
+        a_ptr: u64,
+        a_shape: &[usize],
+        b_ptr: u64,
+        b_shape: &[usize],
+        a_perm: i64,
+        b_perm: i64,
+    ) -> Result<()> {
+        // A: [1, S, H, D] read as [H, S, D] — batch H, rows S, K contiguous.
+        let (l_batch, l_m, l_k, a_batch_s, a_row_s) = if a_perm == 213 {
+            let (sd, hd, dd) = (a_shape[1], a_shape[2], a_shape[3]);
+            (hd, sd, dd, dd, hd * dd)
+        } else {
+            let m = a_shape[a_shape.len() - 2];
+            let k = a_shape[a_shape.len() - 1];
+            let batch: usize = a_shape[..a_shape.len() - 2].iter().product();
+            (batch, m, k, m * k, k)
+        };
+        let (l_n, b_batch_s, b_col_s, b_k_s, b_contig) = match b_perm {
+            // [1, S, H, D] read as [H, D, S]: K is D, N is S.
+            231 => {
+                let (sd, hd, dd) = (b_shape[1], b_shape[2], b_shape[3]);
+                (sd, dd, hd * dd, 1usize, 1u32)
+            }
+            // [1, S, H, D] read as [H, S, D]: K is S, N is D.
+            213 => {
+                let (hd, dd) = (b_shape[2], b_shape[3]);
+                (dd, dd, 1usize, hd * dd, 0u32)
+            }
+            _ => {
+                let n = b_shape[b_shape.len() - 1];
+                let k = b_shape[b_shape.len() - 2];
+                (n, k * n, 1usize, n, 0u32)
+            }
+        };
+
+        let mut out = self
+            .alloc_buf(l_batch * l_m * l_n)
+            .map_err(|e| anyhow!("matmul alloc: {}", e))?;
+        let a_all = ManuallyDrop::new(unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(a_ptr, a_shape.iter().product(), self.ctx.clone())
+        });
+        let b_all = ManuallyDrop::new(unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(b_ptr, b_shape.iter().product(), self.ctx.clone())
+        });
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (l_n as u32).div_ceil(64).max(1),
+                (l_m as u32).div_ceil(64).max(1),
+                l_batch as u32,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.module.sgemm_f16_tc_bmm_strided(
+                &self.stream,
+                cfg,
+                l_m as u32,
+                l_n as u32,
+                l_k as u32,
+                &a_all,
+                &b_all,
+                a_batch_s as u32,
+                a_row_s as u32,
+                b_batch_s as u32,
+                b_col_s as u32,
+                b_k_s as u32,
+                b_contig,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("sgemm_f16_tc_bmm_strided launch: {:?}", e))?;
+        let _ = node;
+        tensors.insert(out_name, out, vec![1, l_batch, l_m, l_n]);
         Ok(())
     }
 

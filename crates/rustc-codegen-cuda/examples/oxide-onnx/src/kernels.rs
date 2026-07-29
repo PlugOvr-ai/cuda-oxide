@@ -2125,6 +2125,246 @@ pub mod gpu {
         }
     }
 
+    // =========================================================================
+    // Batched f16 tensor-core GEMM reading f32 operands in place.
+    //
+    //   The attention pipeline spends most of its time moving data, not
+    //   multiplying it: two pack kernels per batched MatMul, fed by transposes
+    //   whose work largely cancels. K is transposed from [S, H, D] to
+    //   [H, D, S] and then read back column-wise by the packer — which is the
+    //   layout it started in.
+    //
+    //   So this kernel takes strides rather than a layout: element (batch,
+    //   row, kk) of A sits at a_batch*batch + a_row*row + kk, and (batch, col,
+    //   kk) of B at b_batch*batch + b_col*col + b_k*kk. Q, K and V can then be
+    //   read straight out of the fused QKV projection, converted to f16 on the
+    //   way into shared memory, with no transpose and no pack.
+    //
+    //   `b_k_contig` picks which of B's axes the staging threads walk so the
+    //   global reads stay coalesced either way. Shared rows of B are padded to
+    //   9 u32, which makes both walks bank-conflict-free.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sgemm_f16_tc_bmm_strided(
+        m: u32,
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b: &[f32],
+        a_batch: u32,
+        a_row: u32,
+        b_batch: u32,
+        b_col: u32,
+        b_k: u32,
+        b_k_contig: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 1152> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2;
+        let tig = lane & 3;
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let bat = thread::blockIdx_z();
+
+        let abase = bat * a_batch;
+        let bbase = bat * b_batch;
+
+        // A always has kk contiguous: eight threads cover one row's 16 halves.
+        let ar = tid >> 3;
+        let akp = tid & 7;
+        let ar2 = (tid + 256) >> 3;
+        let akp2 = (tid + 256) & 7;
+
+        // B walks whichever of its axes is contiguous in memory.
+        let e2 = tid + 256;
+        let bc = if b_k_contig != 0 { tid >> 3 } else { tid & 63 };
+        let bkp = if b_k_contig != 0 { tid & 7 } else { tid >> 6 };
+        let bc2 = if b_k_contig != 0 { e2 >> 3 } else { e2 & 63 };
+        let bkp2 = if b_k_contig != 0 { e2 & 7 } else { e2 >> 6 };
+
+        let mut acc = [[0.0f32; 4]; 4];
+
+        // The next K step's global reads are issued before the current step's
+        // MMAs and packed only afterwards, so the load latency is spent on
+        // tensor-core work. Single-buffered, this kernel stalls on
+        // long_scoreboard at 5.6 warps per issue-active cycle with the tensor
+        // pipe at 3%.
+        let mut alo = [0.0f32; 2];
+        let mut ahi = [0.0f32; 2];
+        let mut blo = [0.0f32; 2];
+        let mut bhi = [0.0f32; 2];
+
+        let mut q = 0u32;
+        #[unroll]
+        while q < 2 {
+            let r = if q == 0 { ar } else { ar2 };
+            let kp = if q == 0 { akp } else { akp2 };
+            let c = if q == 0 { bc } else { bc2 };
+            let ck = if q == 0 { bkp } else { bkp2 };
+            let gr = row0 + r;
+            let gc = col0 + c;
+            let ka = kp * 2;
+            let kb = ck * 2;
+            alo[q as usize] = if gr < m && ka < k {
+                unsafe { *a.get_unchecked((abase + gr * a_row + ka) as usize) }
+            } else {
+                0.0f32
+            };
+            ahi[q as usize] = if gr < m && ka + 1 < k {
+                unsafe { *a.get_unchecked((abase + gr * a_row + ka + 1) as usize) }
+            } else {
+                0.0f32
+            };
+            blo[q as usize] = if gc < n && kb < k {
+                unsafe { *b.get_unchecked((bbase + gc * b_col + kb * b_k) as usize) }
+            } else {
+                0.0f32
+            };
+            bhi[q as usize] = if gc < n && kb + 1 < k {
+                unsafe { *b.get_unchecked((bbase + gc * b_col + (kb + 1) * b_k) as usize) }
+            } else {
+                0.0f32
+            };
+            q += 1;
+        }
+        let mut q2 = 0u32;
+        #[unroll]
+        while q2 < 2 {
+            let r = if q2 == 0 { ar } else { ar2 };
+            let kp = if q2 == 0 { akp } else { akp2 };
+            let c = if q2 == 0 { bc } else { bc2 };
+            let ck = if q2 == 0 { bkp } else { bkp2 };
+            unsafe {
+                AS[(r * 8 + kp) as usize] = pack_f16x2(alo[q2 as usize], ahi[q2 as usize]);
+                BS[(c * 9 + ck) as usize] = pack_f16x2(blo[q2 as usize], bhi[q2 as usize]);
+            }
+            q2 += 1;
+        }
+        thread::sync_threads();
+
+        let mut buf = 0u32;
+        let mut k0 = 0u32;
+        while k0 < k {
+            let k_next = k0 + 16;
+
+            if k_next < k {
+                let mut qn = 0u32;
+                #[unroll]
+                while qn < 2 {
+                    let r = if qn == 0 { ar } else { ar2 };
+                    let kp = if qn == 0 { akp } else { akp2 };
+                    let c = if qn == 0 { bc } else { bc2 };
+                    let ck = if qn == 0 { bkp } else { bkp2 };
+                    let gr = row0 + r;
+                    let gc = col0 + c;
+                    let ka = k_next + kp * 2;
+                    let kb = k_next + ck * 2;
+                    alo[qn as usize] = if gr < m && ka < k {
+                        unsafe { *a.get_unchecked((abase + gr * a_row + ka) as usize) }
+                    } else {
+                        0.0f32
+                    };
+                    ahi[qn as usize] = if gr < m && ka + 1 < k {
+                        unsafe { *a.get_unchecked((abase + gr * a_row + ka + 1) as usize) }
+                    } else {
+                        0.0f32
+                    };
+                    blo[qn as usize] = if gc < n && kb < k {
+                        unsafe { *b.get_unchecked((bbase + gc * b_col + kb * b_k) as usize) }
+                    } else {
+                        0.0f32
+                    };
+                    bhi[qn as usize] = if gc < n && kb + 1 < k {
+                        unsafe { *b.get_unchecked((bbase + gc * b_col + (kb + 1) * b_k) as usize) }
+                    } else {
+                        0.0f32
+                    };
+                    qn += 1;
+                }
+            }
+
+            let asb = buf * 512;
+            let bsb = buf * 576;
+            let arow = (warp & 3) * 16;
+            let ncol_base = (warp >> 2) * 32;
+            let a0 = unsafe { AS[(asb + (arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[(asb + (arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[(asb + (arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[(asb + (arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 4 {
+                let ncol = ncol_base + t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(bsb + ncol * 9 + tig) as usize] };
+                let b1 = unsafe { BS[(bsb + ncol * 9 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+
+            if k_next < k {
+                let ao = (buf ^ 1) * 512;
+                let bo = (buf ^ 1) * 576;
+                let mut qs = 0u32;
+                #[unroll]
+                while qs < 2 {
+                    let r = if qs == 0 { ar } else { ar2 };
+                    let kp = if qs == 0 { akp } else { akp2 };
+                    let c = if qs == 0 { bc } else { bc2 };
+                    let ck = if qs == 0 { bkp } else { bkp2 };
+                    unsafe {
+                        AS[(ao + r * 8 + kp) as usize] =
+                            pack_f16x2(alo[qs as usize], ahi[qs as usize]);
+                        BS[(bo + c * 9 + ck) as usize] =
+                            pack_f16x2(blo[qs as usize], bhi[qs as usize]);
+                    }
+                    qs += 1;
+                }
+            }
+            thread::sync_threads();
+            buf ^= 1;
+            k0 = k_next;
+        }
+
+        let plane = bat * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 4 {
+            let gc = col0 + (warp >> 2) * 32 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + (warp & 3) * 16 + gid + half * 8;
+                if gr < m {
+                    let base_o = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *out.get_unchecked_mut((base_o + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *out.get_unchecked_mut((base_o + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
     #[kernel]
     pub fn conv2d_f16_tc_splitk(
         m: u32,

@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{AttributeProto, AttributeType, NodeProto, attr_f};
+use crate::model::{AttributeProto, AttributeType, NodeProto, attr_f, attr_ints};
 
 /// Fused-activation codes written into the private `oxide_act` attribute and
 /// read back by the executor. Kept in sync with `kernels::gpu` ACT_* constants.
@@ -35,6 +35,8 @@ pub struct OptStats {
     pub residual_fused: usize,
     /// Bias `Add` nodes folded into the producing MatMul's epilogue.
     pub matmul_bias_fused: usize,
+    /// Attention `Transpose` nodes folded into a MatMul's operand addressing.
+    pub matmul_transpose_fused: usize,
 }
 
 impl OptStats {
@@ -64,7 +66,106 @@ pub fn optimize(
     stats.bn_affine = precompute_batchnorm_affine(nodes, weights);
     stats.residual_fused = fuse_residual_into_conv(nodes, graph_outputs);
     stats.matmul_bias_fused = fuse_bias_into_matmul(nodes, weights, graph_outputs);
+    stats.matmul_transpose_fused = fuse_transpose_into_matmul(nodes, graph_outputs);
     stats
+}
+
+/// Fold the attention `Transpose` nodes into the `MatMul` that consumes them.
+///
+/// Attention reshapes `[1, S, H, D]` into per-head matrices before every
+/// batched MatMul: Q and V by perm 0213, K by perm 0231. The transposes are
+/// pure data movement, and for K the movement is undone immediately — the
+/// operand packer reads the transposed `[H, D, S]` column-wise, which is the
+/// `[S, H, D]` layout it started in.
+///
+/// Since the batched GEMM addresses its operands by stride, none of it needs
+/// to happen. The `MatMul` keeps the pre-transpose tensor as its input and
+/// records the permutation in `oxide_a_perm` / `oxide_b_perm`; the executor
+/// turns that into the operand strides. Three kernels and two round trips
+/// through DRAM disappear per layer.
+///
+/// Applies only when the leading batch dimension is 1 — with B > 1 the batch
+/// and head indices no longer combine into a single stride — and when the
+/// transpose feeds nothing else.
+fn fuse_transpose_into_matmul(
+    nodes: &mut Vec<NodeProto>,
+    graph_outputs: &HashSet<String>,
+) -> usize {
+    struct Fuse {
+        mm: usize,
+        slot: usize,
+        src: String,
+        perm: i64,
+        tr: usize,
+    }
+    let mut fuses: Vec<Fuse> = Vec::new();
+    {
+        let counts = consumer_counts(nodes);
+        let producer = producers(nodes);
+
+        for (mm_idx, mm) in nodes.iter().enumerate() {
+            if mm.op_type != "MatMul" || mm.input.len() != 2 {
+                continue;
+            }
+            for slot in 0..2usize {
+                let name = mm.input[slot].as_str();
+                let Some(&tr_idx) = producer.get(name) else {
+                    continue;
+                };
+                let tr = &nodes[tr_idx];
+                if tr.op_type != "Transpose" || tr.input.len() != 1 {
+                    continue;
+                }
+                if counts.get(name).copied().unwrap_or(0) != 1 || graph_outputs.contains(name) {
+                    continue;
+                }
+                let perm = attr_ints(tr, "perm");
+                let code = if perm == [0, 2, 1, 3] {
+                    213
+                } else if perm == [0, 2, 3, 1] {
+                    231
+                } else {
+                    continue;
+                };
+                // A must present K contiguously; only 0213 does that.
+                if slot == 0 && code != 213 {
+                    continue;
+                }
+                fuses.push(Fuse {
+                    mm: mm_idx,
+                    slot,
+                    src: tr.input[0].clone(),
+                    perm: code,
+                    tr: tr_idx,
+                });
+            }
+        }
+    }
+
+    let mut dead: HashSet<usize> = HashSet::new();
+    for f in &fuses {
+        let mm = &mut nodes[f.mm];
+        mm.input[f.slot] = f.src.clone();
+        set_attr_i(
+            mm,
+            if f.slot == 0 {
+                "oxide_a_perm"
+            } else {
+                "oxide_b_perm"
+            },
+            f.perm,
+        );
+        dead.insert(f.tr);
+    }
+    if !dead.is_empty() {
+        let mut idx = 0;
+        nodes.retain(|_| {
+            let keep = !dead.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+    fuses.len()
 }
 
 /// Fold a bias `Add` into the `MatMul` that feeds it.
