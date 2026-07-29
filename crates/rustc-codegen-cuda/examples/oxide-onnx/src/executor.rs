@@ -1282,6 +1282,119 @@ impl OnnxExecutor {
                 self.dispatch_sgemm(n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, false, &mut out_b)
                     .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {}", b, e))?;
             }
+        } else if !is_depthwise
+            && group == 1
+            && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true)
+            && col_rows_g >= 32
+            && n_out * col_cols >= 4096
+        {
+            // ── Implicit-GEMM on f16 tensor cores ───────────────────────────
+            // One launch per (batch, split): the column matrix is never
+            // materialised, which is where the DRAM gap to TensorRT sat.
+            let (act, act_lo, act_hi) = Self::fused_act(node);
+            let has_bias = node.input.len() > 2 && !node.input[2].is_empty();
+            let bias_ptr = if has_bias {
+                let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+                Some(eb.buf().cu_deviceptr())
+            } else {
+                None
+            };
+            let m = n_out;
+            let kk = col_rows_g;
+            let nn = col_cols;
+            let splits = Self::split_factor(m, nn, kk);
+            let k_per_split = kk.div_ceil(splits).next_multiple_of(16).max(16);
+            // Must match the stride `packed_weights` packs with.
+            let kpairs = kk.div_ceil(2);
+
+            let w_full = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(w_ptr, m * kk, self.ctx.clone())
+            });
+            let a_packed = self.packed_weights(&w_full, m, kk)?;
+
+            for b in 0..batch_n {
+                let x_b = ManuallyDrop::new(unsafe {
+                    DeviceBuffer::<f32>::from_raw_parts(
+                        x_ptr + (b * c_in * h_in * w_in * 4) as u64,
+                        c_in * h_in * w_in,
+                        self.ctx.clone(),
+                    )
+                });
+                let mut out_b = ManuallyDrop::new(unsafe {
+                    DeviceBuffer::<f32>::from_raw_parts(
+                        result_buf.cu_deviceptr() + (b * m * nn * 4) as u64,
+                        m * nn,
+                        self.ctx.clone(),
+                    )
+                });
+                let mut partials = self
+                    .alloc_buf(splits * m * nn)
+                    .map_err(|e| anyhow!("conv f16 partials: {}", e))?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        (nn as u32).div_ceil(64).max(1),
+                        (m as u32).div_ceil(64).max(1),
+                        splits as u32,
+                    ),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.module.conv2d_f16_tc_splitk(
+                        &self.stream,
+                        cfg,
+                        m as u32,
+                        nn as u32,
+                        kk as u32,
+                        k_per_split as u32,
+                        &a_packed,
+                        kpairs as u32,
+                        &x_b,
+                        c_in as u32,
+                        h_in as u32,
+                        w_in as u32,
+                        kh as u32,
+                        kw as u32,
+                        pad_h as u32,
+                        pad_w as u32,
+                        stride_h as u32,
+                        stride_w as u32,
+                        dil_h as u32,
+                        dil_w as u32,
+                        out_w as u32,
+                        &mut partials,
+                    )
+                }
+                .map_err(|e| anyhow!("conv2d_f16_tc launch: {:?}", e))?;
+
+                let bias_view = ManuallyDrop::new(unsafe {
+                    match bias_ptr {
+                        Some(ptr) => DeviceBuffer::<f32>::from_raw_parts(ptr, m, self.ctx.clone()),
+                        None => DeviceBuffer::<f32>::from_raw_parts(w_ptr, m, self.ctx.clone()),
+                    }
+                });
+                unsafe {
+                    self.module.reduce_splits(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((m * nn) as u32),
+                        &partials,
+                        splits as u32,
+                        (m * nn) as u32,
+                        nn as u32,
+                        1.0,
+                        &bias_view,
+                        u32::from(has_bias),
+                        act,
+                        act_lo,
+                        act_hi,
+                        &mut out_b,
+                    )
+                }
+                .map_err(|e| anyhow!("conv f16 reduce: {:?}", e))?;
+            }
+
+            tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
+            return Ok(());
         } else if std::env::var("OXIDE_CONV_IMPLICIT").is_ok() {
             // ── Implicit-GEMM path: the column matrix never reaches DRAM ────
             // Off by default: measured 2× slower than im2col + SGEMM at batch
