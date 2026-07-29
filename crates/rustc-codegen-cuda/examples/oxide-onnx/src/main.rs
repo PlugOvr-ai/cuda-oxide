@@ -28,6 +28,7 @@ pub mod proto {
 // ---------------------------------------------------------------------------
 pub mod cpu_ref;
 pub mod executor;
+pub mod graph_opt;
 pub mod kernels;
 pub mod model;
 pub mod tensor;

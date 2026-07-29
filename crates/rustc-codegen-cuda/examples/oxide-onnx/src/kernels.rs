@@ -31,6 +31,29 @@ fn gpu_rsqrt(x: f32) -> f32 {
     step(step(guess))
 }
 
+/// Apply a fused epilogue activation.
+///
+/// `act` matches the `graph_opt::ACT_*` codes the load-time graph rewrite
+/// stamps onto a node: 0 = none, 1 = relu, 2 = clip to `[lo, hi]`. Branching on
+/// a kernel-uniform argument costs nothing — every thread in the grid takes the
+/// same path.
+#[inline(always)]
+fn apply_act(v: f32, act: u32, lo: f32, hi: f32) -> f32 {
+    if act == 1u32 {
+        if v > 0.0f32 { v } else { 0.0f32 }
+    } else if act == 2u32 {
+        if v < lo {
+            lo
+        } else if v > hi {
+            hi
+        } else {
+            v
+        }
+    } else {
+        v
+    }
+}
+
 /// Compute e^x via range reduction + degree-5 polynomial + 2^n scaling.
 /// No libdevice; uses only bitcast + integer ops + fused float arithmetic.
 /// Max relative error ≈ 2e-7 (matches single-precision needs for softmax).
@@ -363,6 +386,94 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // GEMM with fused bias + activation epilogue.
+    //
+    //   Identical inner loop to `sgemm_tiled` — which measured fastest on every
+    //   batch-1 shape in these models — but the per-row bias and the activation
+    //   the graph rewrite folded in are applied while the result is still in a
+    //   register. For convolution that removes an entire extra pass over the
+    //   output tensor per layer (53 of them in ResNet50).
+    //
+    //   `bias` is indexed by output row (= output channel for im2col conv);
+    //   when `has_bias` is 0 the operand is not read and may be any slice.
+    //
+    //   Launch: same as `sgemm_tiled` — grid=(⌈n/16⌉, ⌈m/16⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_bias_act(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        bias: &[f32],
+        has_bias: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut c: DisjointSlice<f32, thread::Runtime2DIndex>,
+    ) {
+        static mut TILE_A: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x() as usize;
+        let ty = thread::threadIdx_y() as usize;
+        let row = thread::blockIdx_y() as usize * 16 + ty;
+        let col = thread::blockIdx_x() as usize * 16 + tx;
+
+        let m_sz = m as usize;
+        let n_sz = n as usize;
+        let k_sz = k as usize;
+
+        let num_tiles = k_sz.div_ceil(16);
+        let smem_idx = ty * 16 + tx;
+        let mut sum = 0.0f32;
+
+        let mut t = 0usize;
+        while t < num_tiles {
+            let tile_start = t * 16;
+            unsafe {
+                let a_col = tile_start + tx;
+                TILE_A[smem_idx] = if row < m_sz && a_col < k_sz {
+                    a[row * k_sz + a_col]
+                } else {
+                    0.0f32
+                };
+                let b_row = tile_start + ty;
+                TILE_B[smem_idx] = if b_row < k_sz && col < n_sz {
+                    b[b_row * n_sz + col]
+                } else {
+                    0.0f32
+                };
+            }
+            thread::sync_threads();
+            unsafe {
+                let mut i = 0usize;
+                while i < 16 {
+                    sum += TILE_A[ty * 16 + i] * TILE_B[i * 16 + tx];
+                    i += 1;
+                }
+            }
+            thread::sync_threads();
+            t += 1;
+        }
+
+        if let Some(c_idx) = unsafe { thread::index_2d_runtime(n_sz) } {
+            if row < m_sz {
+                let b_val = if has_bias != 0u32 && row < bias.len() {
+                    bias[row]
+                } else {
+                    0.0f32
+                };
+                if let Some(c_elem) = c.get_mut(c_idx) {
+                    *c_elem = apply_act(alpha * sum + b_val, act, lo, hi);
+                }
+            }
+        }
+    }
+
+    // =========================================================================
     // GEMM, N-register-tiled — C = alpha·A·B + beta·C  (row-major).
     //
     //   The naive 16×16 tiled kernel does 1 MAC per 2 shared loads inside a
@@ -498,6 +609,338 @@ pub mod gpu {
                 }
                 t += 1;
             }
+        }
+    }
+
+    // =========================================================================
+    // GEMM, 2-D register-tiled — C = alpha·A·B + beta·C  (row-major).
+    //
+    //   Arithmetic intensity is what separates a toy GEMM from a fast one:
+    //
+    //     sgemm_tiled  1 output/thread   1 MAC  per 2 shared loads  (0.5)
+    //     sgemm_fast   1×8 outputs       8 MACs per 9 shared loads  (0.9)
+    //     this kernel  4×4 outputs      16 MACs per 8 shared loads  (2.0)
+    //
+    //   Each thread holds a 4×4 accumulator block in registers, so one staged
+    //   A value feeds 4 MACs and one staged B value feeds 4 more. The
+    //   local-memory spilling that made the earlier register-blocked attempt
+    //   slower than the naive kernel is gone (no `.local` in the emitted PTX).
+    //
+    //   The tile is 64×64 rather than the textbook 128×128 because these models
+    //   run at batch 1: a 128×128 tile leaves a late ResNet stage (M=512, N=49)
+    //   with 4 blocks for 82 SMs and measured 4× *slower* than the naive
+    //   kernel. Arithmetic intensity is worth nothing on an idle GPU.
+    //
+    //   Rows and columns are assigned to threads with stride 16 rather than in
+    //   contiguous runs of 8: for a fixed sub-index the 16 threads of a row
+    //   then read 16 consecutive floats out of shared memory, which is
+    //   conflict-free, where contiguous blocking would make it 4-way banked.
+    //
+    //   Block tile 64(M)×64(N), BK=8.
+    //   Launch: grid=(⌈n/64⌉, ⌈m/64⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_reg(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        beta: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        // AS/BS are [BK=8][64] tiles: 2 KB each, 4 KB per block.
+        static mut AS: SharedArray<f32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        // u32 index math throughout: the backend widens usize to 64-bit, and
+        // the extra b64 registers cap occupancy. All products stay < 2^31.
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tid = ty * 16 + tx;
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+
+        let mut acc = [[0.0f32; 4]; 4];
+
+        let mut k0 = 0u32;
+        while k0 < k {
+            // Stage A (64 rows x 8 k) and B (8 k x 64 cols): 512 elements
+            // each, 256 threads, 2 elements per thread.
+            let mut q = 0u32;
+            #[unroll]
+            while q < 2 {
+                let e = tid + q * 256;
+
+                // A: element e is (row r, k-offset cc), stored transposed as
+                // AS[cc][r] so the inner loop reads along r.
+                let ar = e >> 3; // 0..64
+                let ak = e & 7; // 0..8
+                let agr = row0 + ar;
+                let agc = k0 + ak;
+                unsafe {
+                    AS[(ak * 64 + ar) as usize] = if agr < m && agc < k {
+                        a[(agr * k + agc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+
+                // B: element e is (k-offset r, column cc), stored as BS[r][cc].
+                let br = e >> 6; // 0..8
+                let bc = e & 63; // 0..64
+                let bgr = k0 + br;
+                let bgc = col0 + bc;
+                unsafe {
+                    BS[e as usize] = if bgr < k && bgc < n {
+                        b[(bgr * n + bgc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+                q += 1;
+            }
+            thread::sync_threads();
+
+            let mut kk = 0u32;
+            #[unroll]
+            while kk < 8 {
+                let arow_base = (kk * 64 + ty) as usize;
+                let bcol_base = (kk * 64 + tx) as usize;
+
+                let a_frag = [
+                    unsafe { AS[arow_base] },
+                    unsafe { AS[arow_base + 16] },
+                    unsafe { AS[arow_base + 32] },
+                    unsafe { AS[arow_base + 48] },
+                ];
+                let b_frag = [
+                    unsafe { BS[bcol_base] },
+                    unsafe { BS[bcol_base + 16] },
+                    unsafe { BS[bcol_base + 32] },
+                    unsafe { BS[bcol_base + 48] },
+                ];
+
+                let mut i = 0usize;
+                #[unroll]
+                while i < 4 {
+                    let av = a_frag[i];
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < 4 {
+                        acc[i][j] += av * b_frag[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        let has_beta = beta != 0.0f32;
+        let mut i = 0u32;
+        #[unroll]
+        while i < 4 {
+            let gr = row0 + ty + 16 * i;
+            if gr < m {
+                let base = gr * n;
+                let mut j = 0u32;
+                #[unroll]
+                while j < 4 {
+                    let gc = col0 + tx + 16 * j;
+                    if gc < n {
+                        let v = acc[i as usize][j as usize];
+                        let cell = unsafe { c.get_unchecked_mut((base + gc) as usize) };
+                        *cell = if has_beta {
+                            alpha * v + beta * (*cell)
+                        } else {
+                            alpha * v
+                        };
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // =========================================================================
+    // Implicit-GEMM Conv2D — the convolution as a GEMM whose B operand is
+    // never materialized.
+    //
+    //   out[co, oh·ow] = sum_{ci, kr, kc} w[co, ci, kr, kc] · x[ci, ih, iw]
+    //
+    //   is the product W[M×K] · Col[K×N] with M = out channels,
+    //   K = in_channels·Kh·Kw, N = out_h·out_w. The explicit path writes Col to
+    //   DRAM and reads it straight back — for a 56×56×64 layer that is a 7 MB
+    //   round trip per convolution, pure overhead. Here each staged tile
+    //   element derives its input coordinate from (k, n) and reads the input
+    //   tensor directly, so the column matrix exists only in shared memory.
+    //
+    //   Same 64×64 tile and 4×4 register block as `sgemm_reg`, and the bias
+    //   and activation are folded into the epilogue, which removes another
+    //   full-tensor pass. Padding is handled by substituting zero, exactly as
+    //   im2col would.
+    //
+    //   Launch: grid=(⌈n/64⌉, ⌈m/64⌉, 1), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn conv2d_implicit_gemm(
+        m: u32,
+        n: u32,
+        k: u32,
+        w: &[f32],
+        x: &[f32],
+        bias: &[f32],
+        has_bias: u32,
+        c_in: u32,
+        h_in: u32,
+        w_in: u32,
+        kh: u32,
+        kw: u32,
+        pad_h: u32,
+        pad_w: u32,
+        stride_h: u32,
+        stride_w: u32,
+        dil_h: u32,
+        dil_w: u32,
+        out_w: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<f32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tid = ty * 16 + tx;
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+
+        let khw = kh * kw;
+        let in_hw = h_in * w_in;
+
+        let mut acc = [[0.0f32; 4]; 4];
+
+        let mut k0 = 0u32;
+        while k0 < k {
+            let mut q = 0u32;
+            #[unroll]
+            while q < 2 {
+                let e = tid + q * 256;
+
+                // Stage the weight tile, transposed to AS[k][m].
+                let ar = e >> 3;
+                let ak = e & 7;
+                let agr = row0 + ar;
+                let agc = k0 + ak;
+                unsafe {
+                    AS[(ak * 64 + ar) as usize] = if agr < m && agc < k {
+                        w[(agr * k + agc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+
+                // Stage the implicit column tile: element (k0+br, col0+bc) of
+                // the column matrix is input pixel (ci, ih, iw).
+                let br = e >> 6;
+                let bc = e & 63;
+                let bk = k0 + br;
+                let bn = col0 + bc;
+                unsafe {
+                    BS[e as usize] = if bk < k && bn < n {
+                        let ci = bk / khw;
+                        let krc = bk % khw;
+                        let kr = krc / kw;
+                        let kc = krc % kw;
+                        let oh = bn / out_w;
+                        let ow = bn % out_w;
+                        let ih = (oh * stride_h + kr * dil_h) as i32 - pad_h as i32;
+                        let iw = (ow * stride_w + kc * dil_w) as i32 - pad_w as i32;
+                        if ih < 0 || ih >= h_in as i32 || iw < 0 || iw >= w_in as i32 {
+                            0.0f32
+                        } else {
+                            x[(ci * in_hw + (ih as u32) * w_in + (iw as u32)) as usize]
+                        }
+                    } else {
+                        0.0f32
+                    };
+                }
+                q += 1;
+            }
+            thread::sync_threads();
+
+            let mut kk = 0u32;
+            #[unroll]
+            while kk < 8 {
+                let arow_base = (kk * 64 + ty) as usize;
+                let bcol_base = (kk * 64 + tx) as usize;
+
+                let a_frag = [
+                    unsafe { AS[arow_base] },
+                    unsafe { AS[arow_base + 16] },
+                    unsafe { AS[arow_base + 32] },
+                    unsafe { AS[arow_base + 48] },
+                ];
+                let b_frag = [
+                    unsafe { BS[bcol_base] },
+                    unsafe { BS[bcol_base + 16] },
+                    unsafe { BS[bcol_base + 32] },
+                    unsafe { BS[bcol_base + 48] },
+                ];
+
+                let mut i = 0usize;
+                #[unroll]
+                while i < 4 {
+                    let av = a_frag[i];
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < 4 {
+                        acc[i][j] += av * b_frag[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        // Epilogue: bias (per output channel = per row) and activation, while
+        // the results are still in registers.
+        let bias_len = bias.len();
+        let mut i = 0u32;
+        #[unroll]
+        while i < 4 {
+            let gr = row0 + ty + 16 * i;
+            if gr < m {
+                let b_val = if has_bias != 0u32 && (gr as usize) < bias_len {
+                    bias[gr as usize]
+                } else {
+                    0.0f32
+                };
+                let base = gr * n;
+                let mut j = 0u32;
+                #[unroll]
+                while j < 4 {
+                    let gc = col0 + tx + 16 * j;
+                    if gc < n {
+                        let v = acc[i as usize][j as usize] + b_val;
+                        unsafe {
+                            *c.get_unchecked_mut((base + gc) as usize) = apply_act(v, act, lo, hi);
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
         }
     }
 
@@ -973,6 +1416,64 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // Bias add + fused activation — x[n, c, ...] = act(x[n, c, ...] + bias[c])
+    //   act: 0 = none, 1 = relu, 2 = clip to [lo, hi]  (see graph_opt::ACT_*)
+    //
+    //   The channel index is derived in 32-bit arithmetic on purpose. The
+    //   natural `(i / spatial) % channels` on usize operands compiles to
+    //   div.u64 + rem.u64, which the GPU emulates in ~100 instructions *per
+    //   element* — enough to make a pure-bandwidth op compute-bound. The 32-bit
+    //   forms are a few instructions each, and every real tensor here is far
+    //   below 2^32 elements.
+    // =========================================================================
+    #[kernel]
+    pub fn bias_act(
+        mut x: DisjointSlice<f32>,
+        bias: &[f32],
+        spatial: u32,
+        channels: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+        if let Some(v) = x.get_mut(idx) {
+            let chan = ((i / spatial) % channels) as usize;
+            *v = apply_act(*v + bias[chan], act, lo, hi);
+        }
+    }
+
+    // =========================================================================
+    // Batch normalization — inference mode
+    //   y[n,c,hw] = gamma[c] * (x[n,c,hw] - mean[c]) / sqrt(var[c]+eps) + beta[c]
+    //   n: batch, c: channels, hw: H*W spatial.  One thread per element.
+    //   act: fused activation applied to the normalized value (see ACT_*).
+    // =========================================================================
+    //   32-bit channel math as in `bias_act`. The per-channel affine
+    //   (scale, shift) is precomputed on the host, so there is no rsqrt and no
+    //   mean/var traffic here either — this kernel is pure bandwidth.
+    #[kernel]
+    pub fn batch_norm_act(
+        x: &[f32],
+        scale: &[f32],
+        shift: &[f32],
+        spatial: u32,
+        channels: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(out) = y.get_mut(idx) {
+            let chan = (((i as u32) / spatial) % channels) as usize;
+            *out = apply_act(x[i] * scale[chan] + shift[chan], act, lo, hi);
+        }
+    }
+
+    // =========================================================================
     // Batch normalization — inference mode
     //   y[n,c,hw] = gamma[c] * (x[n,c,hw] - mean[c]) / sqrt(var[c]+eps) + beta[c]
     //   n: batch, c: channels, hw: H*W spatial.  One thread per element.
@@ -1033,43 +1534,34 @@ pub mod gpu {
         mut y: DisjointSlice<f32>,
     ) {
         let idx = thread::index_1d();
-        let i = idx.get();
+        let i = idx.get() as u32;
         if let Some(out) = y.get_mut(idx) {
-            let c_out_sz = c_out as usize;
-            let out_hw = (out_h * out_w) as usize;
-            let in_hw = h_in as usize * w_in as usize;
+            // 32-bit index unpacking: see the note in `im2col`.
+            let out_hw = out_h * out_w;
+            let in_hw = h_in * w_in;
 
-            let batch_i = i / (c_out_sz * out_hw);
-            let local_i = i % (c_out_sz * out_hw);
+            let per_batch = c_out * out_hw;
+            let batch_i = i / per_batch;
+            let local_i = i % per_batch;
             let oc = local_i / out_hw;
             let spatial = local_i % out_hw;
-            let oh = spatial / out_w as usize;
-            let ow = spatial % out_w as usize;
+            let oh = spatial / out_w;
+            let ow = spatial % out_w;
 
-            let in_ch = oc / cout_per_group as usize;
-
-            let kh_sz = kh as usize;
-            let kw_sz = kw as usize;
-            let w_base = oc * kh_sz * kw_sz;
-            let in_base = batch_i * c_in as usize * in_hw + in_ch * in_hw;
+            let in_ch = oc / cout_per_group;
+            let w_base = oc * kh * kw;
+            let in_base = batch_i * c_in * in_hw + in_ch * in_hw;
 
             let mut sum = 0.0f32;
-            let mut kr = 0usize;
-            while kr < kh_sz {
-                let mut kc = 0usize;
-                while kc < kw_sz {
-                    let ih = oh * stride_h as usize + kr * dil_h as usize;
-                    let iw = ow * stride_w as usize + kc * dil_w as usize;
-                    let ih_unpad = ih as isize - pad_h as isize;
-                    let iw_unpad = iw as isize - pad_w as isize;
-                    if ih_unpad >= 0
-                        && ih_unpad < h_in as isize
-                        && iw_unpad >= 0
-                        && iw_unpad < w_in as isize
-                    {
-                        let in_off =
-                            in_base + ih_unpad as usize * w_in as usize + iw_unpad as usize;
-                        sum += weight[w_base + kr * kw_sz + kc] * input[in_off];
+            let mut kr = 0u32;
+            while kr < kh {
+                let ih = (oh * stride_h + kr * dil_h) as i32 - pad_h as i32;
+                let mut kc = 0u32;
+                while kc < kw {
+                    let iw = (ow * stride_w + kc * dil_w) as i32 - pad_w as i32;
+                    if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                        let in_off = in_base + (ih as u32) * w_in + (iw as u32);
+                        sum += weight[(w_base + kr * kw + kc) as usize] * input[in_off as usize];
                     }
                     kc += 1;
                 }
@@ -1104,46 +1596,38 @@ pub mod gpu {
         mut col: DisjointSlice<f32>,
     ) {
         let idx = thread::index_1d();
-        let i = idx.get();
+        let i = idx.get() as u32;
         if let Some(out) = col.get_mut(idx) {
-            let col_rows = (c_in * kh * kw) as usize;
-            let out_spatial = (out_h * out_w) as usize;
+            // Unpacking one flat index costs nine divisions; in 64-bit those
+            // are emulated (~100 instructions each) and dominate a kernel that
+            // otherwise just moves bytes. Every quantity here fits in 32 bits.
+            let col_rows = c_in * kh * kw;
+            let out_spatial = out_h * out_w;
             let col_per_batch = col_rows * out_spatial;
 
             let batch_i = i / col_per_batch;
             let local_i = i % col_per_batch;
             let kk = local_i / out_spatial;
             let spatial = local_i % out_spatial;
-            let oh = spatial / out_w as usize;
-            let ow = spatial % out_w as usize;
+            let oh = spatial / out_w;
+            let ow = spatial % out_w;
 
-            let kh_sz = kh as usize;
-            let kw_sz = kw as usize;
-            let c_sz = c_in as usize;
+            let khw = kh * kw;
+            let ki = kk / khw;
+            let kr = (kk % khw) / kw;
+            let kc = kk % kw;
 
-            let ki = kk / (kh_sz * kw_sz);
-            let kr = (kk % (kh_sz * kw_sz)) / kw_sz;
-            let kc = kk % kw_sz;
+            // Signed 32-bit so the padding test sees negative coordinates.
+            let ih = (oh * stride_h + kr * dil_h) as i32 - pad_h as i32;
+            let iw = (ow * stride_w + kc * dil_w) as i32 - pad_w as i32;
 
-            let ih = oh * stride_h as usize + kr * dil_h as usize;
-            let iw = ow * stride_w as usize + kc * dil_w as usize;
-            let ih_unpad = ih as isize - pad_h as isize;
-            let iw_unpad = iw as isize - pad_w as isize;
-
-            let val = if ih_unpad < 0
-                || ih_unpad >= h_in as isize
-                || iw_unpad < 0
-                || iw_unpad >= w_in as isize
-            {
+            *out = if ih < 0 || ih >= h_in as i32 || iw < 0 || iw >= w_in as i32 {
                 0.0f32
             } else {
-                let offset = batch_i * c_sz * h_in as usize * w_in as usize
-                    + ki * h_in as usize * w_in as usize
-                    + ih_unpad as usize * w_in as usize
-                    + iw_unpad as usize;
-                input[offset]
+                let plane = h_in * w_in;
+                let offset = batch_i * c_in * plane + ki * plane + (ih as u32) * w_in + (iw as u32);
+                input[offset as usize]
             };
-            *out = val;
         }
     }
 
@@ -1169,37 +1653,36 @@ pub mod gpu {
         mut y: DisjointSlice<f32>,
     ) {
         let idx = thread::index_1d();
-        let i = idx.get();
+        let i = idx.get() as u32;
         if let Some(out) = y.get_mut(idx) {
-            let c_sz = c as usize;
-            let out_hw = (out_h * out_w) as usize;
-            let in_hw = in_h as usize * in_w as usize;
-            let batch_i = i / (c_sz * out_hw);
-            let local_i = i % (c_sz * out_hw);
+            // 32-bit index unpacking: see the note in `im2col`.
+            let out_hw = out_h * out_w;
+            let in_hw = in_h * in_w;
+            let per_batch = c * out_hw;
+            let batch_i = i / per_batch;
+            let local_i = i % per_batch;
             let ch = local_i / out_hw;
             let spatial = local_i % out_hw;
-            let oh = spatial / out_w as usize;
-            let ow = spatial % out_w as usize;
+            let oh = spatial / out_w;
+            let ow = spatial % out_w;
 
             let mut max_val = f32::NEG_INFINITY;
-            let mut ki = 0usize;
-            while ki < kh as usize {
-                let mut kj = 0usize;
-                while kj < kw as usize {
-                    let ih = oh * stride_h as usize + ki;
-                    let iw = ow * stride_w as usize + kj;
-                    let ih_unpad = ih as isize - pad_h as isize;
-                    let iw_unpad = iw as isize - pad_w as isize;
+            let mut ki = 0u32;
+            while ki < kh {
+                let mut kj = 0u32;
+                while kj < kw {
+                    let ih_unpad = (oh * stride_h + ki) as i32 - pad_h as i32;
+                    let iw_unpad = (ow * stride_w + kj) as i32 - pad_w as i32;
                     if ih_unpad >= 0
-                        && ih_unpad < in_h as isize
+                        && ih_unpad < in_h as i32
                         && iw_unpad >= 0
-                        && iw_unpad < in_w as isize
+                        && iw_unpad < in_w as i32
                     {
-                        let offset = batch_i * c_sz * in_hw
+                        let offset = batch_i * c * in_hw
                             + ch * in_hw
-                            + ih_unpad as usize * in_w as usize
-                            + iw_unpad as usize;
-                        let v = x[offset];
+                            + (ih_unpad as u32) * in_w
+                            + (iw_unpad as u32);
+                        let v = x[offset as usize];
                         if v > max_val {
                             max_val = v;
                         }

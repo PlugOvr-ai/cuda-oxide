@@ -16,6 +16,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 
 use std::mem::ManuallyDrop;
 
+use crate::graph_opt;
 use crate::kernels::gpu;
 use crate::model::{
     GraphProto, NodeProto, attr_f, attr_i, attr_ints, conv2d_output_shape, load_initializers,
@@ -51,7 +52,27 @@ impl OnnxExecutor {
         let stream = ctx.default_stream();
         let module = gpu::load(&ctx).map_err(|e| anyhow!("Failed to load CUDA module: {:?}", e))?;
 
-        let host_weights = load_initializers(graph)?;
+        let mut host_weights = load_initializers(graph)?;
+        let mut nodes = topological_sort(graph)?;
+
+        // Rewrite the graph before anything reaches the device: folding
+        // BatchNorm into Conv weights and absorbing activations removes whole
+        // kernels, each of which is a full DRAM round trip of its activation
+        // tensor.
+        let graph_output_names: std::collections::HashSet<String> =
+            graph.output.iter().map(|vi| vi.name.clone()).collect();
+        let opt = graph_opt::optimize(&mut nodes, &mut host_weights, &graph_output_names);
+        if opt.total() > 0 && std::env::var("OXIDE_QUIET").is_err() {
+            eprintln!(
+                "  [graph-opt] folded {} BatchNorm, fused {} Conv activations, \
+                 {} BatchNorm activations ({} nodes removed)",
+                opt.bn_folded,
+                opt.act_fused,
+                opt.bn_act_fused,
+                opt.total()
+            );
+        }
+
         let mut weights = HashMap::new();
         let mut consts = HashMap::new();
         for (name, (data, shape)) in host_weights {
@@ -64,8 +85,6 @@ impl OnnxExecutor {
                 .map_err(|e| anyhow!("H2D weight '{}' failed: {:?}", name, e))?;
             weights.insert(name, (buf, shape));
         }
-
-        let nodes = topological_sort(graph)?;
 
         let input_names = graph
             .input
@@ -319,6 +338,97 @@ impl OnnxExecutor {
             grid_dim: ((n as u32).div_ceil(128), (m as u32).div_ceil(16), 1),
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
+        }
+    }
+
+    /// Launch config for the 2-D register-tiled SGEMM (`sgemm_reg`) and the
+    /// implicit-GEMM convolution: one 256-thread block per 64×64 output tile,
+    /// 4×4 outputs per thread.
+    fn sgemm_reg_cfg(m: usize, n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(64).max(1),
+                (m as u32).div_ceil(64).max(1),
+                1,
+            ),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// Dispatch `C = alpha·A·B + beta·C` to the configured SGEMM kernel.
+    ///
+    /// The 128×128 register-tiled kernel needs enough output tiles to fill the
+    /// GPU: with a 128×128 block tile, a GEMM narrower than that leaves most
+    /// of a block's threads with nothing to accumulate. Conv-im2col GEMMs at
+    /// batch 1 are often short in M (M = output channels of one group), so the
+    /// small-M cases stay on the 16×16 kernel, which wastes far less on them.
+    ///
+    /// `OXIDE_GEMM=tiled|fast|reg` overrides the choice, for A/B measurement.
+    fn dispatch_sgemm(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        beta: f32,
+        c: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
+        let use_reg = match choice.as_str() {
+            "tiled" => false,
+            "reg" => true,
+            // Default: the naive 16×16 kernel, because it measured fastest on
+            // every batch-1 shape in these models. Interleaved min-of-2 runs,
+            // whole-model steady state (ms):
+            //
+            //             ResNet50   ViT    BERT   GPT-2
+            //   tiled        9.57   28.36  24.53  31.14
+            //   reg         12.71   28.94  28.84  32.47
+            //
+            // Register blocking trades parallelism for arithmetic intensity,
+            // and at batch 1 there is no parallelism to spare: a 64×64 tile
+            // leaves a late ResNet stage (M=512, N=49) with 8 blocks for 82
+            // SMs. `sgemm_reg` is kept for larger batches and as the starting
+            // point for a split-K version, which is what these shapes actually
+            // need.
+            _ => false,
+        };
+
+        if use_reg {
+            unsafe {
+                self.module.sgemm_reg(
+                    &self.stream,
+                    Self::sgemm_reg_cfg(m, n),
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    alpha,
+                    a,
+                    b,
+                    beta,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_reg launch: {:?}", e))
+        } else {
+            unsafe {
+                self.module.sgemm_tiled(
+                    &self.stream,
+                    Self::sgemm_cfg(m, n),
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    alpha,
+                    a,
+                    b,
+                    beta,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_tiled launch: {:?}", e))
         }
     }
 
@@ -752,24 +862,120 @@ impl OnnxExecutor {
                     )
                 });
                 // C[n_out × hw] = W[n_out × c_in] · X_b[c_in × hw]
-                unsafe {
-                    self.module.sgemm_tiled(
-                        &self.stream,
-                        Self::sgemm_cfg(n_out, hw),
-                        n_out as u32,
-                        hw as u32,
-                        c_in as u32,
-                        1.0,
-                        &*w_full,
-                        &*x_b,
-                        0.0,
-                        &mut *out_b,
-                    )
-                }
-                .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {:?}", b, e))?;
+                self.dispatch_sgemm(n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, &mut out_b)
+                    .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {}", b, e))?;
             }
+        } else if std::env::var("OXIDE_CONV_IMPLICIT").is_ok() {
+            // ── Implicit-GEMM path: the column matrix never reaches DRAM ────
+            // Off by default: measured 2× slower than im2col + SGEMM at batch
+            // 1, because a 64×64 output tile leaves late ResNet stages
+            // (M=512, N=49) with 8 blocks for 82 SMs. Needs split-K to expose
+            // enough parallelism before it can win here; kept behind the env
+            // var so that work has a starting point.
+            let (act, act_lo, act_hi) = Self::fused_act(node);
+            let has_bias = node.input.len() > 2 && !node.input[2].is_empty();
+            let bias_ptr = if has_bias {
+                let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+                Some(eb.buf().cu_deviceptr())
+            } else {
+                None
+            };
+
+            for b in 0..batch_n {
+                for g in 0..group {
+                    let in_offset = b * c_in * h_in * w_in + g * c_in_per_group * h_in * w_in;
+                    let in_len = c_in_per_group * h_in * w_in;
+                    let x_g = ManuallyDrop::new(unsafe {
+                        DeviceBuffer::<f32>::from_raw_parts(
+                            x_ptr + (in_offset * 4) as u64,
+                            in_len,
+                            self.ctx.clone(),
+                        )
+                    });
+
+                    let w_offset = g * c_out_per_group * c_in_per_group * kh * kw;
+                    let out_offset =
+                        b * n_out * out_h * out_w + g * c_out_per_group * out_h * out_w;
+
+                    let w_g = ManuallyDrop::new(unsafe {
+                        DeviceBuffer::<f32>::from_raw_parts(
+                            w_ptr + (w_offset * 4) as u64,
+                            c_out_per_group * col_rows_g,
+                            self.ctx.clone(),
+                        )
+                    });
+                    let mut out_g = ManuallyDrop::new(unsafe {
+                        DeviceBuffer::<f32>::from_raw_parts(
+                            result_buf.cu_deviceptr() + (out_offset * 4) as u64,
+                            c_out_per_group * col_cols,
+                            self.ctx.clone(),
+                        )
+                    });
+                    // When the conv has no bias the kernel is told not to read
+                    // the operand, and gets the weight slice as a stand-in.
+                    let bias_view = ManuallyDrop::new(unsafe {
+                        match bias_ptr {
+                            Some(ptr) => DeviceBuffer::<f32>::from_raw_parts(
+                                ptr + (g * c_out_per_group * 4) as u64,
+                                c_out_per_group,
+                                self.ctx.clone(),
+                            ),
+                            None => DeviceBuffer::<f32>::from_raw_parts(
+                                w_ptr + (w_offset * 4) as u64,
+                                c_out_per_group,
+                                self.ctx.clone(),
+                            ),
+                        }
+                    });
+
+                    unsafe {
+                        self.module.conv2d_implicit_gemm(
+                            &self.stream,
+                            Self::sgemm_reg_cfg(c_out_per_group, col_cols),
+                            c_out_per_group as u32,
+                            col_cols as u32,
+                            col_rows_g as u32,
+                            &w_g,
+                            &x_g,
+                            &bias_view,
+                            u32::from(has_bias),
+                            c_in_per_group as u32,
+                            h_in as u32,
+                            w_in as u32,
+                            kh as u32,
+                            kw as u32,
+                            pad_h as u32,
+                            pad_w as u32,
+                            stride_h as u32,
+                            stride_w as u32,
+                            dil_h as u32,
+                            dil_w as u32,
+                            out_w as u32,
+                            act,
+                            act_lo,
+                            act_hi,
+                            &mut out_g,
+                        )
+                    }
+                    .map_err(|e| anyhow!("conv implicit gemm g={}: {:?}", g, e))?;
+                }
+            }
+
+            // The epilogue already applied bias and activation.
+            tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
+            return Ok(());
         } else {
-            // Single col buffer reused across group iterations.
+            // ── im2col + SGEMM (default) ────────────────────────────────────
+            // Bias and activation ride in the GEMM epilogue, so the only
+            // passes over the output are the GEMM's own stores.
+            let (act, act_lo, act_hi) = Self::fused_act(node);
+            let has_bias = node.input.len() > 2 && !node.input[2].is_empty();
+            let bias_ptr = if has_bias {
+                let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+                Some(eb.buf().cu_deviceptr())
+            } else {
+                None
+            };
             let mut col_dev = unsafe {
                 DeviceBuffer::<f32>::uninitialized_async(&self.stream, col_rows_g * col_cols)
             }
@@ -777,7 +983,6 @@ impl OnnxExecutor {
 
             for b in 0..batch_n {
                 for g in 0..group {
-                    // ── im2col on GPU sub-view of x (no PCIe transfer) ─────────
                     let in_offset = b * c_in * h_in * w_in + g * c_in_per_group * h_in * w_in;
                     let in_len = c_in_per_group * h_in * w_in;
                     // ManuallyDrop prevents Drop from freeing the borrowed pointer.
@@ -812,12 +1017,10 @@ impl OnnxExecutor {
                     }
                     .map_err(|e| anyhow!("conv im2col g={}: {:?}", g, e))?;
 
-                    // ── Tiled SGEMM: W_g [c_out_g × col_rows_g] × col → out_g ──
                     let w_offset = g * c_out_per_group * c_in_per_group * kh * kw;
                     let out_offset =
                         b * n_out * out_h * out_w + g * c_out_per_group * out_h * out_w;
 
-                    // GPU sub-views of the weight slice and output slice (no PCIe).
                     let w_g = ManuallyDrop::new(unsafe {
                         DeviceBuffer::<f32>::from_raw_parts(
                             w_ptr + (w_offset * 4) as u64,
@@ -833,46 +1036,125 @@ impl OnnxExecutor {
                         )
                     });
 
+                    // The bias slice covers this group's output channels;
+                    // with no bias the kernel is told not to read the operand
+                    // and gets the weight slice as a stand-in.
+                    let bias_view = ManuallyDrop::new(unsafe {
+                        match bias_ptr {
+                            Some(ptr) => DeviceBuffer::<f32>::from_raw_parts(
+                                ptr + (g * c_out_per_group * 4) as u64,
+                                c_out_per_group,
+                                self.ctx.clone(),
+                            ),
+                            None => DeviceBuffer::<f32>::from_raw_parts(
+                                w_ptr + (w_offset * 4) as u64,
+                                c_out_per_group,
+                                self.ctx.clone(),
+                            ),
+                        }
+                    });
+
                     unsafe {
-                        self.module.sgemm_tiled(
+                        self.module.sgemm_bias_act(
                             &self.stream,
                             Self::sgemm_cfg(c_out_per_group, col_cols),
                             c_out_per_group as u32,
                             col_cols as u32,
                             col_rows_g as u32,
                             1.0,
-                            &*w_g,
+                            &w_g,
                             &col_dev,
-                            0.0,
-                            &mut *out_g,
+                            &bias_view,
+                            u32::from(has_bias),
+                            act,
+                            act_lo,
+                            act_hi,
+                            &mut out_g,
                         )
                     }
                     .map_err(|e| anyhow!("conv sgemm g={}: {:?}", g, e))?;
                 }
             }
 
-            // sgemm_tiled reads col_dev asynchronously; keep it alive until the
+            // The SGEMM reads col_dev asynchronously; keep it alive until the
             // run's final sync (DeviceBuffer::drop is an immediate cuMemFree).
             tensors.push_scratch(col_dev);
+
+            // Bias and activation were applied in the GEMM epilogue.
+            tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
+            return Ok(());
         } // end !is_depthwise
 
-        // Optional bias (3rd input): x[n,c,h,w] += bias[c]
+        // Epilogue: optional bias (3rd input) and the activation the graph
+        // rewrite folded in, in a single pass over the output.
+        let (act, act_lo, act_hi) = Self::fused_act(node);
         if node.input.len() > 2 && !node.input[2].is_empty() {
             let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
             unsafe {
-                self.module.bias_add(
+                self.module.bias_act(
                     &self.stream,
                     LaunchConfig::for_num_elems(out_numel as u32),
                     &mut result_buf,
                     eb.buf(),
                     (out_h * out_w) as u32,
                     n_out as u32,
+                    act,
+                    act_lo,
+                    act_hi,
                 )
             }
             .map_err(|e| anyhow!("conv bias: {:?}", e))?;
+        } else if act != graph_opt::ACT_NONE as u32 {
+            self.apply_act_inplace(&mut result_buf, out_numel, act, act_lo, act_hi)?;
         }
 
         tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
+        Ok(())
+    }
+
+    /// Launch geometry for the channel-wise elementwise kernels: one grid row
+    /// per (batch, channel) pair, `spatial` elements wide.
+    ///
+    /// `blockDim.y` must stay 1 — the kernels read the row index straight out
+    /// of `blockIdx.y` to avoid deriving the channel by integer division.
+    fn nc_cfg(spatial: usize, rows: usize) -> LaunchConfig {
+        const BLOCK_X: u32 = 256;
+        LaunchConfig {
+            grid_dim: ((spatial as u32).div_ceil(BLOCK_X).max(1), rows as u32, 1),
+            block_dim: (BLOCK_X, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// Read the activation the load-time graph rewrite fused into this node.
+    ///
+    /// Returns `(act_code, lo, hi)` with the bounds only meaningful for
+    /// `ACT_CLIP`.
+    fn fused_act(node: &NodeProto) -> (u32, f32, f32) {
+        let act = attr_i(node, "oxide_act", graph_opt::ACT_NONE) as u32;
+        let lo = attr_f(node, "oxide_act_lo", f32::NEG_INFINITY);
+        let hi = attr_f(node, "oxide_act_hi", f32::INFINITY);
+        (act, lo, hi)
+    }
+
+    /// Apply a fused activation in place, for producers that have no bias pass
+    /// to piggyback on.
+    fn apply_act_inplace(
+        &self,
+        buf: &mut DeviceBuffer<f32>,
+        numel: usize,
+        act: u32,
+        lo: f32,
+        hi: f32,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        if act == graph_opt::ACT_RELU as u32 {
+            unsafe { self.module.relu(&self.stream, cfg, buf) }
+                .map_err(|e| anyhow!("fused relu: {:?}", e))?;
+        } else if act == graph_opt::ACT_CLIP as u32 {
+            unsafe { self.module.clip(&self.stream, cfg, buf, lo, hi) }
+                .map_err(|e| anyhow!("fused clip: {:?}", e))?;
+        }
         Ok(())
     }
 
@@ -882,45 +1164,71 @@ impl OnnxExecutor {
     fn op_batchnorm(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
         let out_name = node.output[0].clone();
         let eps = attr_f(node, "epsilon", 1e-5);
+        let (act, act_lo, act_hi) = Self::fused_act(node);
 
-        // All five inputs are live during the kernel call; NLL ends borrows after.
-        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
-        let egamma = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
-        let ebeta = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
-        let emean = Self::get_tensor(tensors, &self.weights, &node.input[3])?;
-        let evar = Self::get_tensor(tensors, &self.weights, &node.input[4])?;
-
-        let x_shape = ex.shape().clone();
-        let numel = ex.buf().len();
+        let x_shape = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            ex.shape().clone()
+        };
         let n = x_shape[0];
         let c = x_shape[1];
-        let hw = if x_shape.len() >= 4 {
-            x_shape[2] * x_shape[3]
-        } else {
-            1
-        };
+        let hw: usize = x_shape.iter().skip(2).product::<usize>().max(1);
+        let numel: usize = x_shape.iter().product();
 
         let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
             .map_err(|e| anyhow!("batchnorm alloc: {:?}", e))?;
 
-        unsafe {
-            self.module.batch_norm_inference(
-                &self.stream,
-                LaunchConfig::for_num_elems(numel as u32),
-                ex.buf(),
-                egamma.buf(),
-                ebeta.buf(),
-                emean.buf(),
-                evar.buf(),
-                eps,
-                n as u32,
-                c as u32,
-                hw as u32,
-                &mut out,
-            )
+        // Fast path: the load-time rewrite collapsed the five parameters into
+        // (scale, shift), so the kernel is a per-channel affine and nothing more.
+        if node.input.len() == 3 {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            let escale = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
+            let eshift = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+            unsafe {
+                self.module.batch_norm_act(
+                    &self.stream,
+                    LaunchConfig::for_num_elems(numel as u32),
+                    ex.buf(),
+                    escale.buf(),
+                    eshift.buf(),
+                    hw as u32,
+                    c as u32,
+                    act,
+                    act_lo,
+                    act_hi,
+                    &mut out,
+                )
+            }
+            .map_err(|e| anyhow!("batchnorm launch: {:?}", e))?;
+        } else {
+            // Fallback: parameters were not load-time constants, so normalize
+            // on device from the original five inputs.
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            let egamma = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
+            let ebeta = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+            let emean = Self::get_tensor(tensors, &self.weights, &node.input[3])?;
+            let evar = Self::get_tensor(tensors, &self.weights, &node.input[4])?;
+            unsafe {
+                self.module.batch_norm_inference(
+                    &self.stream,
+                    LaunchConfig::for_num_elems(numel as u32),
+                    ex.buf(),
+                    egamma.buf(),
+                    ebeta.buf(),
+                    emean.buf(),
+                    evar.buf(),
+                    eps,
+                    n as u32,
+                    c as u32,
+                    hw as u32,
+                    &mut out,
+                )
+            }
+            .map_err(|e| anyhow!("batchnorm launch: {:?}", e))?;
+            if act != graph_opt::ACT_NONE as u32 {
+                self.apply_act_inplace(&mut out, numel, act, act_lo, act_hi)?;
+            }
         }
-        .map_err(|e| anyhow!("batchnorm launch: {:?}", e))?;
-        // NLL: borrows on ex, egamma, ... (from tensors/weights) end here
 
         tensors.insert(&out_name, out, x_shape);
         Ok(())
@@ -1063,21 +1371,8 @@ impl OnnxExecutor {
             }
             .map_err(|e| anyhow!("gemm sgemm_transb: {:?}", e))?;
         } else {
-            unsafe {
-                self.module.sgemm_tiled(
-                    &self.stream,
-                    Self::sgemm_cfg(m, n),
-                    m as u32,
-                    n as u32,
-                    k_a as u32,
-                    alpha,
-                    ea.buf(),
-                    eb.buf(),
-                    0.0,
-                    &mut out_dev,
-                )
-            }
-            .map_err(|e| anyhow!("gemm sgemm: {:?}", e))?;
+            self.dispatch_sgemm(m, n, k_a, alpha, ea.buf(), eb.buf(), 0.0, &mut out_dev)
+                .map_err(|e| anyhow!("gemm sgemm: {}", e))?;
         }
         drop(ea);
         drop(eb);
@@ -1191,21 +1486,8 @@ impl OnnxExecutor {
                     self.ctx.clone(),
                 )
             });
-            unsafe {
-                self.module.sgemm_tiled(
-                    &self.stream,
-                    Self::sgemm_cfg(m, n),
-                    m as u32,
-                    n as u32,
-                    k as u32,
-                    1.0,
-                    &*a_g,
-                    &*b_g,
-                    0.0,
-                    &mut *c_g,
-                )
-            }
-            .map_err(|e| anyhow!("matmul sgemm bi={}: {:?}", bi, e))?;
+            self.dispatch_sgemm(m, n, k, 1.0, &a_g, &b_g, 0.0, &mut c_g)
+                .map_err(|e| anyhow!("matmul sgemm bi={}: {}", bi, e))?;
         }
 
         tensors.insert(&out_name, out, out_shape);
