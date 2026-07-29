@@ -59,6 +59,15 @@ fn main() -> Result<()> {
     unit_tests()?;
     println!();
 
+    // OXIDE_BENCH_KERNELS=1 runs the per-kernel microbenchmark instead of the
+    // models. Whole-model timings cannot attribute a regression to a kernel,
+    // and the per-node profile inflates cheap ops by synchronising after each
+    // one; this measures kernels the way they actually run.
+    if std::env::var("OXIDE_BENCH_KERNELS").is_ok() {
+        bench_kernels()?;
+        return Ok(());
+    }
+
     let resnet_present = std::path::Path::new(RESNET50_PATH).exists();
     let mobilenet_present = std::path::Path::new(MOBILENET_PATH).exists();
     let vit_present = std::path::Path::new(VIT_PATH).exists();
@@ -107,6 +116,345 @@ fn main() -> Result<()> {
 // ===========================================================================
 // Section 1: Unit tests — GPU kernel vs CPU reference
 // ===========================================================================
+
+// ===========================================================================
+// Kernel microbenchmark
+// ===========================================================================
+
+/// Time one kernel launch in steady state.
+///
+/// Launches `iters` times back to back and synchronises once, so the result is
+/// the kernel's own throughput rather than launch latency, and takes the
+/// minimum over several rounds because this GPU is shared — the minimum is the
+/// only statistic that survives another process taking the SMs.
+fn time_kernel<F>(stream: &cuda_core::CudaStream, iters: usize, mut launch: F) -> Result<f64>
+where
+    F: FnMut() -> Result<()>,
+{
+    const ROUNDS: usize = 5;
+    // Warm up: first launch pays PTX JIT and cache population.
+    for _ in 0..8 {
+        launch()?;
+    }
+    stream
+        .synchronize()
+        .map_err(|e| anyhow::anyhow!("sync: {:?}", e))?;
+
+    let mut best = f64::INFINITY;
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch()?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("sync: {:?}", e))?;
+        let per_iter = t0.elapsed().as_secs_f64() / iters as f64;
+        best = best.min(per_iter);
+    }
+    Ok(best)
+}
+
+/// Per-kernel throughput on the shapes these models actually run.
+fn bench_kernels() -> Result<()> {
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA context: {:?}", e))?;
+    let stream = ctx.default_stream();
+    let module = gpu::load(&ctx).map_err(|e| anyhow::anyhow!("load module: {:?}", e))?;
+
+    println!("═══ Kernel microbenchmark ═══");
+    println!("  (min of 5 rounds × 50 launches; 3090 peak ≈ 936 GB/s)");
+    println!();
+
+    // The BatchNorm shapes ResNet50-v2 leaves after Conv→BN folding: the
+    // residual-stream normalisations, one per block.
+    let bn_shapes: [(usize, usize, usize); 4] = [
+        (256, 3136, 3), // stage 1: 256×56×56
+        (512, 784, 4),  // stage 2: 512×28×28
+        (1024, 196, 6), // stage 3: 1024×14×14
+        (2048, 49, 3),  // stage 4: 2048×7×7
+    ];
+
+    println!("  batch_norm_act");
+    println!(
+        "    {:>6} {:>8} {:>10} {:>10} {:>9} {:>7}",
+        "chan", "spatial", "elems", "µs", "GB/s", "n×"
+    );
+    let mut bn_total_us = 0.0;
+    for (channels, spatial, count) in bn_shapes {
+        let numel = channels * spatial;
+        let x = DeviceBuffer::<f32>::zeroed(&stream, numel)
+            .map_err(|e| anyhow::anyhow!("alloc x: {:?}", e))?;
+        let scale = DeviceBuffer::<f32>::zeroed(&stream, channels)
+            .map_err(|e| anyhow::anyhow!("alloc scale: {:?}", e))?;
+        let shift = DeviceBuffer::<f32>::zeroed(&stream, channels)
+            .map_err(|e| anyhow::anyhow!("alloc shift: {:?}", e))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(&stream, numel)
+            .map_err(|e| anyhow::anyhow!("alloc y: {:?}", e))?;
+
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.batch_norm_act(
+                    &stream,
+                    cfg,
+                    &x,
+                    &scale,
+                    &shift,
+                    spatial as u32,
+                    channels as u32,
+                    1,
+                    0.0,
+                    0.0,
+                    &mut y,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("batch_norm_act: {:?}", e))
+        })?;
+
+        // One read of x plus one write of y; the per-channel parameters are
+        // negligible and cached.
+        let bytes = (numel * 4 * 2) as f64;
+        let gbps = bytes / secs / 1e9;
+        bn_total_us += secs * 1e6 * count as f64;
+        println!(
+            "    {:>6} {:>8} {:>10} {:>10.1} {:>9.1} {:>7}",
+            channels,
+            spatial,
+            numel,
+            secs * 1e6,
+            gbps,
+            count
+        );
+    }
+    println!(
+        "    ResNet50 total for these {} launches: {:.2} ms",
+        bn_shapes.iter().map(|s| s.2).sum::<usize>(),
+        bn_total_us / 1000.0
+    );
+    println!();
+
+    // Every GEMM ResNet50-v2 issues at batch 1, with how many times each
+    // occurs, so the column sums account for the whole model rather than a
+    // sample of it. 3×3 convolutions go through im2col; 1×1 convolutions are
+    // fed to the GEMM directly.
+    let gemm_shapes: [(usize, usize, usize, usize, &str); 13] = [
+        (64, 12544, 147, 1, "stem 7×7"),
+        (64, 3136, 576, 3, "s1 3×3"),
+        (64, 3136, 256, 3, "s1 1×1 red"),
+        (256, 3136, 64, 3, "s1 1×1 exp"),
+        (128, 784, 1152, 4, "s2 3×3"),
+        (128, 784, 512, 4, "s2 1×1 red"),
+        (512, 784, 128, 4, "s2 1×1 exp"),
+        (256, 196, 2304, 6, "s3 3×3"),
+        (256, 196, 1024, 6, "s3 1×1 red"),
+        (1024, 196, 256, 6, "s3 1×1 exp"),
+        (512, 49, 4608, 3, "s4 3×3"),
+        (512, 49, 2048, 3, "s4 1×1 red"),
+        (2048, 49, 512, 3, "s4 1×1 exp"),
+    ];
+
+    println!("  sgemm_tiled — every GEMM in ResNet50-v2, batch 1");
+    println!(
+        "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>9} {:>9} {:>9}",
+        "layer", "M", "N", "K", "n×", "µs", "GFLOP/s", "total ms"
+    );
+    let mut gemm_total_ms = 0.0;
+    for (m, n, k, count, name) in gemm_shapes {
+        let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
+            .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
+        let b = DeviceBuffer::<f32>::zeroed(&stream, k * n)
+            .map_err(|e| anyhow::anyhow!("alloc b: {:?}", e))?;
+        let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.sgemm_tiled(
+                    &stream, cfg, m as u32, n as u32, k as u32, 1.0, &a, &b, 0.0, &mut c,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("sgemm_tiled: {:?}", e))
+        })?;
+        let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
+        let total_ms = secs * count as f64 * 1e3;
+        gemm_total_ms += total_ms;
+        println!(
+            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>9.1} {:>9.0} {:>9.2}",
+            name,
+            m,
+            n,
+            k,
+            count,
+            secs * 1e6,
+            gflops,
+            total_ms
+        );
+    }
+    println!("    {:>50} {:>9.2}", "GEMM total:", gemm_total_ms);
+    println!();
+
+    // im2col for the 3×3 convolutions: the cost of materialising the column
+    // matrix that the implicit-GEMM kernel would remove.
+    println!("  im2col (3×3 layers)");
+    let mut im2col_total_ms = 0.0;
+    for (c_in, h, w, count, name) in [
+        (64usize, 56usize, 56usize, 3usize, "s1"),
+        (128, 28, 28, 4, "s2"),
+        (256, 14, 14, 6, "s3"),
+        (512, 7, 7, 3, "s4"),
+    ] {
+        let col_rows = c_in * 9;
+        let col_cols = h * w;
+        let x = DeviceBuffer::<f32>::zeroed(&stream, c_in * h * w)
+            .map_err(|e| anyhow::anyhow!("alloc x: {:?}", e))?;
+        let mut col = DeviceBuffer::<f32>::zeroed(&stream, col_rows * col_cols)
+            .map_err(|e| anyhow::anyhow!("alloc col: {:?}", e))?;
+        let cfg = LaunchConfig::for_num_elems((col_rows * col_cols) as u32);
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.im2col(
+                    &stream,
+                    cfg,
+                    &x,
+                    c_in as u32,
+                    h as u32,
+                    w as u32,
+                    3,
+                    3,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    h as u32,
+                    w as u32,
+                    &mut col,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("im2col: {:?}", e))
+        })?;
+        let total_ms = secs * count as f64 * 1e3;
+        im2col_total_ms += total_ms;
+        println!(
+            "    {:>11} {:>9.1} µs  ×{}  = {:.2} ms",
+            name,
+            secs * 1e6,
+            count,
+            total_ms
+        );
+    }
+    println!("    {:>50} {:>9.2}", "im2col total:", im2col_total_ms);
+    println!();
+    println!(
+        "  accounted kernel time: {:.2} ms  (GEMM {:.2} + im2col {:.2} + BN {:.2})",
+        gemm_total_ms + im2col_total_ms + bn_total_us / 1000.0,
+        gemm_total_ms,
+        im2col_total_ms,
+        bn_total_us / 1000.0
+    );
+    println!("  (3090 FP32 peak ≈ 35 600 GFLOP/s)");
+    println!();
+
+    // Per-node host overhead. The executor allocates a fresh output buffer for
+    // every node, so a 91-node graph pays this 91 times per inference; if it
+    // is tens of microseconds it outweighs several of the kernels.
+    println!("  host-side per-node costs");
+    let alloc_secs = {
+        const N: usize = 200;
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for _ in 0..N {
+                let buf = unsafe { DeviceBuffer::<f32>::uninitialized_async(&stream, 802_816) }
+                    .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+                drop(buf);
+            }
+            best = best.min(t0.elapsed().as_secs_f64() / N as f64);
+        }
+        best
+    };
+    println!(
+        "    uninitialized_async + drop (3 MB): {:>8.1} µs   ×91 nodes = {:.2} ms",
+        alloc_secs * 1e6,
+        alloc_secs * 91.0 * 1e3
+    );
+
+    // The same allocation, but with the stream already loaded with work.
+    // cuMemAllocAsync is stream-ordered: when the pool cannot satisfy a request
+    // from free blocks it waits for the stream to progress far enough to reuse
+    // memory, which turns an allocation into a host-side stall.
+    let alloc_busy_secs = {
+        const N: usize = 50;
+        let m = 512usize;
+        let n = 49usize;
+        let k = 4608usize;
+        let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
+            .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
+        let b = DeviceBuffer::<f32>::zeroed(&stream, k * n)
+            .map_err(|e| anyhow::anyhow!("alloc b: {:?}", e))?;
+        let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            // Queue roughly 5 ms of GPU work, then allocate while it runs.
+            for _ in 0..20 {
+                unsafe {
+                    module.sgemm_tiled(
+                        &stream, cfg, m as u32, n as u32, k as u32, 1.0, &a, &b, 0.0, &mut c,
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("sgemm: {:?}", e))?;
+            }
+            let t0 = Instant::now();
+            let mut bufs = Vec::with_capacity(N);
+            for _ in 0..N {
+                bufs.push(
+                    unsafe { DeviceBuffer::<f32>::uninitialized_async(&stream, 802_816) }
+                        .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?,
+                );
+            }
+            best = best.min(t0.elapsed().as_secs_f64() / N as f64);
+            drop(bufs);
+            stream
+                .synchronize()
+                .map_err(|e| anyhow::anyhow!("sync: {:?}", e))?;
+        }
+        best
+    };
+    println!(
+        "    same, while the stream is busy:    {:>8.1} µs   ×18 BN nodes = {:.2} ms",
+        alloc_busy_secs * 1e6,
+        alloc_busy_secs * 18.0 * 1e3
+    );
+
+    let launch_secs = {
+        let mut dummy = DeviceBuffer::<f32>::zeroed(&stream, 1024)
+            .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+        let cfg = LaunchConfig::for_num_elems(1024);
+        time_kernel(&stream, 200, || {
+            unsafe { module.relu(&stream, cfg, &mut dummy) }
+                .map_err(|e| anyhow::anyhow!("relu: {:?}", e))
+        })?
+    };
+    println!(
+        "    empty-ish kernel launch:           {:>8.1} µs   ×91 nodes = {:.2} ms",
+        launch_secs * 1e6,
+        launch_secs * 91.0 * 1e3
+    );
+    Ok(())
+}
 
 fn unit_tests() -> Result<()> {
     let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA context: {:?}", e))?;

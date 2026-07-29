@@ -8,6 +8,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -44,6 +45,9 @@ pub struct OnnxExecutor {
     pub input_names: Vec<String>,
     /// Graph-level output names
     pub output_names: Vec<String>,
+    /// Device copies of small constant metadata arrays (shapes, strides,
+    /// permutations), keyed by their contents. See [`Self::meta_buf`].
+    meta_cache: RefCell<HashMap<u64, DeviceBuffer<f32>>>,
 }
 
 impl OnnxExecutor {
@@ -104,6 +108,7 @@ impl OnnxExecutor {
             nodes,
             input_names,
             output_names,
+            meta_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -120,7 +125,14 @@ impl OnnxExecutor {
             tensors.insert(name, buf, shape.clone());
         }
 
-        let profile = std::env::var("OXIDE_PROFILE").is_ok();
+        let profile_mode = std::env::var("OXIDE_PROFILE").unwrap_or_default();
+        let profile = !profile_mode.is_empty();
+        // OXIDE_PROFILE=host omits the per-node synchronize, so the timings are
+        // pure host-side dispatch cost: kernel launches are asynchronous, and
+        // if that cost approaches the kernel time the GPU is being starved
+        // rather than saturated. OXIDE_PROFILE=1 keeps the sync and measures
+        // device time, at the price of inflating cheap kernels.
+        let sync_each = profile_mode != "host";
         if profile {
             use std::collections::BTreeMap;
             let mut acc: BTreeMap<String, (f64, u32)> = BTreeMap::new();
@@ -128,7 +140,9 @@ impl OnnxExecutor {
                 let t0 = std::time::Instant::now();
                 self.dispatch_node(node, &mut tensors)
                     .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
-                self.stream.synchronize().ok();
+                if sync_each {
+                    self.stream.synchronize().ok();
+                }
                 let dt = t0.elapsed().as_secs_f64() * 1000.0;
                 let e = acc.entry(node.op_type.clone()).or_insert((0.0, 0));
                 e.0 += dt;
@@ -572,14 +586,10 @@ impl OnnxExecutor {
         // General NumPy broadcasting (e.g. attention scores + mask).
         let (out_shape, out_str, a_str, b_str, ndim) = Self::broadcast_meta(&a_shape, &b_shape)?;
         let out_numel: usize = out_shape.iter().product();
-        let osh = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&out_shape))
-            .map_err(|e| anyhow!("add bcast osh: {:?}", e))?;
-        let ost = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&out_str))
-            .map_err(|e| anyhow!("add bcast ost: {:?}", e))?;
-        let ast = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&a_str))
-            .map_err(|e| anyhow!("add bcast ast: {:?}", e))?;
-        let bst = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&b_str))
-            .map_err(|e| anyhow!("add bcast bst: {:?}", e))?;
+        let osh = self.meta_buf(&Self::to_f32(&out_shape))?;
+        let ost = self.meta_buf(&Self::to_f32(&out_str))?;
+        let ast = self.meta_buf(&Self::to_f32(&a_str))?;
+        let bst = self.meta_buf(&Self::to_f32(&b_str))?;
         let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
             .map_err(|e| anyhow!("add bcast alloc: {:?}", e))?;
         unsafe {
@@ -600,10 +610,6 @@ impl OnnxExecutor {
         drop(ea);
         drop(eb);
         // add_bcast reads these async — keep alive until the run's final sync.
-        tensors.push_scratch(osh);
-        tensors.push_scratch(ost);
-        tensors.push_scratch(ast);
-        tensors.push_scratch(bst);
         tensors.insert(&out_name, out, out_shape);
         Ok(())
     }
@@ -1110,6 +1116,47 @@ impl OnnxExecutor {
 
         tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
         Ok(())
+    }
+
+    /// Device copy of a small constant metadata array — shapes, strides,
+    /// permutations — cached by contents for the executor's lifetime.
+    ///
+    /// The obvious `DeviceBuffer::from_host` per use is correct but ruinous for
+    /// latency: it allocates with `cuMemAlloc`, and the matching `cuMemFree`
+    /// when the buffer drops at the end of the op **synchronizes the entire
+    /// context**, draining the pipeline the executor just spent effort
+    /// filling. ViT issues 49 Transposes, each building four such buffers, so
+    /// nearly 200 device-wide stalls per inference — measured at ~350 µs per
+    /// Transpose node, 17 ms of a 28 ms inference.
+    ///
+    /// These arrays are a handful of elements and repeat across inferences, so
+    /// caching them removes the allocation, the copy and the stall together.
+    /// The returned view must not be dropped as an owning buffer; callers get
+    /// a `ManuallyDrop` alias of the cached allocation.
+    fn meta_buf(&self, data: &[f32]) -> Result<ManuallyDrop<DeviceBuffer<f32>>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        data.len().hash(&mut hasher);
+        for v in data {
+            v.to_bits().hash(&mut hasher);
+        }
+        let key = hasher.finish();
+
+        let mut cache = self.meta_cache.borrow_mut();
+        let entry = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let buf = DeviceBuffer::from_host(&self.stream, data)
+                    .map_err(|e| anyhow!("metadata h2d: {:?}", e))?;
+                e.insert(buf)
+            }
+        };
+        // SAFETY: the alias is only read by kernels launched on this stream
+        // while the cache entry (and therefore the allocation) is alive, and
+        // ManuallyDrop keeps the alias from freeing it.
+        Ok(ManuallyDrop::new(unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(entry.cu_deviceptr(), entry.len(), self.ctx.clone())
+        }))
     }
 
     /// Launch geometry for the channel-wise elementwise kernels: one grid row
@@ -1725,16 +1772,11 @@ impl OnnxExecutor {
         let y_str = Self::bcast_strides(&out_shape, &ys);
         let ndim = out_shape.len();
 
-        let osh = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&out_shape))
-            .map_err(|e| anyhow!("where osh: {:?}", e))?;
-        let osb = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&ost))
-            .map_err(|e| anyhow!("where ost: {:?}", e))?;
-        let csb = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&c_str))
-            .map_err(|e| anyhow!("where cst: {:?}", e))?;
-        let xsb = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&x_str))
-            .map_err(|e| anyhow!("where xst: {:?}", e))?;
-        let ysb = DeviceBuffer::from_host(&self.stream, &Self::to_f32(&y_str))
-            .map_err(|e| anyhow!("where yst: {:?}", e))?;
+        let osh = self.meta_buf(&Self::to_f32(&out_shape))?;
+        let osb = self.meta_buf(&Self::to_f32(&ost))?;
+        let csb = self.meta_buf(&Self::to_f32(&c_str))?;
+        let xsb = self.meta_buf(&Self::to_f32(&x_str))?;
+        let ysb = self.meta_buf(&Self::to_f32(&y_str))?;
         let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
             .map_err(|e| anyhow!("where alloc: {:?}", e))?;
         unsafe {
@@ -1757,11 +1799,6 @@ impl OnnxExecutor {
         drop(ec);
         drop(ex);
         drop(ey);
-        tensors.push_scratch(osh);
-        tensors.push_scratch(osb);
-        tensors.push_scratch(csb);
-        tensors.push_scratch(xsb);
-        tensors.push_scratch(ysb);
         tensors.insert(&out_name, out, out_shape);
         Ok(())
     }
@@ -2106,14 +2143,10 @@ impl OnnxExecutor {
         let out_strides = strides(&out_shape);
 
         let to_f32 = |v: &[usize]| -> Vec<f32> { v.iter().map(|&x| x as f32).collect() };
-        let os_buf = DeviceBuffer::from_host(&self.stream, &to_f32(&out_shape))
-            .map_err(|e| anyhow!("transpose os h2d: {:?}", e))?;
-        let ostr_buf = DeviceBuffer::from_host(&self.stream, &to_f32(&out_strides))
-            .map_err(|e| anyhow!("transpose ostr h2d: {:?}", e))?;
-        let istr_buf = DeviceBuffer::from_host(&self.stream, &to_f32(&in_strides))
-            .map_err(|e| anyhow!("transpose istr h2d: {:?}", e))?;
-        let perm_buf = DeviceBuffer::from_host(&self.stream, &to_f32(&perm))
-            .map_err(|e| anyhow!("transpose perm h2d: {:?}", e))?;
+        let os_buf = self.meta_buf(&to_f32(&out_shape))?;
+        let ostr_buf = self.meta_buf(&to_f32(&out_strides))?;
+        let istr_buf = self.meta_buf(&to_f32(&in_strides))?;
+        let perm_buf = self.meta_buf(&to_f32(&perm))?;
 
         let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
             .map_err(|e| anyhow!("transpose alloc: {:?}", e))?;
@@ -2134,10 +2167,6 @@ impl OnnxExecutor {
         drop(ex);
 
         // transpose_nd reads these async; keep alive until the run's final sync.
-        tensors.push_scratch(os_buf);
-        tensors.push_scratch(ostr_buf);
-        tensors.push_scratch(istr_buf);
-        tensors.push_scratch(perm_buf);
         tensors.insert(&out_name, out, out_shape);
         Ok(())
     }
@@ -2219,8 +2248,9 @@ impl OnnxExecutor {
             ind_shape.iter().product()
         };
 
-        let idx_buf = DeviceBuffer::from_host(&self.stream, &indices)
-            .map_err(|e| anyhow!("gather idx h2d: {:?}", e))?;
+        // Cached: gather indices are constant per node, and the naive
+        // from_host would free synchronously on drop (see `meta_buf`).
+        let idx_buf = self.meta_buf(&indices)?;
         let out_numel = outer * n_idx * inner;
         let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
             .map_err(|e| anyhow!("gather alloc: {:?}", e))?;
@@ -2230,7 +2260,7 @@ impl OnnxExecutor {
                 &self.stream,
                 LaunchConfig::for_num_elems(out_numel as u32),
                 ed.buf(),
-                &idx_buf,
+                &*idx_buf,
                 axis_len as u32,
                 inner as u32,
                 n_idx as u32,
@@ -2251,7 +2281,6 @@ impl OnnxExecutor {
         }
 
         // gather_axis reads idx_buf async; keep alive until the run's final sync.
-        tensors.push_scratch(idx_buf);
         tensors.insert(&out_name, out, out_shape);
         Ok(())
     }
