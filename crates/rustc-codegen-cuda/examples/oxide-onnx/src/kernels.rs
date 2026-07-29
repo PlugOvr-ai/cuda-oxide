@@ -2215,6 +2215,11 @@ pub mod gpu {
         alpha: f32,
         bias: &[f32],
         has_bias: u32,
+        // Residual tensor added before the activation, for the skip connection
+        // a ResNet block would otherwise spend a whole kernel and a full
+        // round trip of the activation on.
+        residual: &[f32],
+        has_residual: u32,
         act: u32,
         lo: f32,
         hi: f32,
@@ -2234,7 +2239,12 @@ pub mod gpu {
             } else {
                 0.0f32
             };
-            *o = apply_act(alpha * sum + b_val, act, lo, hi);
+            let r_val = if has_residual != 0u32 {
+                residual[i as usize]
+            } else {
+                0.0f32
+            };
+            *o = apply_act(alpha * sum + b_val + r_val, act, lo, hi);
         }
     }
 
@@ -2903,6 +2913,12 @@ pub mod gpu {
         bias: &[f32],
         spatial: u32,
         channels: u32,
+        has_bias: u32,
+        // Residual added before the activation: a fused skip connection then
+        // costs one extra load in a pass that already runs, instead of its own
+        // kernel and a full round trip of the activation.
+        residual: &[f32],
+        has_residual: u32,
         act: u32,
         lo: f32,
         hi: f32,
@@ -2911,7 +2927,13 @@ pub mod gpu {
         let i = idx.get() as u32;
         if let Some(v) = x.get_mut(idx) {
             let chan = ((i / spatial) % channels) as usize;
-            *v = apply_act(*v + bias[chan], act, lo, hi);
+            let b = if has_bias != 0u32 { bias[chan] } else { 0.0f32 };
+            let r = if has_residual != 0u32 {
+                residual[i as usize]
+            } else {
+                0.0f32
+            };
+            *v = apply_act(*v + b + r, act, lo, hi);
         }
     }
 

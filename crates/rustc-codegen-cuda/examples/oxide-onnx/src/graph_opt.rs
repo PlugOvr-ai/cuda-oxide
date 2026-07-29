@@ -31,13 +31,15 @@ pub struct OptStats {
     pub bn_act_fused: usize,
     /// BatchNorm nodes whose 5 inputs were collapsed to (scale, shift).
     pub bn_affine: usize,
+    /// Residual `Add` nodes folded into the producing Conv's epilogue.
+    pub residual_fused: usize,
 }
 
 impl OptStats {
     /// Nodes removed from the graph. `bn_affine` rewrites a node in place
     /// rather than removing it, so it is not counted here.
     pub fn total(&self) -> usize {
-        self.bn_folded + self.act_fused + self.bn_act_fused
+        self.bn_folded + self.act_fused + self.bn_act_fused + self.residual_fused
     }
 }
 
@@ -58,7 +60,95 @@ pub fn optimize(
     stats.act_fused = fuse_activation_into(nodes, graph_outputs, "Conv");
     stats.bn_act_fused = fuse_activation_into(nodes, graph_outputs, "BatchNormalization");
     stats.bn_affine = precompute_batchnorm_affine(nodes, weights);
+    stats.residual_fused = fuse_residual_into_conv(nodes, graph_outputs);
     stats
+}
+
+/// Fold a residual `Add` into the convolution that feeds it.
+///
+/// A ResNet block ends `conv(...) + shortcut`, which costs a whole kernel and
+/// a full round trip of the activation through DRAM — 44 MB and 16 launches on
+/// ResNet50. The convolution's epilogue already reads the accumulator and
+/// writes the output, so it can add the shortcut on the way past. TensorRT
+/// fuses the same pattern; its kernel names say so.
+///
+/// The shortcut tensor is appended as the Conv's fourth input and flagged with
+/// `oxide_residual`, with an empty bias slot inserted when the Conv has none so
+/// the index is stable. Applies only when the Conv's output feeds the Add and
+/// nothing else, and is not a graph output.
+fn fuse_residual_into_conv(nodes: &mut Vec<NodeProto>, graph_outputs: &HashSet<String>) -> usize {
+    struct Fuse {
+        conv: usize,
+        add: usize,
+        residual: String,
+    }
+    let mut fuses: Vec<Fuse> = Vec::new();
+    {
+        let counts = consumer_counts(nodes);
+        let producer = producers(nodes);
+        let mut claimed: HashSet<usize> = HashSet::new();
+
+        for (add_idx, add) in nodes.iter().enumerate() {
+            if add.op_type != "Add" || add.input.len() != 2 {
+                continue;
+            }
+            // Exactly one side must come from a Conv we can absorb into.
+            for (a, b) in [(0usize, 1usize), (1, 0)] {
+                let from = add.input[a].as_str();
+                let other = add.input[b].as_str();
+                let Some(&conv_idx) = producer.get(from) else {
+                    continue;
+                };
+                let conv = &nodes[conv_idx];
+                if conv.op_type != "Conv" || conv.output.len() != 1 {
+                    continue;
+                }
+                if claimed.contains(&conv_idx) {
+                    continue;
+                }
+                if counts.get(from).copied().unwrap_or(0) != 1 || graph_outputs.contains(from) {
+                    continue;
+                }
+                // The residual must already exist when the Conv runs.
+                let Some(&res_idx) = producer.get(other) else {
+                    continue;
+                };
+                if res_idx > conv_idx {
+                    continue;
+                }
+                claimed.insert(conv_idx);
+                fuses.push(Fuse {
+                    conv: conv_idx,
+                    add: add_idx,
+                    residual: other.to_string(),
+                });
+                break;
+            }
+        }
+    }
+
+    let mut dead: HashSet<usize> = HashSet::new();
+    for f in &fuses {
+        let add_out = nodes[f.add].output[0].clone();
+        let conv = &mut nodes[f.conv];
+        while conv.input.len() < 3 {
+            conv.input.push(String::new());
+        }
+        conv.input.truncate(3);
+        conv.input.push(f.residual.clone());
+        set_attr_i(conv, "oxide_residual", 1);
+        conv.output[0] = add_out;
+        dead.insert(f.add);
+    }
+    if !dead.is_empty() {
+        let mut idx = 0;
+        nodes.retain(|_| {
+            let keep = !dead.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+    fuses.len()
 }
 
 /// Collapse a surviving BatchNormalization's five inputs into the two arrays

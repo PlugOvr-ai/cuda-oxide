@@ -595,6 +595,8 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    bias_operand,
+                    0, // no residual on this path
                     act,
                     lo,
                     hi,
@@ -667,6 +669,8 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    bias_operand,
+                    0, // no residual on this path
                     act,
                     lo,
                     hi,
@@ -785,6 +789,8 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    bias_operand,
+                    0, // no residual on this path
                     act,
                     lo,
                     hi,
@@ -1318,6 +1324,13 @@ impl OnnxExecutor {
             } else {
                 None
             };
+            let has_residual = attr_i(node, "oxide_residual", 0) != 0 && node.input.len() > 3;
+            let residual_ptr = if has_residual {
+                let er = Self::get_tensor(tensors, &self.weights, &node.input[3])?;
+                Some(er.buf().cu_deviceptr())
+            } else {
+                None
+            };
             let m = n_out;
             let kk = col_rows_g;
             let nn = col_cols;
@@ -1394,6 +1407,18 @@ impl OnnxExecutor {
                         None => DeviceBuffer::<f32>::from_raw_parts(w_ptr, m, self.ctx.clone()),
                     }
                 });
+                // A residual Add folded in by the graph rewrite is added here,
+                // before the activation, instead of costing its own kernel.
+                let residual_view = ManuallyDrop::new(unsafe {
+                    match residual_ptr {
+                        Some(ptr) => DeviceBuffer::<f32>::from_raw_parts(
+                            ptr + (b * m * nn * 4) as u64,
+                            m * nn,
+                            self.ctx.clone(),
+                        ),
+                        None => DeviceBuffer::<f32>::from_raw_parts(w_ptr, m, self.ctx.clone()),
+                    }
+                });
                 unsafe {
                     self.module.reduce_splits(
                         &self.stream,
@@ -1405,6 +1430,8 @@ impl OnnxExecutor {
                         1.0,
                         &bias_view,
                         u32::from(has_bias),
+                        &residual_view,
+                        u32::from(has_residual),
                         act,
                         act_lo,
                         act_hi,
@@ -1638,16 +1665,36 @@ impl OnnxExecutor {
         // Epilogue: optional bias (3rd input) and the activation the graph
         // rewrite folded in, in a single pass over the output.
         let (act, act_lo, act_hi) = Self::fused_act(node);
-        if node.input.len() > 2 && !node.input[2].is_empty() {
-            let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+        let has_bias_ep = node.input.len() > 2 && !node.input[2].is_empty();
+        // A residual Add folded in by the graph rewrite arrives as a fourth
+        // input and is applied in this pass, which already exists, rather than
+        // costing its own kernel and a round trip of the activation.
+        let has_res_ep = attr_i(node, "oxide_residual", 0) != 0 && node.input.len() > 3;
+        if has_bias_ep || has_res_ep {
+            let stub = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(w_ptr, 1, self.ctx.clone())
+            });
+            let bias_ep = if has_bias_ep {
+                Some(Self::get_tensor(tensors, &self.weights, &node.input[2])?)
+            } else {
+                None
+            };
+            let res_ep = if has_res_ep {
+                Some(Self::get_tensor(tensors, &self.weights, &node.input[3])?)
+            } else {
+                None
+            };
             unsafe {
                 self.module.bias_act(
                     &self.stream,
                     LaunchConfig::for_num_elems(out_numel as u32),
                     &mut result_buf,
-                    eb.buf(),
+                    bias_ep.as_ref().map_or(&*stub, |e| e.buf()),
                     (out_h * out_w) as u32,
                     n_out as u32,
+                    u32::from(has_bias_ep),
+                    res_ep.as_ref().map_or(&*stub, |e| e.buf()),
+                    u32::from(has_res_ep),
                     act,
                     act_lo,
                     act_hi,
