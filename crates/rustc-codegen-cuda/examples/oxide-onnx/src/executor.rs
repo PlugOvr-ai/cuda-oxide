@@ -1370,11 +1370,12 @@ impl OnnxExecutor {
                         (m as u32).div_ceil(64).max(1),
                         splits as u32,
                     ),
-                    block_dim: (128, 1, 1),
+                    // 8 warps over the same 64x64 tile: see conv2d_f16_tc_w8.
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.module.conv2d_f16_tc_splitk(
+                    self.module.conv2d_f16_tc_w8(
                         &self.stream,
                         cfg,
                         m as u32,
@@ -1399,7 +1400,7 @@ impl OnnxExecutor {
                         &mut partials,
                     )
                 }
-                .map_err(|e| anyhow!("conv2d_f16_tc launch: {:?}", e))?;
+                .map_err(|e| anyhow!("conv2d_f16_tc_w8 launch: {:?}", e))?;
 
                 let bias_view = ManuallyDrop::new(unsafe {
                     match bias_ptr {

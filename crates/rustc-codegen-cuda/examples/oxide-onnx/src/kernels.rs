@@ -1919,6 +1919,176 @@ pub mod gpu {
         }
     }
 
+    #[kernel]
+    pub fn conv2d_f16_tc_w8(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a_packed: &[u32],
+        kpairs: u32,
+        x: &[f32],
+        c_in: u32,
+        h_in: u32,
+        w_in: u32,
+        kh: u32,
+        kw: u32,
+        pad_h: u32,
+        pad_w: u32,
+        stride_h: u32,
+        stride_w: u32,
+        dil_h: u32,
+        dil_w: u32,
+        out_w: u32,
+        mut partials: DisjointSlice<f32>,
+    ) {
+        // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
+        static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5; // 0..8
+        let lane = tid & 31;
+        let gid = lane >> 2; // groupID 0..7
+        let tig = lane & 3; // threadID_in_group 0..3
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 4]; 4];
+
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
+            let mut q = 0u32;
+            #[unroll]
+            while q < 2 {
+                let e = tid + q * 256;
+                let r = e >> 3;
+                let kk = (e & 7) * 2;
+                let gr = row0 + r;
+                let g0 = k0 + kk;
+                // Already half-packed at load time: one 32-bit read, no
+                // conversion, half the bytes of the f32 form.
+                unsafe {
+                    AS[e as usize] = if gr < m && g0 < k_stop {
+                        a_packed[(gr * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                }
+                q += 1;
+            }
+            // Stage B directly from the input tensor: the column matrix is
+            // never materialised. For a 3x3 convolution im2col inflates the
+            // input ninefold, so reading X here saves both that write and the
+            // inflated read the GEMM would otherwise do.
+            let khw = kh * kw;
+            let plane = h_in * w_in;
+            let mut q2 = 0u32;
+            #[unroll]
+            while q2 < 2 {
+                let e = tid + q2 * 256;
+                let cc = e >> 3;
+                let kk = (e & 7) * 2;
+                let gc = col0 + cc;
+                let g0 = k0 + kk;
+                // One register holds the two K-neighbours of a column, which
+                // for a convolution are two adjacent taps of the same patch.
+                let oh = gc / out_w;
+                let ow = gc % out_w;
+                let mut lo = 0.0f32;
+                let mut hi = 0.0f32;
+                if gc < n {
+                    if g0 < k_stop {
+                        let ci = g0 / khw;
+                        let krc = g0 % khw;
+                        let ih = (oh * stride_h + (krc / kw) * dil_h) as i32 - pad_h as i32;
+                        let iw = (ow * stride_w + (krc % kw) * dil_w) as i32 - pad_w as i32;
+                        if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                            lo = x[(ci * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                        }
+                    }
+                    let g1 = g0 + 1;
+                    if g1 < k_stop {
+                        let ci = g1 / khw;
+                        let krc = g1 % khw;
+                        let ih = (oh * stride_h + (krc / kw) * dil_h) as i32 - pad_h as i32;
+                        let iw = (ow * stride_w + (krc % kw) * dil_w) as i32 - pad_w as i32;
+                        if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                            hi = x[(ci * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                        }
+                    }
+                }
+                unsafe {
+                    BS[e as usize] = pack_f16x2(lo, hi);
+                }
+                q2 += 1;
+            }
+            thread::sync_threads();
+
+            // One A fragment for this warp's 16 rows, reused by all 8 tiles.
+            let arow = (warp & 3) * 16;
+            let ncol_base = (warp >> 2) * 32;
+            let a0 = unsafe { AS[((arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[((arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[((arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[((arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 4 {
+                let ncol = ncol_base + t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+            thread::sync_threads();
+            k0 += 16;
+        }
+
+        // Partial store; alpha, bias and activation belong to `reduce_splits`.
+        let plane = split * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 4 {
+            let gc = col0 + (warp >> 2) * 32 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + (warp & 3) * 16 + gid + half * 8;
+                if gr < m {
+                    let base = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
     // =========================================================================
     // Split-K GEMM — partial products over a slice of K, one per grid.z.
     //
