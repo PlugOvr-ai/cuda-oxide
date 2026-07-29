@@ -51,6 +51,9 @@ pub struct OnnxExecutor {
     /// Intermediate buffers recycled across inferences, keyed by element count.
     /// See [`Self::alloc_buf`].
     buf_pool: RefCell<HashMap<usize, Vec<DeviceBuffer<f32>>>>,
+    /// Weight matrices pre-packed as f16 pairs for the tensor-core GEMM, keyed
+    /// by (device pointer, rows, k). See [`Self::packed_weights`].
+    f16_weights: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
 }
 
 impl OnnxExecutor {
@@ -113,6 +116,7 @@ impl OnnxExecutor {
             output_names,
             meta_cache: RefCell::new(HashMap::new()),
             buf_pool: RefCell::new(HashMap::new()),
+            f16_weights: RefCell::new(HashMap::new()),
         })
     }
 
@@ -497,6 +501,9 @@ impl OnnxExecutor {
         act: u32,
         lo: f32,
         hi: f32,
+        // True when `a` is a load-time constant (conv weights), which is what
+        // makes the f16 packing cacheable.
+        a_static: bool,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
@@ -512,6 +519,67 @@ impl OnnxExecutor {
         // over the output for nothing (measured: 2.5 ms -> 6.4 ms on ViT).
         let worth_it = splits >= 2 || m * n >= 65_536;
         let use_splitk = choice != "tiled" && choice != "reg" && worth_it;
+
+        // f16 tensor cores, when `a` is a constant we can keep pre-packed. The
+        // GEMM is 1.55x the f32 split-K path on these shapes; the cost is f16's
+        // 10-bit mantissa, so it is gated on the correctness harness rather
+        // than assumed harmless. OXIDE_F16=0 disables it.
+        let f16_ok = a_static
+            && k >= 32
+            && m * n >= 4096
+            && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true);
+        if use_splitk && f16_ok {
+            let kpairs = k.div_ceil(2);
+            let a_packed = self.packed_weights(a, m, k)?;
+            let k_per_split = k.div_ceil(splits).next_multiple_of(16).max(16);
+            let mut partials = self
+                .alloc_buf(splits * m * n)
+                .map_err(|e| anyhow!("f16 partials alloc: {}", e))?;
+            let gemm_cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64).max(1),
+                    (m as u32).div_ceil(64).max(1),
+                    splits as u32,
+                ),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.module.sgemm_f16_tc_splitk_wpacked(
+                    &self.stream,
+                    gemm_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    &a_packed,
+                    kpairs as u32,
+                    b,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_f16_tc launch: {:?}", e))?;
+            let bias_operand = bias.unwrap_or(a);
+            unsafe {
+                self.module.reduce_splits(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((m * n) as u32),
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    alpha,
+                    bias_operand,
+                    u32::from(bias.is_some()),
+                    act,
+                    lo,
+                    hi,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("reduce_splits launch: {:?}", e))?;
+            return Ok(());
+        }
 
         // One split means the reduction would be a pure copy of the partials
         // into the output — measured at up to 24% of a shape's time. Write the
@@ -697,6 +765,8 @@ impl OnnxExecutor {
             graph_opt::ACT_NONE as u32,
             0.0,
             0.0,
+            // Gemm/MatMul take an activation as `a`, so nothing to cache.
+            false,
             c,
         )
     }
@@ -1333,6 +1403,8 @@ impl OnnxExecutor {
                         act,
                         act_lo,
                         act_hi,
+                        // Conv's `a` is the weight tensor: constant, cacheable.
+                        true,
                         &mut out_g,
                     )
                     .map_err(|e| anyhow!("conv sgemm g={}: {}", g, e))?;
@@ -1451,6 +1523,53 @@ impl OnnxExecutor {
         for buf in scratch {
             pool.entry(buf.len()).or_default().push(buf);
         }
+    }
+
+    /// An f16-packed copy of a *constant* weight matrix, built once and kept.
+    ///
+    /// Only valid for tensors that live for the executor's lifetime: the key
+    /// includes the device pointer, and intermediate buffers are recycled, so
+    /// caching a transient tensor would hand back another tensor's data. Conv
+    /// weights qualify; activations do not, which is why the caller states it.
+    ///
+    /// Pre-packing is what makes the tensor-core path worth using. Reading the
+    /// operand as ready-made half pairs removes both the per-element software
+    /// conversion and half the bytes: the same kernel measured 1.88 ms over f32
+    /// weights and 1.30 ms over packed ones, against 1.99 ms for the f32
+    /// split-K path.
+    fn packed_weights(
+        &self,
+        a: &DeviceBuffer<f32>,
+        m: usize,
+        k: usize,
+    ) -> Result<ManuallyDrop<DeviceBuffer<u32>>> {
+        let key = (a.cu_deviceptr(), m, k);
+        let kpairs = k.div_ceil(2);
+        let mut cache = self.f16_weights.borrow_mut();
+        let entry = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let mut packed = DeviceBuffer::<u32>::zeroed(&self.stream, m * kpairs)
+                    .map_err(|err| anyhow!("f16 weight alloc: {:?}", err))?;
+                unsafe {
+                    self.module.pack_f16_rows(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((m * kpairs) as u32),
+                        a,
+                        k as u32,
+                        kpairs as u32,
+                        &mut packed,
+                    )
+                }
+                .map_err(|err| anyhow!("f16 weight pack: {:?}", err))?;
+                e.insert(packed)
+            }
+        };
+        // SAFETY: aliases a cache entry that outlives the launch; ManuallyDrop
+        // keeps the alias from freeing it.
+        Ok(ManuallyDrop::new(unsafe {
+            DeviceBuffer::<u32>::from_raw_parts(entry.cu_deviceptr(), entry.len(), self.ctx.clone())
+        }))
     }
 
     /// Launch geometry for the channel-wise elementwise kernels: one grid row

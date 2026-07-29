@@ -523,7 +523,7 @@ fn bench_kernels() -> Result<()> {
     // f16 tensor cores: accuracy against the f32 kernel, then speed. f16 has a
     // 10-bit mantissa, so the question is not whether it differs but whether
     // the difference is small relative to the values involved.
-    println!("  sgemm_f16_tc (f16 tensor cores, f32 accumulate)");
+    println!("  sgemm_f16_tc_splitk_wpacked (f16 tensor cores, pre-packed weights)");
     println!(
         "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>9} {:>9} {:>9} {:>10}",
         "layer", "M", "N", "K", "sp", "µs", "GFLOP/s", "total ms", "max rel err"
@@ -564,16 +564,33 @@ fn bench_kernels() -> Result<()> {
             shared_mem_bytes: 0,
         };
         let red_cfg2 = LaunchConfig::for_num_elems((m * n) as u32);
+        // Weights pre-packed once, as the executor would do at load time.
+        let kpairs = k.div_ceil(2);
+        let mut a_packed = DeviceBuffer::<u32>::zeroed(&stream, m * kpairs)
+            .map_err(|e| anyhow::anyhow!("alloc packed: {:?}", e))?;
+        unsafe {
+            module.pack_f16_rows(
+                &stream,
+                LaunchConfig::for_num_elems((m * kpairs) as u32),
+                &a,
+                k as u32,
+                kpairs as u32,
+                &mut a_packed,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("pack: {:?}", e))?;
+
         let secs = time_kernel(&stream, 50, || {
             unsafe {
-                module.sgemm_f16_tc_splitk(
+                module.sgemm_f16_tc_splitk_wpacked(
                     &stream,
                     tc_cfg,
                     m as u32,
                     n as u32,
                     k as u32,
                     k_per_split as u32,
-                    &a,
+                    &a_packed,
+                    kpairs as u32,
                     &b,
                     &mut partials,
                 )

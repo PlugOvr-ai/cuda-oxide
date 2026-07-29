@@ -1114,6 +1114,166 @@ pub mod gpu {
         }
     }
 
+    #[kernel]
+    pub fn sgemm_f16_tc_splitk_wpacked(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a_packed: &[u32],
+        kpairs: u32,
+        b: &[f32],
+        mut partials: DisjointSlice<f32>,
+    ) {
+        // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
+        static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2; // groupID 0..7
+        let tig = lane & 3; // threadID_in_group 0..3
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 4]; 8];
+
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
+            let mut q = 0u32;
+            #[unroll]
+            while q < 4 {
+                let e = tid + q * 128;
+                let r = e >> 3;
+                let kk = (e & 7) * 2;
+                let gr = row0 + r;
+                let g0 = k0 + kk;
+                // Already half-packed at load time: one 32-bit read, no
+                // conversion, half the bytes of the f32 form.
+                unsafe {
+                    AS[e as usize] = if gr < m && g0 < k_stop {
+                        a_packed[(gr * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                }
+                q += 1;
+            }
+            // Stage B as BS[col][kpair] — transposed relative to A, because the
+            // B fragment wants a column's two K neighbours in one register.
+            let mut q2 = 0u32;
+            #[unroll]
+            while q2 < 4 {
+                let e = tid + q2 * 128;
+                let cc = e >> 3;
+                let kk = (e & 7) * 2;
+                let gc = col0 + cc;
+                let g0 = k0 + kk;
+                let v0 = if gc < n && g0 < k_stop {
+                    b[(g0 * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                let v1 = if gc < n && g0 + 1 < k_stop {
+                    b[((g0 + 1) * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                unsafe {
+                    BS[e as usize] = pack_f16x2(v0, v1);
+                }
+                q2 += 1;
+            }
+            thread::sync_threads();
+
+            // One A fragment for this warp's 16 rows, reused by all 8 tiles.
+            let arow = warp * 16;
+            let a0 = unsafe { AS[((arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[((arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[((arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[((arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 8 {
+                let ncol = t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+            thread::sync_threads();
+            k0 += 16;
+        }
+
+        // Partial store; alpha, bias and activation belong to `reduce_splits`.
+        let plane = split * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 8 {
+            let gc = col0 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + warp * 16 + gid + half * 8;
+                if gr < m {
+                    let base = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
+    // =========================================================================
+    // Pack an f32 matrix into f16 pairs for the tensor-core A operand.
+    //   src: [rows][k] row-major f32.  dst: [rows][ceil(k/2)] u32, each
+    //   holding k and k+1 as two halves. Odd k pads the final half with zero,
+    //   which the GEMM masks off by its K bound anyway.
+    // =========================================================================
+    #[kernel]
+    pub fn pack_f16_rows(src: &[f32], k: u32, kpairs: u32, mut dst: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+        if let Some(o) = dst.get_mut(idx) {
+            let row = i / kpairs;
+            let pair = i % kpairs;
+            let k0 = pair * 2;
+            let lo = src[(row * k + k0) as usize];
+            let hi = if k0 + 1 < k {
+                src[(row * k + k0 + 1) as usize]
+            } else {
+                0.0f32
+            };
+            *o = pack_f16x2(lo, hi);
+        }
+    }
+
     // =========================================================================
     // Split-K GEMM — partial products over a slice of K, one per grid.z.
     //
