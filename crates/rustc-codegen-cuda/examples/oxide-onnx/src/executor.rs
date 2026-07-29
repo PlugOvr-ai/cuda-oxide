@@ -621,7 +621,7 @@ impl OnnxExecutor {
                     (m as u32).div_ceil(64).max(1),
                     splits as u32,
                 ),
-                block_dim: (128, 1, 1),
+                block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
             // Pack the activation once, rather than letting every block that
@@ -643,7 +643,7 @@ impl OnnxExecutor {
             }
             .map_err(|e| anyhow!("f16 A pack: {:?}", e))?;
             unsafe {
-                self.module.sgemm_f16_tc_splitk_ab_db(
+                self.module.sgemm_f16_tc_splitk_ab_w8(
                     &self.stream,
                     gemm_cfg,
                     m as u32,
@@ -656,7 +656,7 @@ impl OnnxExecutor {
                     &mut partials,
                 )
             }
-            .map_err(|e| anyhow!("sgemm_f16_tc_ab_db launch: {:?}", e))?;
+            .map_err(|e| anyhow!("sgemm_f16_tc_ab_w8 launch: {:?}", e))?;
             let bias_operand = bias.unwrap_or(a);
             unsafe {
                 self.module.reduce_splits(
