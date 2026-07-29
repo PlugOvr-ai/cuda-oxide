@@ -2251,7 +2251,8 @@ impl OnnxExecutor {
         // a time it leaves the grid nearly empty — 197x64x197 is sixteen
         // blocks — and repeats the operand packing per head. Folding the batch
         // into gridDim.z gives one launch with a grid `batch` times larger.
-        if batch > 1 && !b_static && m >= 32 && n >= 32 && k >= 16 && k % 16 == 0 {
+        let fused_bias = attr_i(node, "oxide_bias", 0) != 0 && node.input.len() > 2;
+        if batch > 1 && !fused_bias && !b_static && m >= 32 && n >= 32 && k >= 16 && k % 16 == 0 {
             let kpairs = k.div_ceil(2);
             let a_all = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(a_ptr, batch * m * k, self.ctx.clone())
@@ -2339,8 +2340,29 @@ impl OnnxExecutor {
                     self.ctx.clone(),
                 )
             });
-            self.dispatch_sgemm(m, n, k, 1.0, &a_g, &b_g, 0.0, b_static, &mut c_g)
-                .map_err(|e| anyhow!("matmul sgemm bi={}: {}", bi, e))?;
+            // A fused bias rides the split-K reduction's epilogue, so the
+            // separate broadcast Add never runs.
+            let bias = if fused_bias {
+                Some(Self::get_tensor(tensors, &self.weights, &node.input[2])?)
+            } else {
+                None
+            };
+            self.dispatch_sgemm_epilogue(
+                m,
+                n,
+                k,
+                1.0,
+                &a_g,
+                &b_g,
+                bias.as_ref().map(|b| b.buf()),
+                0,
+                0.0,
+                0.0,
+                false,
+                b_static,
+                &mut c_g,
+            )
+            .map_err(|e| anyhow!("matmul sgemm bi={}: {}", bi, e))?;
         }
 
         tensors.insert(&out_name, out, out_shape);
