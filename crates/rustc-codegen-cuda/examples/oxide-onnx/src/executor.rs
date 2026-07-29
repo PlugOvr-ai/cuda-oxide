@@ -48,6 +48,9 @@ pub struct OnnxExecutor {
     /// Device copies of small constant metadata arrays (shapes, strides,
     /// permutations), keyed by their contents. See [`Self::meta_buf`].
     meta_cache: RefCell<HashMap<u64, DeviceBuffer<f32>>>,
+    /// Intermediate buffers recycled across inferences, keyed by element count.
+    /// See [`Self::alloc_buf`].
+    buf_pool: RefCell<HashMap<usize, Vec<DeviceBuffer<f32>>>>,
 }
 
 impl OnnxExecutor {
@@ -109,6 +112,7 @@ impl OnnxExecutor {
             input_names,
             output_names,
             meta_cache: RefCell::new(HashMap::new()),
+            buf_pool: RefCell::new(HashMap::new()),
         })
     }
 
@@ -126,9 +130,9 @@ impl OnnxExecutor {
             // run synchronises the whole device — and the next inference's
             // allocation then queues behind that. Measured at 6 ms of BERT's
             // ~20 ms, for two tensors of 128 elements.
-            let mut buf =
-                unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, data.len()) }
-                    .map_err(|e| anyhow!("input alloc '{}': {:?}", name, e))?;
+            let mut buf = self
+                .alloc_buf(data.len())
+                .map_err(|e| anyhow!("input alloc '{}': {}", name, e))?;
             buf.copy_from_host(&self.stream, data)
                 .map_err(|e| anyhow!("H2D input '{}': {:?}", name, e))?;
             tensors.insert(name, buf, shape.clone());
@@ -264,6 +268,9 @@ impl OnnxExecutor {
                 t_out.elapsed().as_secs_f64() * 1e3
             );
         }
+        // The outputs are already on the host, so every intermediate is dead;
+        // hand them to the pool rather than enqueueing a free for each.
+        self.recycle(tensors);
         Ok(outputs)
     }
 
@@ -307,8 +314,9 @@ impl OnnxExecutor {
             let eb = Self::get_tensor(tensors, &self.weights, in_name)?;
             (eb.buf().len(), eb.buf().cu_deviceptr())
         };
-        let out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("alias_or_copy alloc: {:?}", e))?;
+        let out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("alias_or_copy alloc: {}", e))?;
         self.dtod_copy(&out, src_ptr, numel * 4)?;
         tensors.insert(out_name, out, new_shape);
         Ok(())
@@ -507,9 +515,9 @@ impl OnnxExecutor {
 
         if use_splitk {
             let k_per_split = k.div_ceil(splits).next_multiple_of(8).max(8);
-            let partials =
-                unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, splits * m * n) }
-                    .map_err(|e| anyhow!("splitk partials alloc: {:?}", e))?;
+            let partials = self
+                .alloc_buf(splits * m * n)
+                .map_err(|e| anyhow!("splitk partials alloc: {}", e))?;
             // `partials` is freed stream-ordered when it drops, i.e. after the
             // reduction that reads it has run.
             let mut partials = partials;
@@ -650,8 +658,9 @@ impl OnnxExecutor {
         let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let numel = ea.buf().len();
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("relu alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("relu alloc: {}", e))?;
         // Fused read→write: no separate D2D copy of the input.
         unsafe {
             self.module.relu_fwd(
@@ -697,8 +706,9 @@ impl OnnxExecutor {
         let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let numel = ea.buf().len();
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("clip alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("clip alloc: {}", e))?;
         // Fused read→write: no separate D2D copy of the input.
         unsafe {
             self.module.clip_fwd(
@@ -735,8 +745,9 @@ impl OnnxExecutor {
                 (eb.buf(), nb, eb.shape().clone(), node.input[0].as_str())
             };
             let s = self.host_vals(tensors, scalar_name)?[0];
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-                .map_err(|e| anyhow!("add alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(numel)
+                .map_err(|e| anyhow!("add alloc: {}", e))?;
             unsafe {
                 self.module.add_scalar(
                     &self.stream,
@@ -754,8 +765,9 @@ impl OnnxExecutor {
         let b_shape = eb.shape().clone();
         // Equal element count AND identical shape → fast elementwise path.
         if na == nb && a_shape == b_shape {
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, na) }
-                .map_err(|e| anyhow!("add alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(na)
+                .map_err(|e| anyhow!("add alloc: {}", e))?;
             unsafe {
                 self.module.add_elementwise(
                     &self.stream,
@@ -776,8 +788,9 @@ impl OnnxExecutor {
         let ost = self.meta_buf(&Self::to_f32(&out_str))?;
         let ast = self.meta_buf(&Self::to_f32(&a_str))?;
         let bst = self.meta_buf(&Self::to_f32(&b_str))?;
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-            .map_err(|e| anyhow!("add bcast alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("add bcast alloc: {}", e))?;
         unsafe {
             self.module.add_bcast(
                 &self.stream,
@@ -902,8 +915,9 @@ impl OnnxExecutor {
                 (eb.buf(), nb, eb.shape().clone(), node.input[0].as_str())
             };
             let s = self.host_vals(tensors, scalar_name)?[0];
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-                .map_err(|e| anyhow!("mul alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(numel)
+                .map_err(|e| anyhow!("mul alloc: {}", e))?;
             unsafe {
                 self.module.mul_scalar(
                     &self.stream,
@@ -919,8 +933,9 @@ impl OnnxExecutor {
         }
         let numel = na;
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("mul alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("mul alloc: {}", e))?;
         unsafe {
             self.module.mul_elementwise(
                 &self.stream,
@@ -972,9 +987,9 @@ impl OnnxExecutor {
         let out_numel = batch_n * n_out * out_h * out_w;
 
         // Pre-allocate output on GPU (zeroed, written in-place per group).
-        let mut result_buf =
-            unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-                .map_err(|e| anyhow!("conv result alloc: {:?}", e))?;
+        let mut result_buf = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("conv result alloc: {}", e))?;
 
         // ── Fast path: depthwise conv (group == c_in, 1 input chan/group) ──
         // Collapses the O(group) im2col+GEMM launches into one fused kernel.
@@ -1340,6 +1355,43 @@ impl OnnxExecutor {
         }))
     }
 
+    /// An intermediate buffer of `len` elements, recycled across inferences.
+    ///
+    /// Every node allocates its output and the whole graph is freed at the end
+    /// of the run — for BERT that is ~450 `cuMemFreeAsync` calls enqueued on
+    /// the stream, which the *next* inference's first synchronisation has to
+    /// wait for the GPU to work through. Measured at 6.8 ms of GPT-2's 19.5 ms,
+    /// entirely in the setup phase, before any kernel of that inference runs.
+    ///
+    /// Recycling avoids both the free and the allocation. Reuse is safe on a
+    /// single stream: a kernel reading a recycled buffer is enqueued after
+    /// every kernel that used it previously, so the stream order is the
+    /// dependency order.
+    fn alloc_buf(&self, len: usize) -> Result<DeviceBuffer<f32>> {
+        if let Some(bucket) = self.buf_pool.borrow_mut().get_mut(&len)
+            && let Some(buf) = bucket.pop()
+        {
+            return Ok(buf);
+        }
+        unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, len) }
+            .map_err(|e| anyhow!("alloc {len} elems: {:?}", e))
+    }
+
+    /// Return a run's intermediates to the pool instead of freeing them.
+    ///
+    /// Called once the outputs have been copied back, which synchronises the
+    /// stream, so nothing recycled here is still in flight.
+    fn recycle(&self, tensors: TensorMap) {
+        let mut pool = self.buf_pool.borrow_mut();
+        let TensorMap { map, scratch, .. } = tensors;
+        for (_, (buf, _)) in map {
+            pool.entry(buf.len()).or_default().push(buf);
+        }
+        for buf in scratch {
+            pool.entry(buf.len()).or_default().push(buf);
+        }
+    }
+
     /// Launch geometry for the channel-wise elementwise kernels: one grid row
     /// per (batch, channel) pair, `spatial` elements wide.
     ///
@@ -1403,8 +1455,9 @@ impl OnnxExecutor {
         let hw: usize = x_shape.iter().skip(2).product::<usize>().max(1);
         let numel: usize = x_shape.iter().product();
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("batchnorm alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("batchnorm alloc: {}", e))?;
 
         // Fast path: the load-time rewrite collapsed the five parameters into
         // (scale, shift), so the kernel is a per-channel affine and nothing more.
@@ -1478,8 +1531,9 @@ impl OnnxExecutor {
             maxpool_output_shape(in_h, in_w, kh, kw, pad_h, pad_w, stride_h, stride_w);
         let out_numel = n * c * out_h * out_w;
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-            .map_err(|e| anyhow!("maxpool alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("maxpool alloc: {}", e))?;
 
         unsafe {
             self.module.maxpool2d(
@@ -1521,8 +1575,9 @@ impl OnnxExecutor {
             1
         };
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, n * c) }
-            .map_err(|e| anyhow!("gavgpool alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(n * c)
+            .map_err(|e| anyhow!("gavgpool alloc: {}", e))?;
 
         unsafe {
             self.module.global_avg_pool(
@@ -1576,9 +1631,9 @@ impl OnnxExecutor {
         }
 
         let out_numel = m * n;
-        let mut out_dev =
-            unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-                .map_err(|e| anyhow!("gemm alloc: {:?}", e))?;
+        let mut out_dev = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("gemm alloc: {}", e))?;
 
         // C = alpha * A * op(B)  (beta=0, bias added separately below)
         let cfg = Self::sgemm_cfg(m, n);
@@ -1687,9 +1742,9 @@ impl OnnxExecutor {
         let mut out_shape = a_shape[..a_shape.len() - 2].to_vec();
         out_shape.extend([m, n]);
 
-        let mut out =
-            unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, batch * m * n) }
-                .map_err(|e| anyhow!("matmul alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(batch * m * n)
+            .map_err(|e| anyhow!("matmul alloc: {}", e))?;
         let out_ptr = out.cu_deviceptr();
 
         for bi in 0..batch {
@@ -1741,8 +1796,9 @@ impl OnnxExecutor {
         let cols = x_shape[ax];
         let rows = numel / cols;
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("softmax alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("softmax alloc: {}", e))?;
 
         unsafe {
             self.module.softmax_block(
@@ -1784,8 +1840,9 @@ impl OnnxExecutor {
         let cols: usize = x_shape[ax..].iter().product();
         let rows = numel / cols;
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("layernorm alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("layernorm alloc: {}", e))?;
 
         unsafe {
             self.module.layernorm_block(
@@ -1814,8 +1871,9 @@ impl OnnxExecutor {
         let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let numel = ea.buf().len();
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("erf alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("erf alloc: {}", e))?;
         unsafe {
             self.module.erf_fwd(
                 &self.stream,
@@ -1838,8 +1896,9 @@ impl OnnxExecutor {
         let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let numel = ea.buf().len();
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("tanh alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("tanh alloc: {}", e))?;
         unsafe {
             self.module.tanh_fwd(
                 &self.stream,
@@ -1867,8 +1926,9 @@ impl OnnxExecutor {
         if na == 1 && nb > 1 {
             let s = self.host_vals(tensors, &node.input[0])?[0];
             let shape = eb.shape().clone();
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, nb) }
-                .map_err(|e| anyhow!("sub alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(nb)
+                .map_err(|e| anyhow!("sub alloc: {}", e))?;
             unsafe {
                 self.module.sub_scalar_lhs(
                     &self.stream,
@@ -1885,8 +1945,9 @@ impl OnnxExecutor {
         if nb == 1 && na > 1 {
             let s = self.host_vals(tensors, &node.input[1])?[0];
             let shape = ea.shape().clone();
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, na) }
-                .map_err(|e| anyhow!("sub alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(na)
+                .map_err(|e| anyhow!("sub alloc: {}", e))?;
             unsafe {
                 self.module.add_scalar(
                     &self.stream,
@@ -1916,8 +1977,9 @@ impl OnnxExecutor {
         let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let numel = ea.buf().len();
         let shape = ea.shape().clone();
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("pow alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("pow alloc: {}", e))?;
         unsafe {
             self.module.pow_scalar(
                 &self.stream,
@@ -1958,8 +2020,9 @@ impl OnnxExecutor {
         let csb = self.meta_buf(&Self::to_f32(&c_str))?;
         let xsb = self.meta_buf(&Self::to_f32(&x_str))?;
         let ysb = self.meta_buf(&Self::to_f32(&y_str))?;
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-            .map_err(|e| anyhow!("where alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("where alloc: {}", e))?;
         unsafe {
             self.module.where_bcast(
                 &self.stream,
@@ -1996,8 +2059,9 @@ impl OnnxExecutor {
         if nb == 1 {
             let shape = ea.shape().clone();
             let s = self.host_vals(tensors, &node.input[1])?[0];
-            let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, na) }
-                .map_err(|e| anyhow!("div alloc: {:?}", e))?;
+            let mut out = self
+                .alloc_buf(na)
+                .map_err(|e| anyhow!("div alloc: {}", e))?;
             unsafe {
                 self.module.mul_scalar(
                     &self.stream,
@@ -2058,9 +2122,9 @@ impl OnnxExecutor {
         let mut start = 0usize;
         for (oi, &sz) in sizes.iter().enumerate() {
             let piece_numel = outer * sz * inner;
-            let mut piece =
-                unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, piece_numel) }
-                    .map_err(|e| anyhow!("split alloc: {:?}", e))?;
+            let mut piece = self
+                .alloc_buf(piece_numel)
+                .map_err(|e| anyhow!("split alloc: {}", e))?;
             unsafe {
                 self.module.slice_axis(
                     &self.stream,
@@ -2171,8 +2235,9 @@ impl OnnxExecutor {
             eb.shape().iter().map(|&d| d as f32).collect()
         };
         let n = shape_vals.len();
-        let mut buf = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, n) }
-            .map_err(|e| anyhow!("shape alloc: {:?}", e))?;
+        let mut buf = self
+            .alloc_buf(n)
+            .map_err(|e| anyhow!("shape alloc: {}", e))?;
         buf.copy_from_host(&self.stream, &shape_vals)
             .map_err(|e| anyhow!("shape h2d: {:?}", e))?;
         tensors.insert(&out_name, buf, vec![n]);
@@ -2269,8 +2334,9 @@ impl OnnxExecutor {
         // GPU scatter: each input is copied straight into its axis slot.
         // No D2H/CPU/H2D and no per-input stream sync (the old path stalled
         // the whole pipeline on every Concat — heavy in ViT/BERT/GPT-2).
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-            .map_err(|e| anyhow!("concat alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("concat alloc: {}", e))?;
         let mut start = 0usize;
         for (inp_name, s) in node.input.iter().zip(shapes.iter()) {
             let sz = s[axis];
@@ -2331,8 +2397,9 @@ impl OnnxExecutor {
         let istr_buf = self.meta_buf(&to_f32(&in_strides))?;
         let perm_buf = self.meta_buf(&to_f32(&perm))?;
 
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, numel) }
-            .map_err(|e| anyhow!("transpose alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("transpose alloc: {}", e))?;
         unsafe {
             self.module.transpose_nd(
                 &self.stream,
@@ -2435,8 +2502,9 @@ impl OnnxExecutor {
         // from_host would free synchronously on drop (see `meta_buf`).
         let idx_buf = self.meta_buf(&indices)?;
         let out_numel = outer * n_idx * inner;
-        let mut out = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, out_numel) }
-            .map_err(|e| anyhow!("gather alloc: {:?}", e))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("gather alloc: {}", e))?;
 
         unsafe {
             self.module.gather_axis(
