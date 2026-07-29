@@ -261,6 +261,42 @@ pub unsafe fn wgmma_mma_m64n64k16_f32_tf32(acc: &mut [[f32; 8]; 4], desc_a: u64,
 /// # Safety
 /// - Must be called by all 32 lanes of a warp from a `#[kernel]` on sm_80+.
 /// - Caller owns the lane→element packing per the PTX ISA fragment layout.
+/// Ampere tensor-core MMA: `D = A·B + C` for one `m16n8k16` tile, f16 inputs,
+/// f32 accumulate. Warp-collective (all 32 lanes participate).
+///
+/// Same operand shape as the tf32 variant — the wider K is absorbed by packing
+/// two halves into each 32-bit register — but twice the throughput on this
+/// class of hardware, because f16 with f32 accumulate runs at 2× the FP32
+/// CUDA-core rate on GA10x while tf32 runs at parity with it.
+///
+/// Per-thread fragment layout (CUDA PTX ISA, `mma.sync.aligned.m16n8k16`),
+/// with `group = lane / 4` and `tig = lane % 4`:
+/// - `acc`: 4 f32 accumulator regs (C in, D out — read-modify-write), holding
+///   rows `group` and `group + 8`, columns `2·tig` and `2·tig + 1`.
+/// - `a0..a3`: A 16×16 f16 fragment — 4 `.b32` registers, two halves each,
+///   rows `group` / `group + 8`, k-offsets `2·tig` and `2·tig + 8`.
+/// - `b0,b1`: B 16×8 f16 fragment — 2 `.b32` registers, column `group`,
+///   k-offsets `2·tig` and `2·tig + 8`.
+///
+/// PTX: `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
+///
+/// # Safety
+/// - Must be called by all 32 lanes of a warp from a `#[kernel]` on sm_80+.
+/// - Caller owns the lane→element packing per the PTX ISA fragment layout.
+#[inline(never)]
+pub unsafe fn mma_sync_m16n8k16_f32_f16(
+    acc: &mut [f32; 4],
+    a0: u32,
+    a1: u32,
+    a2: u32,
+    a3: u32,
+    b0: u32,
+    b1: u32,
+) {
+    let _ = (acc, a0, a1, a2, a3, b0, b1);
+    unreachable!("mma_sync_m16n8k16_f32_f16 called outside CUDA kernel context")
+}
+
 #[inline(never)]
 pub unsafe fn mma_sync_m16n8k8_f32_tf32(
     acc: &mut [f32; 4],

@@ -203,6 +203,68 @@ impl Verify for WgmmaMmaM64N64K16F32Bf16Op {
     }
 }
 
+/// Ampere warp-level MMA: m16n8k16, f32 accumulator, f16 inputs.
+///
+/// Same operand shape as the tf32 m16n8k8 op — the wider K is absorbed by
+/// packing two halves per 32-bit register.
+///
+/// PTX: `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
+///
+/// # Operands
+///
+/// - `acc_ptr` (ptr): pointer to the 4-f32 accumulator (read-modify-write)
+/// - `a0..a3` (u32): A fragment, 4 registers of two halves each
+/// - `b0,b1` (u32): B fragment, 2 registers of two halves each
+///
+/// # Results
+///
+/// - None (accumulator is updated in-place via pointer)
+#[pliron_op(
+    name = "nvvm.mma_sync_m16n8k16_f32_f16",
+    format,
+    interfaces = [NOpdsInterface<7>, NResultsInterface<0>],
+)]
+pub struct MmaSyncM16N8K16F32F16Op;
+
+impl MmaSyncM16N8K16F32F16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MmaSyncM16N8K16F32F16Op { op }
+    }
+}
+
+impl Verify for MmaSyncM16N8K16F32F16Op {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = self.get_operation().deref(ctx);
+        if op.get_num_operands() != 7 || op.get_num_results() != 0 {
+            return verify_err!(
+                op.loc(),
+                "nvvm.mma_sync_m16n8k16_f32_f16 requires seven operands and no results"
+            );
+        }
+        let accumulator_ty = op.get_operand(0).get_type(ctx);
+        if accumulator_ty
+            .deref(ctx)
+            .downcast_ref::<MirPtrType>()
+            .is_none()
+        {
+            return verify_err!(
+                op.loc(),
+                "nvvm.mma_sync_m16n8k16_f32_f16 accumulator must be a MIR pointer"
+            );
+        }
+        for idx in 1..7 {
+            if !is_u32(ctx, op.get_operand(idx).get_type(ctx)) {
+                return verify_err!(
+                    op.loc(),
+                    "nvvm.mma_sync_m16n8k16_f32_f16 fragment registers must be u32"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Ampere warp-level MMA: m16n8k8, f32 accumulator, tf32 inputs.
 ///
 /// Performs `D = A × B + C` for one warp-collective 16×8×8 tile.
@@ -271,4 +333,5 @@ pub(super) fn register(ctx: &mut Context) {
     WgmmaMakeSmemDescOp::register(ctx);
     WgmmaMmaM64N64K16F32Bf16Op::register(ctx);
     MmaSyncM16N8K8F32Tf32Op::register(ctx);
+    MmaSyncM16N8K16F32F16Op::register(ctx);
 }

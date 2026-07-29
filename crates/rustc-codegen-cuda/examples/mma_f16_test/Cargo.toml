@@ -1,0 +1,17 @@
+[package]
+name = "mma_f16_test"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone crate (not part of parent workspace)
+[workspace]
+
+# Verifies the Ampere mma.sync.m16n8k16 f16 tensor-core intrinsic.
+# Build/run with:
+#   cargo oxide run mma_f16_test
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host   = { path = "../../../cuda-host" }
+cuda-core   = { path = "../../../cuda-core" }
