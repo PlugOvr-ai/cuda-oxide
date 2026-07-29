@@ -540,6 +540,23 @@ impl OnnxExecutor {
         }
 
         if use_splitk {
+            // Two register-block sizes, chosen per shape from measurement. The
+            // 8x8 block has twice the arithmetic intensity but a quarter of the
+            // blocks per output, so it only pays when the 128x128 tile is
+            // actually filled and K is long enough to amortise the staging:
+            //
+            //                       4x4 (64x64)   8x8 (128x128)
+            //   s2 3x3 (128,784,1152)   52.4 us      38.9 us
+            //   s3 3x3 (256,196,2304)   60.5 us      43.4 us
+            //   s1 3x3 (64,3136,576)    50.1 us      64.7 us   (M=64 wastes half the tile)
+            //   s4 3x3 (512,49,4608)    71.2 us      76.4 us   (N=49 wastes most of it)
+            let big_tile = m >= 128 && n >= 128 && k >= 1024;
+            let splits = if big_tile {
+                let base_blocks = m.div_ceil(128) * n.div_ceil(128);
+                (164usize.div_ceil(base_blocks.max(1))).clamp(1, (k / 128).max(1).min(16))
+            } else {
+                splits
+            };
             let k_per_split = k.div_ceil(splits).next_multiple_of(8).max(8);
             let partials = self
                 .alloc_buf(splits * m * n)
@@ -548,29 +565,47 @@ impl OnnxExecutor {
             // reduction that reads it has run.
             let mut partials = partials;
 
+            let tile = if big_tile { 128u32 } else { 64u32 };
             let gemm_cfg = LaunchConfig {
                 grid_dim: (
-                    (n as u32).div_ceil(64).max(1),
-                    (m as u32).div_ceil(64).max(1),
+                    (n as u32).div_ceil(tile).max(1),
+                    (m as u32).div_ceil(tile).max(1),
                     splits as u32,
                 ),
                 block_dim: (16, 16, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe {
-                self.module.sgemm_reg_splitk(
-                    &self.stream,
-                    gemm_cfg,
-                    m as u32,
-                    n as u32,
-                    k as u32,
-                    k_per_split as u32,
-                    a,
-                    b,
-                    &mut partials,
-                )
+            if big_tile {
+                unsafe {
+                    self.module.sgemm_reg8_splitk(
+                        &self.stream,
+                        gemm_cfg,
+                        m as u32,
+                        n as u32,
+                        k as u32,
+                        k_per_split as u32,
+                        a,
+                        b,
+                        &mut partials,
+                    )
+                }
+                .map_err(|e| anyhow!("sgemm_reg8_splitk launch: {:?}", e))?;
+            } else {
+                unsafe {
+                    self.module.sgemm_reg_splitk(
+                        &self.stream,
+                        gemm_cfg,
+                        m as u32,
+                        n as u32,
+                        k as u32,
+                        k_per_split as u32,
+                        a,
+                        b,
+                        &mut partials,
+                    )
+                }
+                .map_err(|e| anyhow!("sgemm_reg_splitk launch: {:?}", e))?;
             }
-            .map_err(|e| anyhow!("sgemm_reg_splitk launch: {:?}", e))?;
 
             // The kernel never reads `bias`, so an absent bias can pass any
             // slice; `a` is already resident and correctly typed.

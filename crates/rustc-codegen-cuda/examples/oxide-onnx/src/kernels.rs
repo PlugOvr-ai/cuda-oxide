@@ -914,6 +914,148 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // Split-K GEMM, 128x128 tile with an 8x8 register block.
+    //
+    //   Twice the arithmetic intensity of the 64x64 variant — 64 MACs per 16
+    //   shared loads against 16 per 8 — at the cost of four times fewer blocks
+    //   per output. That trade sank the plain register-tiled kernel, but with
+    //   K split the block count is no longer bounded by the output, so the
+    //   intensity is available again. Which of the two wins is per-shape and
+    //   measured, not assumed.
+    //
+    //   Launch: grid=(ceil(n/128), ceil(m/128), splits), block=(16,16,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_reg8_splitk(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a: &[f32],
+        b: &[f32],
+        mut partials: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 1024> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tid = ty * 16 + tx;
+        let row0 = thread::blockIdx_y() * 128;
+        let col0 = thread::blockIdx_x() * 128;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 8]; 8];
+
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            let mut q = 0u32;
+            #[unroll]
+            while q < 4 {
+                let e = tid + q * 256;
+
+                let ar = e >> 3;
+                let ak = e & 7;
+                let agr = row0 + ar;
+                let agc = k0 + ak;
+                unsafe {
+                    AS[(ak * 128 + ar) as usize] = if agr < m && agc < k_stop {
+                        a[(agr * k + agc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+
+                let br = e >> 7;
+                let bc = e & 127;
+                let bgr = k0 + br;
+                let bgc = col0 + bc;
+                unsafe {
+                    BS[e as usize] = if bgr < k_stop && bgc < n {
+                        b[(bgr * n + bgc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+                q += 1;
+            }
+            thread::sync_threads();
+
+            let mut kk = 0u32;
+            #[unroll]
+            while kk < 8 {
+                let arow_base = (kk * 128 + ty) as usize;
+                let bcol_base = (kk * 128 + tx) as usize;
+                let a_frag = [
+                    unsafe { AS[arow_base] },
+                    unsafe { AS[arow_base + 16] },
+                    unsafe { AS[arow_base + 32] },
+                    unsafe { AS[arow_base + 48] },
+                    unsafe { AS[arow_base + 64] },
+                    unsafe { AS[arow_base + 80] },
+                    unsafe { AS[arow_base + 96] },
+                    unsafe { AS[arow_base + 112] },
+                ];
+                let b_frag = [
+                    unsafe { BS[bcol_base] },
+                    unsafe { BS[bcol_base + 16] },
+                    unsafe { BS[bcol_base + 32] },
+                    unsafe { BS[bcol_base + 48] },
+                    unsafe { BS[bcol_base + 64] },
+                    unsafe { BS[bcol_base + 80] },
+                    unsafe { BS[bcol_base + 96] },
+                    unsafe { BS[bcol_base + 112] },
+                ];
+                let mut i = 0usize;
+                #[unroll]
+                while i < 8 {
+                    let av = a_frag[i];
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < 8 {
+                        acc[i][j] += av * b_frag[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        let plane = split * m * n;
+        let mut i = 0u32;
+        #[unroll]
+        while i < 8 {
+            let gr = row0 + ty + 16 * i;
+            if gr < m {
+                let base = plane + gr * n;
+                let mut j = 0u32;
+                #[unroll]
+                while j < 8 {
+                    let gc = col0 + tx + 16 * j;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc) as usize) =
+                                acc[i as usize][j as usize];
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // =========================================================================
     // Reduce the split-K partials, applying alpha, the per-row bias and the
     // fused activation in the same pass.
     //   partials: [splits][mn]   out: [mn], row = i / n

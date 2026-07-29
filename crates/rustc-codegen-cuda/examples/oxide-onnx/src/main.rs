@@ -413,6 +413,100 @@ fn bench_kernels() -> Result<()> {
         );
     }
     println!("    {:>57} {:>9.2}", "split-K total:", splitk_total_ms);
+    println!();
+
+    // The 8x8 register block: twice the intensity, a quarter of the blocks.
+    // Split-K supplies the blocks, so the trade may now pay.
+    println!("  sgemm_reg8_splitk (128×128 tile, 8×8 per thread)");
+    println!(
+        "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9} {:>9} {:>9}",
+        "layer", "M", "N", "K", "n×", "split", "µs", "GFLOP/s", "total ms"
+    );
+    let mut reg8_total_ms = 0.0;
+    for (m, n, k, count, name) in gemm_shapes {
+        let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
+            .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
+        let b = DeviceBuffer::<f32>::zeroed(&stream, k * n)
+            .map_err(|e| anyhow::anyhow!("alloc b: {:?}", e))?;
+        let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+        let bias = DeviceBuffer::<f32>::zeroed(&stream, m)
+            .map_err(|e| anyhow::anyhow!("alloc bias: {:?}", e))?;
+
+        // Same block target as split_factor, against 128×128 tiles.
+        let base_blocks = m.div_ceil(128) * n.div_ceil(128);
+        let splits = (164usize.div_ceil(base_blocks.max(1))).clamp(1, (k / 128).max(1).min(16));
+        let k_per_split = k.div_ceil(splits).next_multiple_of(8);
+        let mut partials = DeviceBuffer::<f32>::zeroed(&stream, splits * m * n)
+            .map_err(|e| anyhow::anyhow!("alloc partials: {:?}", e))?;
+
+        let gemm_cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(128).max(1),
+                (m as u32).div_ceil(128).max(1),
+                splits as u32,
+            ),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let red_cfg = LaunchConfig::for_num_elems((m * n) as u32);
+
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.sgemm_reg8_splitk(
+                    &stream,
+                    gemm_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    &a,
+                    &b,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("reg8: {:?}", e))?;
+            unsafe {
+                module.reduce_splits(
+                    &stream,
+                    red_cfg,
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    1.0,
+                    &bias,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    &mut c,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("reduce: {:?}", e))
+        })?;
+        let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
+        let total_ms = secs * count as f64 * 1e3;
+        reg8_total_ms += total_ms;
+        println!(
+            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9.1} {:>9.0} {:>9.2}",
+            name,
+            m,
+            n,
+            k,
+            count,
+            splits,
+            secs * 1e6,
+            gflops,
+            total_ms
+        );
+    }
+    println!("    {:>57} {:>9.2}", "8×8 split-K total:", reg8_total_ms);
+    println!(
+        "    {:>57} {:>9.2}x",
+        "vs 4×4 split-K:",
+        splitk_total_ms / reg8_total_ms
+    );
     println!(
         "    {:>57} {:>9.2}  ({:.0}%)",
         "of which reduction:",
@@ -424,6 +518,73 @@ fn bench_kernels() -> Result<()> {
         "speed-up over sgemm_tiled:",
         gemm_total_ms / splitk_total_ms
     );
+    println!();
+
+    // Would Winograd pay off here? F(4x4,3x3) cuts multiplies 3.4x on these
+    // layers, but turns each convolution into 36 batched GEMMs whose N is the
+    // tile count — 196 down to 4 at batch 1. FLOPs saved only become time
+    // saved if those shapes run at a decent fraction of peak, so measure them
+    // before writing any transform kernels.
+    //
+    // Two bounds per layer: 36 separate small GEMMs (no batching), and one
+    // GEMM of the same total FLOPs with N widened 36x (perfect batching, but
+    // ignoring that each position has its own filter matrix). Real batched
+    // Winograd sits between them.
+    println!("  Winograd F(4×4,3×3) feasibility — GEMM shapes it would produce");
+    println!(
+        "    {:>6} {:>16} {:>4} {:>11} {:>11} {:>11}",
+        "layer", "(M,N,K) per pos", "pos", "unbatched", "batched", "direct now"
+    );
+    for (c, tiles, positions, count, name, direct_us) in [
+        (64usize, 196usize, 36usize, 3usize, "s1 3×3", 50.1f64),
+        (128, 49, 36, 4, "s2 3×3", 52.4),
+        (256, 16, 36, 6, "s3 3×3", 60.5),
+        (512, 4, 36, 3, "s4 3×3", 71.2),
+    ] {
+        let bench_gemm = |m: usize, n: usize, k: usize| -> Result<f64> {
+            let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
+                .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+            let b = DeviceBuffer::<f32>::zeroed(&stream, k * n)
+                .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+            let mut cbuf = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+                .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+            let bias = DeviceBuffer::<f32>::zeroed(&stream, m)
+                .map_err(|e| anyhow::anyhow!("alloc: {:?}", e))?;
+            let splits = OnnxExecutor::split_factor(m, n, k);
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64).max(1),
+                    (m as u32).div_ceil(64).max(1),
+                    1,
+                ),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let _ = splits;
+            time_kernel(&stream, 50, || {
+                unsafe {
+                    module.sgemm_reg(
+                        &stream, cfg, m as u32, n as u32, k as u32, 1.0, &a, &b, &bias, 0, 0, 0.0,
+                        0.0, &mut cbuf,
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("wino gemm: {:?}", e))
+            })
+        };
+
+        let one = bench_gemm(c, tiles, c)?;
+        let wide = bench_gemm(c, tiles * positions, c)?;
+        println!(
+            "    {:>6} {:>16} {:>4} {:>9.1}µs {:>9.1}µs {:>9.1}µs",
+            name,
+            format!("({c},{tiles},{c})"),
+            positions,
+            one * positions as f64 * 1e6,
+            wide * 1e6,
+            direct_us
+        );
+        let _ = count;
+    }
     println!();
 
     // im2col for the 3×3 convolutions: the cost of materialising the column
