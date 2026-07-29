@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, LaunchConfig};
 
 use std::mem::ManuallyDrop;
 
@@ -117,23 +117,92 @@ impl OnnxExecutor {
         &self,
         inputs: &HashMap<String, (Vec<f32>, Vec<usize>)>,
     ) -> Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+        let t_setup = std::time::Instant::now();
         let mut tensors = TensorMap::new();
 
         for (name, (data, shape)) in inputs {
-            let buf = DeviceBuffer::from_host(&self.stream, data)
+            // Stream-ordered allocation, not `from_host`: that allocates with
+            // cuMemAlloc, whose cuMemFree when the TensorMap drops at end of
+            // run synchronises the whole device — and the next inference's
+            // allocation then queues behind that. Measured at 6 ms of BERT's
+            // ~20 ms, for two tensors of 128 elements.
+            let mut buf =
+                unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, data.len()) }
+                    .map_err(|e| anyhow!("input alloc '{}': {:?}", name, e))?;
+            buf.copy_from_host(&self.stream, data)
                 .map_err(|e| anyhow!("H2D input '{}': {:?}", name, e))?;
             tensors.insert(name, buf, shape.clone());
         }
 
+        let t_setup_ms = t_setup.elapsed().as_secs_f64() * 1e3;
+        #[allow(unused_assignments)]
+        let mut t_loop_ms = 0.0f64;
         let profile_mode = std::env::var("OXIDE_PROFILE").unwrap_or_default();
         let profile = !profile_mode.is_empty();
-        // OXIDE_PROFILE=host omits the per-node synchronize, so the timings are
-        // pure host-side dispatch cost: kernel launches are asynchronous, and
-        // if that cost approaches the kernel time the GPU is being starved
-        // rather than saturated. OXIDE_PROFILE=1 keeps the sync and measures
-        // device time, at the price of inflating cheap kernels.
-        let sync_each = profile_mode != "host";
-        if profile {
+        // Three modes, because each answers a different question and the first
+        // two are easy to misread:
+        //   OXIDE_PROFILE=1      host wall time with a sync after every node.
+        //                        Measures device time, but charges the sync's
+        //                        pipeline drain to whichever node it follows,
+        //                        which inflates cheap kernels enormously.
+        //   OXIDE_PROFILE=host   no sync: pure host dispatch cost. Shows where
+        //                        the host blocks, not what anything costs.
+        //   OXIDE_PROFILE=event  CUDA events around each node's launches. The
+        //                        pipeline is never drained, so this is the
+        //                        node's real device time in situ — the only
+        //                        one of the three to trust for attribution.
+        let sync_each = profile_mode != "host" && profile_mode != "event";
+        if profile_mode == "event" {
+            use std::collections::BTreeMap;
+            let flags = Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
+            let mut marks: Vec<(usize, CudaEvent, CudaEvent)> =
+                Vec::with_capacity(self.nodes.len());
+            for (idx, node) in self.nodes.iter().enumerate() {
+                let start = self
+                    .ctx
+                    .new_event(flags)
+                    .map_err(|e| anyhow!("event create: {:?}", e))?;
+                let end = self
+                    .ctx
+                    .new_event(flags)
+                    .map_err(|e| anyhow!("event create: {:?}", e))?;
+                start
+                    .record(&self.stream)
+                    .map_err(|e| anyhow!("event record: {:?}", e))?;
+                self.dispatch_node(node, &mut tensors)
+                    .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
+                end.record(&self.stream)
+                    .map_err(|e| anyhow!("event record: {:?}", e))?;
+                marks.push((idx, start, end));
+            }
+            self.stream
+                .synchronize()
+                .map_err(|e| anyhow!("sync: {:?}", e))?;
+
+            let mut acc: BTreeMap<String, (f64, u32)> = BTreeMap::new();
+            for (idx, start, end) in &marks {
+                let ms = start.elapsed_ms(end).unwrap_or(0.0) as f64;
+                let e = acc
+                    .entry(self.nodes[*idx].op_type.clone())
+                    .or_insert((0.0, 0));
+                e.0 += ms;
+                e.1 += 1;
+            }
+            let mut rows: Vec<_> = acc.into_iter().collect();
+            rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            let total: f64 = rows.iter().map(|r| r.1.0).sum();
+            eprintln!("  ── OXIDE_PROFILE=event (device time per op-type, ms) ──");
+            for (op, (ms, n)) in &rows {
+                eprintln!(
+                    "  {:>20}  {:>8.2} ms  ({:>3}×, {:>5.1}%)",
+                    op,
+                    ms,
+                    n,
+                    100.0 * ms / total
+                );
+            }
+            eprintln!("  {:>20}  {:>8.2} ms  (device busy)", "TOTAL", total);
+        } else if profile {
             use std::collections::BTreeMap;
             let mut acc: BTreeMap<String, (f64, u32)> = BTreeMap::new();
             for node in &self.nodes {
@@ -165,14 +234,18 @@ impl OnnxExecutor {
                 "  {:>20}  {:>8.2} ms  (sum incl. per-op sync)",
                 "TOTAL", total
             );
+            t_loop_ms = 0.0;
         } else {
+            let t_loop = std::time::Instant::now();
             for node in &self.nodes {
                 self.dispatch_node(node, &mut tensors)
                     .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
             }
+            t_loop_ms = t_loop.elapsed().as_secs_f64() * 1e3;
         }
 
         let mut outputs = HashMap::new();
+        let t_out = std::time::Instant::now();
         for name in &self.output_names {
             // Resolves alias chains (e.g. a final Reshape) to the real buffer.
             if let Ok(eb) = Self::get_tensor(&tensors, &self.weights, name) {
@@ -182,6 +255,14 @@ impl OnnxExecutor {
                     .map_err(|e| anyhow!("D2H output '{}': {:?}", name, e))?;
                 outputs.insert(name.clone(), (data, eb.shape().clone()));
             }
+        }
+        if std::env::var("OXIDE_PHASES").is_ok() {
+            eprintln!(
+                "  [phases] h2d+setup={:.2}ms  node-loop(submit)={:.2}ms  drain+d2h={:.2}ms",
+                t_setup_ms,
+                t_loop_ms,
+                t_out.elapsed().as_secs_f64() * 1e3
+            );
         }
         Ok(outputs)
     }
@@ -1990,7 +2071,9 @@ impl OnnxExecutor {
             eb.shape().iter().map(|&d| d as f32).collect()
         };
         let n = shape_vals.len();
-        let buf = DeviceBuffer::from_host(&self.stream, &shape_vals)
+        let mut buf = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, n) }
+            .map_err(|e| anyhow!("shape alloc: {:?}", e))?;
+        buf.copy_from_host(&self.stream, &shape_vals)
             .map_err(|e| anyhow!("shape h2d: {:?}", e))?;
         tensors.insert(&out_name, buf, vec![n]);
         Ok(())

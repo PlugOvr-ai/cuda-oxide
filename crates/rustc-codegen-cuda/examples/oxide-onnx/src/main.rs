@@ -911,6 +911,13 @@ fn run_model(model_path: &str, model_name: &str) -> Result<()> {
     inputs.insert(input_name, (input_data.clone(), input_shape));
 
     // --- oxide GPU inference ---
+    // When profiling, discard one run first: the first inference pays one-off
+    // costs (memory-pool growth, PTX module warm-up) that otherwise land on
+    // whichever node happens to allocate first and swamp its measurement.
+    if std::env::var("OXIDE_PROFILE").is_ok() {
+        let _ = executor.run(&inputs)?;
+        eprintln!("  (profile: steady state, after one warm-up inference)");
+    }
     let t0 = Instant::now();
     let outputs = executor.run(&inputs)?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
