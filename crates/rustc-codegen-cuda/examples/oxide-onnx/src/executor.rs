@@ -513,6 +513,32 @@ impl OnnxExecutor {
         let worth_it = splits >= 2 || m * n >= 65_536;
         let use_splitk = choice != "tiled" && choice != "reg" && worth_it;
 
+        // One split means the reduction would be a pure copy of the partials
+        // into the output — measured at up to 24% of a shape's time. Write the
+        // final values straight from the GEMM instead.
+        if use_splitk && splits == 1 {
+            let bias_operand = bias.unwrap_or(a);
+            return unsafe {
+                self.module.sgemm_reg(
+                    &self.stream,
+                    Self::sgemm_reg_cfg(m, n),
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    alpha,
+                    a,
+                    b,
+                    bias_operand,
+                    u32::from(bias.is_some()),
+                    act,
+                    lo,
+                    hi,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_reg launch: {:?}", e));
+        }
+
         if use_splitk {
             let k_per_split = k.div_ceil(splits).next_multiple_of(8).max(8);
             let partials = self

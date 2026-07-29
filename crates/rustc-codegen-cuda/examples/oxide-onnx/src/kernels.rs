@@ -647,7 +647,11 @@ pub mod gpu {
         alpha: f32,
         a: &[f32],
         b: &[f32],
-        beta: f32,
+        bias: &[f32],
+        has_bias: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
         mut c: DisjointSlice<f32>,
     ) {
         // AS/BS are [BK=8][64] tiles: 2 KB each, 4 KB per block.
@@ -740,25 +744,27 @@ pub mod gpu {
             k0 += 8;
         }
 
-        let has_beta = beta != 0.0f32;
+        let bias_len = bias.len();
         let mut i = 0u32;
         #[unroll]
         while i < 4 {
             let gr = row0 + ty + 16 * i;
             if gr < m {
+                let b_val = if has_bias != 0u32 && (gr as usize) < bias_len {
+                    bias[gr as usize]
+                } else {
+                    0.0f32
+                };
                 let base = gr * n;
                 let mut j = 0u32;
                 #[unroll]
                 while j < 4 {
                     let gc = col0 + tx + 16 * j;
                     if gc < n {
-                        let v = acc[i as usize][j as usize];
-                        let cell = unsafe { c.get_unchecked_mut((base + gc) as usize) };
-                        *cell = if has_beta {
-                            alpha * v + beta * (*cell)
-                        } else {
-                            alpha * v
-                        };
+                        let v = alpha * acc[i as usize][j as usize] + b_val;
+                        unsafe {
+                            *c.get_unchecked_mut((base + gc) as usize) = apply_act(v, act, lo, hi);
+                        }
                     }
                     j += 1;
                 }

@@ -307,7 +307,9 @@ fn bench_kernels() -> Result<()> {
         "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9} {:>9} {:>9}",
         "layer", "M", "N", "K", "n×", "split", "µs", "GFLOP/s", "total ms"
     );
+    println!("    {:>62} {:>8} {:>7}", "", "reduce", "of it");
     let mut splitk_total_ms = 0.0;
+    let mut splitk_reduce_ms = 0.0;
     for (m, n, k, count, name) in gemm_shapes {
         let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
             .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
@@ -368,11 +370,35 @@ fn bench_kernels() -> Result<()> {
             }
             .map_err(|e| anyhow::anyhow!("reduce: {:?}", e))
         })?;
+        // Time the reduction alone, to see what fraction of the split-K path
+        // is the extra pass over the output rather than the multiply.
+        let red_secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.reduce_splits(
+                    &stream,
+                    red_cfg,
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    1.0,
+                    &bias,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    &mut c,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("reduce: {:?}", e))
+        })?;
+
         let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
         let total_ms = secs * count as f64 * 1e3;
         splitk_total_ms += total_ms;
+        splitk_reduce_ms += red_secs * count as f64 * 1e3;
         println!(
-            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9.1} {:>9.0} {:>9.2}",
+            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9.1} {:>9.0} {:>9.2} {:>8.1} {:>6.0}%",
             name,
             m,
             n,
@@ -381,10 +407,18 @@ fn bench_kernels() -> Result<()> {
             splits,
             secs * 1e6,
             gflops,
-            total_ms
+            total_ms,
+            red_secs * 1e6,
+            100.0 * red_secs / secs
         );
     }
     println!("    {:>57} {:>9.2}", "split-K total:", splitk_total_ms);
+    println!(
+        "    {:>57} {:>9.2}  ({:.0}%)",
+        "of which reduction:",
+        splitk_reduce_ms,
+        100.0 * splitk_reduce_ms / splitk_total_ms
+    );
     println!(
         "    {:>57} {:>9.2}x",
         "speed-up over sgemm_tiled:",
