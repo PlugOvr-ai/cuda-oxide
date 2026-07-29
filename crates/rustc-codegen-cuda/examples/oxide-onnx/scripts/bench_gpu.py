@@ -43,8 +43,14 @@ def bench(model_path: str, warmup: int = 3, runs: int = 20):
     # Same deterministic input as the Rust benchmark
     input_data = (np.arange(numel, dtype=np.float32) / numel).reshape(1, 3, 224, 224)
 
-    for _ in range(warmup):
+    # Warm to a fixed wall time, not a fixed count: the GPU idles at 210 MHz
+    # against a 2130 MHz boost clock, so a short benchmark otherwise measures
+    # whatever clock state it happened to start in. Matches the Rust harness.
+    w0 = time.perf_counter()
+    warmed = 0
+    while warmed < warmup or (time.perf_counter() - w0 < 0.8 and warmed < 10000):
         session.run(None, {inp_name: input_data})
+        warmed += 1
 
     t0 = time.perf_counter()
     for _ in range(runs):

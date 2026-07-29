@@ -45,8 +45,14 @@ with open(output_bin, "wb") as f:
         f.write(np.asarray(arr).astype(np.float32).tobytes())
 
 import time
-for _ in range(3):
+# Warm to a fixed wall time, not a fixed count: the GPU idles at 210 MHz
+# against a 2130 MHz boost clock, so a short benchmark otherwise measures
+# whatever clock state it happened to start in. Matches the Rust harness.
+_w0 = time.perf_counter()
+_n = 0
+while _n < 3 or (time.perf_counter() - _w0 < 0.8 and _n < 10000):
     session.run(None, feeds)
+    _n += 1
 N = 10
 t0 = time.perf_counter()
 for _ in range(N):

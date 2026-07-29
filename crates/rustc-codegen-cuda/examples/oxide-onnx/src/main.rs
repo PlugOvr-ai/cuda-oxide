@@ -1841,8 +1841,17 @@ fn bench_fn<F: Fn()>(name: &str, warmup: usize, runs: usize, f: F) -> f64 {
         name, warmup, runs
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    for _ in 0..warmup {
+    // The GPU idles at 210 MHz against a 2130 MHz boost clock, and the ORT and
+    // TensorRT subprocesses that run between our benchmarks leave it there. A
+    // fixed warmup count is not enough for the short models — GPT-2's thirteen
+    // iterations are 150 ms of work, and it was timing anywhere from 9 to 17 ms
+    // depending on where the clocks happened to be when it started. Warm by
+    // wall time instead, so every model reaches the same clock state.
+    let warm_t0 = Instant::now();
+    let mut warmed = 0usize;
+    while warmed < warmup || (warm_t0.elapsed().as_millis() < 800 && warmed < 10_000) {
         f();
+        warmed += 1;
     }
     let t0 = Instant::now();
     for _ in 0..runs {
