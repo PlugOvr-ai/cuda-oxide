@@ -768,6 +768,183 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // Split-K GEMM — partial products over a slice of K, one per grid.z.
+    //
+    //   At batch 1 the output is often too small to occupy the GPU on its own:
+    //   ResNet50's last stage is M=512, N=49, i.e. 25 088 elements total. No
+    //   tiling of the output can fill 82 SMs with useful work, and giving each
+    //   thread more outputs (which is what buys arithmetic intensity) makes it
+    //   strictly worse — the 64x64 tile leaves 8 blocks.
+    //
+    //   Splitting the reduction dimension restores the parallelism: each block
+    //   accumulates over K/splits and writes a partial tile, and `reduce_splits`
+    //   sums them. Now a shape can have both intensity (4x4 per thread) and
+    //   enough blocks, which the fixed-tile kernels could not do at once.
+    //
+    //   Launch: grid=(ceil(n/64), ceil(m/64), splits), block=(16,16,1).
+    //   `partials` is [splits][m][n]; alpha, bias and activation are applied by
+    //   the reduction, not here.
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_reg_splitk(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a: &[f32],
+        b: &[f32],
+        mut partials: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<f32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+        let tid = ty * 16 + tx;
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 4]; 4];
+
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            let mut q = 0u32;
+            #[unroll]
+            while q < 2 {
+                let e = tid + q * 256;
+
+                let ar = e >> 3;
+                let ak = e & 7;
+                let agr = row0 + ar;
+                let agc = k0 + ak;
+                unsafe {
+                    AS[(ak * 64 + ar) as usize] = if agr < m && agc < k_stop {
+                        a[(agr * k + agc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+
+                let br = e >> 6;
+                let bc = e & 63;
+                let bgr = k0 + br;
+                let bgc = col0 + bc;
+                unsafe {
+                    BS[e as usize] = if bgr < k_stop && bgc < n {
+                        b[(bgr * n + bgc) as usize]
+                    } else {
+                        0.0f32
+                    };
+                }
+                q += 1;
+            }
+            thread::sync_threads();
+
+            let mut kk = 0u32;
+            #[unroll]
+            while kk < 8 {
+                let arow_base = (kk * 64 + ty) as usize;
+                let bcol_base = (kk * 64 + tx) as usize;
+                let a_frag = [
+                    unsafe { AS[arow_base] },
+                    unsafe { AS[arow_base + 16] },
+                    unsafe { AS[arow_base + 32] },
+                    unsafe { AS[arow_base + 48] },
+                ];
+                let b_frag = [
+                    unsafe { BS[bcol_base] },
+                    unsafe { BS[bcol_base + 16] },
+                    unsafe { BS[bcol_base + 32] },
+                    unsafe { BS[bcol_base + 48] },
+                ];
+                let mut i = 0usize;
+                #[unroll]
+                while i < 4 {
+                    let av = a_frag[i];
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < 4 {
+                        acc[i][j] += av * b_frag[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                kk += 1;
+            }
+            thread::sync_threads();
+            k0 += 8;
+        }
+
+        let plane = split * m * n;
+        let mut i = 0u32;
+        #[unroll]
+        while i < 4 {
+            let gr = row0 + ty + 16 * i;
+            if gr < m {
+                let base = plane + gr * n;
+                let mut j = 0u32;
+                #[unroll]
+                while j < 4 {
+                    let gc = col0 + tx + 16 * j;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc) as usize) =
+                                acc[i as usize][j as usize];
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // =========================================================================
+    // Reduce the split-K partials, applying alpha, the per-row bias and the
+    // fused activation in the same pass.
+    //   partials: [splits][mn]   out: [mn], row = i / n
+    // =========================================================================
+    #[kernel]
+    pub fn reduce_splits(
+        partials: &[f32],
+        splits: u32,
+        mn: u32,
+        n: u32,
+        alpha: f32,
+        bias: &[f32],
+        has_bias: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+        if let Some(o) = out.get_mut(idx) {
+            let mut sum = 0.0f32;
+            let mut s = 0u32;
+            while s < splits {
+                sum += partials[(s * mn + i) as usize];
+                s += 1;
+            }
+            let b_val = if has_bias != 0u32 {
+                bias[(i / n) as usize]
+            } else {
+                0.0f32
+            };
+            *o = apply_act(alpha * sum + b_val, act, lo, hi);
+        }
+    }
+
+    // =========================================================================
     // Implicit-GEMM Conv2D — the convolution as a GEMM whose B operand is
     // never materialized.
     //

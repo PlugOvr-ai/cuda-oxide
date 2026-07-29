@@ -451,15 +451,142 @@ impl OnnxExecutor {
         }
     }
 
-    /// Dispatch `C = alpha·A·B + beta·C` to the configured SGEMM kernel.
+    /// How many ways to split the K dimension for a given GEMM shape.
     ///
-    /// The 128×128 register-tiled kernel needs enough output tiles to fill the
-    /// GPU: with a 128×128 block tile, a GEMM narrower than that leaves most
-    /// of a block's threads with nothing to accumulate. Conv-im2col GEMMs at
-    /// batch 1 are often short in M (M = output channels of one group), so the
-    /// small-M cases stay on the 16×16 kernel, which wastes far less on them.
+    /// The 64×64 register-tiled kernel needs roughly two blocks per SM to keep
+    /// this card busy; the output alone rarely provides that at batch 1
+    /// (M=512, N=49 gives 8). Splitting K makes up the difference, bounded so
+    /// that each split still has enough K to amortise its shared-memory
+    /// staging, and so the partial buffer stays small.
+    pub fn split_factor(m: usize, n: usize, k: usize) -> usize {
+        const TARGET_BLOCKS: usize = 164; // ~2 per SM on a 82-SM card
+        const MIN_K_PER_SPLIT: usize = 128;
+        let base_blocks = m.div_ceil(64) * n.div_ceil(64);
+        let wanted = TARGET_BLOCKS.div_ceil(base_blocks.max(1));
+        let by_k = (k / MIN_K_PER_SPLIT).max(1);
+        wanted.clamp(1, by_k.min(16))
+    }
+
+    /// Dispatch `C = act(alpha·A·B + bias)` to the best available kernel.
     ///
-    /// `OXIDE_GEMM=tiled|fast|reg` overrides the choice, for A/B measurement.
+    /// Split-K is the default: it measured 2.1× faster than the 16×16 kernel
+    /// across every GEMM shape in ResNet50 (3.7× on the worst one), because it
+    /// is the only scheme here that gets arithmetic intensity and enough
+    /// blocks at the same time. The reduction pass applies alpha, the per-row
+    /// bias and the activation, so the epilogue stays fused.
+    ///
+    /// `OXIDE_GEMM=tiled|reg|splitk` overrides the choice for measurement.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sgemm_epilogue(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        bias: Option<&DeviceBuffer<f32>>,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        c: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
+        let splits = match choice.as_str() {
+            "tiled" | "reg" => 1,
+            _ => Self::split_factor(m, n, k),
+        };
+        // The register-tiled kernel needs either a split — which is what makes
+        // a small output fill the GPU — or an output big enough to keep its
+        // 64×64 tiles busy. Attention MatMuls are neither: 197×64 with K=64 has
+        // no K to split and only four tiles, and there the 16×16 kernel with a
+        // fused epilogue wins, because split-K would add a whole extra pass
+        // over the output for nothing (measured: 2.5 ms -> 6.4 ms on ViT).
+        let worth_it = splits >= 2 || m * n >= 65_536;
+        let use_splitk = choice != "tiled" && choice != "reg" && worth_it;
+
+        if use_splitk {
+            let k_per_split = k.div_ceil(splits).next_multiple_of(8).max(8);
+            let partials =
+                unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, splits * m * n) }
+                    .map_err(|e| anyhow!("splitk partials alloc: {:?}", e))?;
+            // `partials` is freed stream-ordered when it drops, i.e. after the
+            // reduction that reads it has run.
+            let mut partials = partials;
+
+            let gemm_cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64).max(1),
+                    (m as u32).div_ceil(64).max(1),
+                    splits as u32,
+                ),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.module.sgemm_reg_splitk(
+                    &self.stream,
+                    gemm_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    a,
+                    b,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_reg_splitk launch: {:?}", e))?;
+
+            // The kernel never reads `bias`, so an absent bias can pass any
+            // slice; `a` is already resident and correctly typed.
+            let bias_operand = bias.unwrap_or(a);
+            unsafe {
+                self.module.reduce_splits(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((m * n) as u32),
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    alpha,
+                    bias_operand,
+                    u32::from(bias.is_some()),
+                    act,
+                    lo,
+                    hi,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("reduce_splits launch: {:?}", e))?;
+            return Ok(());
+        }
+
+        // Fallback: the 16×16 kernel with the epilogue fused into its store.
+        let bias_operand = bias.unwrap_or(a);
+        unsafe {
+            self.module.sgemm_bias_act(
+                &self.stream,
+                Self::sgemm_cfg(m, n),
+                m as u32,
+                n as u32,
+                k as u32,
+                alpha,
+                a,
+                b,
+                bias_operand,
+                u32::from(bias.is_some()),
+                act,
+                lo,
+                hi,
+                c,
+            )
+        }
+        .map_err(|e| anyhow!("sgemm_bias_act launch: {:?}", e))
+    }
+
+    /// `C = alpha·A·B` with no epilogue, for the plain Gemm/MatMul paths.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_sgemm(
         &self,
         m: usize,
@@ -471,45 +598,10 @@ impl OnnxExecutor {
         beta: f32,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
-        let use_reg = match choice.as_str() {
-            "tiled" => false,
-            "reg" => true,
-            // Default: the naive 16×16 kernel, because it measured fastest on
-            // every batch-1 shape in these models. Interleaved min-of-2 runs,
-            // whole-model steady state (ms):
-            //
-            //             ResNet50   ViT    BERT   GPT-2
-            //   tiled        9.57   28.36  24.53  31.14
-            //   reg         12.71   28.94  28.84  32.47
-            //
-            // Register blocking trades parallelism for arithmetic intensity,
-            // and at batch 1 there is no parallelism to spare: a 64×64 tile
-            // leaves a late ResNet stage (M=512, N=49) with 8 blocks for 82
-            // SMs. `sgemm_reg` is kept for larger batches and as the starting
-            // point for a split-K version, which is what these shapes actually
-            // need.
-            _ => false,
-        };
-
-        if use_reg {
-            unsafe {
-                self.module.sgemm_reg(
-                    &self.stream,
-                    Self::sgemm_reg_cfg(m, n),
-                    m as u32,
-                    n as u32,
-                    k as u32,
-                    alpha,
-                    a,
-                    b,
-                    beta,
-                    c,
-                )
-            }
-            .map_err(|e| anyhow!("sgemm_reg launch: {:?}", e))
-        } else {
-            unsafe {
+        // beta != 0 accumulates into C, which the split-K reduction does not
+        // model; no current call site uses it, but keep the old kernel honest.
+        if beta != 0.0 {
+            return unsafe {
                 self.module.sgemm_tiled(
                     &self.stream,
                     Self::sgemm_cfg(m, n),
@@ -523,8 +615,21 @@ impl OnnxExecutor {
                     c,
                 )
             }
-            .map_err(|e| anyhow!("sgemm_tiled launch: {:?}", e))
+            .map_err(|e| anyhow!("sgemm_tiled launch: {:?}", e));
         }
+        self.dispatch_sgemm_epilogue(
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            b,
+            None,
+            graph_opt::ACT_NONE as u32,
+            0.0,
+            0.0,
+            c,
+        )
     }
 
     /// Launch config for the block-per-row reduction kernels (softmax /
@@ -1141,25 +1246,20 @@ impl OnnxExecutor {
                         }
                     });
 
-                    unsafe {
-                        self.module.sgemm_bias_act(
-                            &self.stream,
-                            Self::sgemm_cfg(c_out_per_group, col_cols),
-                            c_out_per_group as u32,
-                            col_cols as u32,
-                            col_rows_g as u32,
-                            1.0,
-                            &w_g,
-                            &col_dev,
-                            &bias_view,
-                            u32::from(has_bias),
-                            act,
-                            act_lo,
-                            act_hi,
-                            &mut out_g,
-                        )
-                    }
-                    .map_err(|e| anyhow!("conv sgemm g={}: {:?}", g, e))?;
+                    self.dispatch_sgemm_epilogue(
+                        c_out_per_group,
+                        col_cols,
+                        col_rows_g,
+                        1.0,
+                        &w_g,
+                        &col_dev,
+                        has_bias.then_some(&*bias_view),
+                        act,
+                        act_lo,
+                        act_hi,
+                        &mut out_g,
+                    )
+                    .map_err(|e| anyhow!("conv sgemm g={}: {}", g, e))?;
                 }
             }
 

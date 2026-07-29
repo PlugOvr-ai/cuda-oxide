@@ -298,6 +298,100 @@ fn bench_kernels() -> Result<()> {
     println!("    {:>50} {:>9.2}", "GEMM total:", gemm_total_ms);
     println!();
 
+    // Same shapes through the split-K path: 64×64 tile, 4×4 per thread, with
+    // the K dimension partitioned so every shape gets enough blocks to fill
+    // the GPU. Includes the reduction pass in the timing, since that is part
+    // of the cost of the method.
+    println!("  sgemm_reg_splitk (+ reduction)");
+    println!(
+        "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9} {:>9} {:>9}",
+        "layer", "M", "N", "K", "n×", "split", "µs", "GFLOP/s", "total ms"
+    );
+    let mut splitk_total_ms = 0.0;
+    for (m, n, k, count, name) in gemm_shapes {
+        let a = DeviceBuffer::<f32>::zeroed(&stream, m * k)
+            .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
+        let b = DeviceBuffer::<f32>::zeroed(&stream, k * n)
+            .map_err(|e| anyhow::anyhow!("alloc b: {:?}", e))?;
+        let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+        let bias = DeviceBuffer::<f32>::zeroed(&stream, m)
+            .map_err(|e| anyhow::anyhow!("alloc bias: {:?}", e))?;
+
+        let splits = OnnxExecutor::split_factor(m, n, k);
+        let k_per_split = k.div_ceil(splits).next_multiple_of(8);
+        let mut partials = DeviceBuffer::<f32>::zeroed(&stream, splits * m * n)
+            .map_err(|e| anyhow::anyhow!("alloc partials: {:?}", e))?;
+
+        let gemm_cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(64).max(1),
+                (m as u32).div_ceil(64).max(1),
+                splits as u32,
+            ),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let red_cfg = LaunchConfig::for_num_elems((m * n) as u32);
+
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.sgemm_reg_splitk(
+                    &stream,
+                    gemm_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    &a,
+                    &b,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("splitk: {:?}", e))?;
+            unsafe {
+                module.reduce_splits(
+                    &stream,
+                    red_cfg,
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    1.0,
+                    &bias,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    &mut c,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("reduce: {:?}", e))
+        })?;
+        let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
+        let total_ms = secs * count as f64 * 1e3;
+        splitk_total_ms += total_ms;
+        println!(
+            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>6} {:>9.1} {:>9.0} {:>9.2}",
+            name,
+            m,
+            n,
+            k,
+            count,
+            splits,
+            secs * 1e6,
+            gflops,
+            total_ms
+        );
+    }
+    println!("    {:>57} {:>9.2}", "split-K total:", splitk_total_ms);
+    println!(
+        "    {:>57} {:>9.2}x",
+        "speed-up over sgemm_tiled:",
+        gemm_total_ms / splitk_total_ms
+    );
+    println!();
+
     // im2col for the 3×3 convolutions: the cost of materialising the column
     // matrix that the implicit-GEMM kernel would remove.
     println!("  im2col (3×3 layers)");
