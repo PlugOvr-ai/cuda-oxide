@@ -475,10 +475,29 @@ impl OnnxExecutor {
     /// that each split still has enough K to amortise its shared-memory
     /// staging, and so the partial buffer stays small.
     pub fn split_factor(m: usize, n: usize, k: usize) -> usize {
-        const TARGET_BLOCKS: usize = 164; // ~2 per SM on a 82-SM card
+        Self::split_factor_for(m, n, k, 164)
+    }
+
+    /// As [`Self::split_factor`], with an explicit block target.
+    ///
+    /// The best target is not universal, which a sweep made plain (ms):
+    ///
+    ///     target        41     82    164    328    656   1312
+    ///     ResNet50    3.69   2.81   2.43   2.24   2.22   2.30
+    ///     ViT                        6.01   6.70   6.99   7.30
+    ///
+    /// Convolution keeps improving well past two blocks per SM, while the
+    /// transformer projections degrade past it. Same kernel, opposite
+    /// preference — which is the argument for a per-shape autotuner rather
+    /// than any single constant.
+    pub fn split_factor_for(m: usize, n: usize, k: usize, target: usize) -> usize {
+        let target_blocks: usize = std::env::var("OXIDE_SPLIT_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(target);
         const MIN_K_PER_SPLIT: usize = 128;
         let base_blocks = m.div_ceil(64) * n.div_ceil(64);
-        let wanted = TARGET_BLOCKS.div_ceil(base_blocks.max(1));
+        let wanted = target_blocks.div_ceil(base_blocks.max(1));
         let by_k = (k / MIN_K_PER_SPLIT).max(1);
         wanted.clamp(1, by_k.min(16))
     }
@@ -1302,7 +1321,9 @@ impl OnnxExecutor {
             let m = n_out;
             let kk = col_rows_g;
             let nn = col_cols;
-            let splits = Self::split_factor(m, nn, kk);
+            // Convolution wants more parallelism than the Gemm path; see
+            // `split_factor_for`.
+            let splits = Self::split_factor_for(m, nn, kk, 328);
             let k_per_split = kk.div_ceil(splits).next_multiple_of(16).max(16);
             // Must match the stride `packed_weights` packs with.
             let kpairs = kk.div_ceil(2);
