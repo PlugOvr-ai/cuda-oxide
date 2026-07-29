@@ -2972,6 +2972,72 @@ impl OnnxExecutor {
         };
         let out_shape: Vec<usize> = perm.iter().map(|&p| x_shape[p]).collect();
 
+        // The attention layout swaps are the only transposes that matter —
+        // 48 of BERT's 60, 60 of GPT-2's — and both have a shape the general
+        // kernel cannot exploit. Dispatch them to kernels that get their
+        // coordinates from the grid instead of from a loop of divisions.
+        if ndim == 4 && x_shape[0] > 0 {
+            let (bdim, sdim, hdim, ddim) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+            if perm == [0, 2, 1, 3] {
+                let mut out = self
+                    .alloc_buf(numel)
+                    .map_err(|e| anyhow!("transpose alloc: {}", e))?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        (ddim as u32).div_ceil(128).max(1),
+                        hdim as u32,
+                        (bdim * sdim) as u32,
+                    ),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.module.transpose_0213(
+                        &self.stream,
+                        cfg,
+                        sdim as u32,
+                        hdim as u32,
+                        ddim as u32,
+                        ex.buf(),
+                        &mut out,
+                    )
+                }
+                .map_err(|e| anyhow!("transpose_0213 launch: {:?}", e))?;
+                drop(ex);
+                tensors.insert(&out_name, out, out_shape);
+                return Ok(());
+            }
+            if perm == [0, 2, 3, 1] {
+                let mut out = self
+                    .alloc_buf(numel)
+                    .map_err(|e| anyhow!("transpose alloc: {}", e))?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        (sdim as u32).div_ceil(32).max(1),
+                        (ddim as u32).div_ceil(32).max(1),
+                        (bdim * hdim) as u32,
+                    ),
+                    block_dim: (32, 32, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.module.transpose_0231(
+                        &self.stream,
+                        cfg,
+                        sdim as u32,
+                        hdim as u32,
+                        ddim as u32,
+                        ex.buf(),
+                        &mut out,
+                    )
+                }
+                .map_err(|e| anyhow!("transpose_0231 launch: {:?}", e))?;
+                drop(ex);
+                tensors.insert(&out_name, out, out_shape);
+                return Ok(());
+            }
+        }
+
         // Row-major strides for input and output.
         let strides = |s: &[usize]| -> Vec<usize> {
             let mut st = vec![1usize; s.len()];

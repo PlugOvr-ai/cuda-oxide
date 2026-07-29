@@ -4063,6 +4063,83 @@ pub mod gpu {
     //   then gather from input at Σ coord[d] · in_strides[perm[d]].
     //   Shape/stride/perm vectors are passed as f32 (values < 2^24, exact).
     // =========================================================================
+    // =========================================================================
+    // Transpose [B, S, H, D] -> [B, H, S, D] (perm 0,2,1,3).
+    //
+    //   This is every attention head-split in the graph — 36 of BERT's 48
+    //   transposes, 48 of GPT-2's 60. D stays innermost on both sides, so it
+    //   is not really a transpose at all: it is a permutation of contiguous
+    //   D-element rows, fully coalesced in both directions.
+    //
+    //   The general N-D kernel cannot see that. It runs a loop over the rank
+    //   with two integer divisions per dimension per element — eight divisions
+    //   to move one float. Here the grid carries the coordinates instead:
+    //   blockIdx.z is the flattened (b, s), blockIdx.y is the head, and the
+    //   only division left is once per block on a uniform value.
+    // =========================================================================
+    #[kernel]
+    pub fn transpose_0213(sdim: u32, hdim: u32, ddim: u32, x: &[f32], mut y: DisjointSlice<f32>) {
+        let bs = thread::blockIdx_z(); // b * S + s
+        let hh = thread::blockIdx_y();
+        let dd = thread::blockIdx_x() * 128 + thread::threadIdx_x();
+        if dd >= ddim {
+            return;
+        }
+        let b = bs / sdim;
+        let ss = bs % sdim;
+        let in_off = (bs * hdim + hh) * ddim + dd;
+        let out_off = ((b * hdim + hh) * sdim + ss) * ddim + dd;
+        unsafe {
+            *y.get_unchecked_mut(out_off as usize) = *x.get_unchecked(in_off as usize);
+        }
+    }
+
+    // =========================================================================
+    // Transpose [B, S, H, D] -> [B, H, D, S] (perm 0,2,3,1).
+    //
+    //   The K operand of every QK^T. Unlike 0213 this really does exchange the
+    //   innermost axis, so a direct copy would read or write with stride H*D.
+    //   Staging a 32x32 tile in shared memory makes both sides coalesced; the
+    //   tile is padded to 33 columns so the transposed read hits 32 distinct
+    //   banks.
+    // =========================================================================
+    #[kernel]
+    pub fn transpose_0231(sdim: u32, hdim: u32, ddim: u32, x: &[f32], mut y: DisjointSlice<f32>) {
+        static mut TILE: SharedArray<f32, 1056> = SharedArray::UNINIT;
+
+        let bh = thread::blockIdx_z();
+        let b = bh / hdim;
+        let hh = bh % hdim;
+        let tx = thread::threadIdx_x();
+        let ty = thread::threadIdx_y();
+
+        let s0 = thread::blockIdx_x() * 32;
+        let d0 = thread::blockIdx_y() * 32;
+
+        // Read [s][d] rows, D contiguous.
+        let ss = s0 + ty;
+        let dd = d0 + tx;
+        let v = if ss < sdim && dd < ddim {
+            unsafe { *x.get_unchecked((((b * sdim + ss) * hdim + hh) * ddim + dd) as usize) }
+        } else {
+            0.0f32
+        };
+        unsafe {
+            TILE[(ty * 33 + tx) as usize] = v;
+        }
+        thread::sync_threads();
+
+        // Write [d][s] rows, S contiguous.
+        let so = s0 + tx;
+        let dout = d0 + ty;
+        if so < sdim && dout < ddim {
+            let val = unsafe { TILE[(tx * 33 + ty) as usize] };
+            unsafe {
+                *y.get_unchecked_mut((((b * hdim + hh) * ddim + dout) * sdim + so) as usize) = val;
+            }
+        }
+    }
+
     #[kernel]
     pub fn transpose_nd(
         input: &[f32],
