@@ -12,7 +12,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use cuda_device::wgmma::mma_sync_m16n8k8_f32_tf32;
+use cuda_device::wgmma::{mma_sync_m16n8k8_f32_tf32, mma_sync_m16n8k16_f32_f16};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 
@@ -52,6 +52,45 @@ fn apply_act(v: f32, act: u32, lo: f32, hi: f32) -> f32 {
     } else {
         v
     }
+}
+
+/// IEEE-754 binary32 → binary16 bit pattern, round-to-nearest-even.
+///
+/// Integer ops only, for the same reason as `gpu_rsqrt`: float intrinsics map
+/// to libdevice, which pulls the kernel into NVVM IR mode and skips PTX
+/// embedding. Infinities and NaNs saturate to infinity; subnormal results
+/// flush to zero, which is what a GEMM operand path wants.
+#[inline(always)]
+fn f32_to_f16_bits(x: f32) -> u32 {
+    let bits = x.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+
+    if exp == 0xff {
+        return sign | 0x7c00;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if new_exp <= 0 {
+        return sign;
+    }
+    let round_bias = 0x0fff + ((mant >> 13) & 1);
+    let mant_rounded = mant + round_bias;
+    let exp_adjusted = new_exp as u32 + (mant_rounded >> 23);
+    if exp_adjusted >= 0x1f {
+        return sign | 0x7c00;
+    }
+    sign | (exp_adjusted << 10) | ((mant_rounded >> 13) & 0x03ff)
+}
+
+/// Pack two f32 values as two f16 halves in one register, `lo` in the low 16
+/// bits — the order an `.f16x2` operand of `mma.sync` expects.
+#[inline(always)]
+fn pack_f16x2(lo: f32, hi: f32) -> u32 {
+    f32_to_f16_bits(lo) | (f32_to_f16_bits(hi) << 16)
 }
 
 /// Compute e^x via range reduction + degree-5 polynomial + 2^n scaling.
@@ -770,6 +809,308 @@ pub mod gpu {
                 }
             }
             i += 1;
+        }
+    }
+
+    // =========================================================================
+    // f16 tensor-core GEMM — C = act(alpha·A·B + bias), row-major.
+    //
+    //   On GA10x the f16 tensor cores with f32 accumulate run at roughly twice
+    //   the FP32 CUDA-core rate, while tf32 runs at parity with it — which is
+    //   why the tf32 mma.sync path never paid for itself here and this one can.
+    //
+    //   128 threads (4 warps) per 64x64 output tile, K stepped 16 at a time.
+    //   Warp w owns rows [16w, 16w+16) across all 64 columns, i.e. eight
+    //   m16n8k16 tiles, so one A fragment (4 registers) feeds all eight MMAs
+    //   while only B changes: 512 MACs per lane per K-step against 20 shared
+    //   loads. Accumulators are 8x4 f32 in registers.
+    //
+    //   Shared memory holds halves already packed two-per-register in the
+    //   layout the fragments want — A packed along K row-major, B packed along
+    //   K column-major — so the f32→f16 conversion happens once per staged
+    //   element rather than once per fragment read.
+    //
+    //   Launch: grid=(ceil(n/64), ceil(m/64), 1), block=(128,1,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_f16_tc(
+        m: u32,
+        n: u32,
+        k: u32,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        bias: &[f32],
+        has_bias: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
+        static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2; // groupID 0..7
+        let tig = lane & 3; // threadID_in_group 0..3
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+
+        let mut acc = [[0.0f32; 4]; 8];
+
+        let mut k0 = 0u32;
+        while k0 < k {
+            // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
+            let mut q = 0u32;
+            #[unroll]
+            while q < 4 {
+                let e = tid + q * 128;
+                let r = e >> 3;
+                let kk = (e & 7) * 2;
+                let gr = row0 + r;
+                let g0 = k0 + kk;
+                let v0 = if gr < m && g0 < k {
+                    a[(gr * k + g0) as usize]
+                } else {
+                    0.0f32
+                };
+                let v1 = if gr < m && g0 + 1 < k {
+                    a[(gr * k + g0 + 1) as usize]
+                } else {
+                    0.0f32
+                };
+                unsafe {
+                    AS[e as usize] = pack_f16x2(v0, v1);
+                }
+                q += 1;
+            }
+            // Stage B as BS[col][kpair] — transposed relative to A, because the
+            // B fragment wants a column's two K neighbours in one register.
+            let mut q2 = 0u32;
+            #[unroll]
+            while q2 < 4 {
+                let e = tid + q2 * 128;
+                let cc = e >> 3;
+                let kk = (e & 7) * 2;
+                let gc = col0 + cc;
+                let g0 = k0 + kk;
+                let v0 = if gc < n && g0 < k {
+                    b[(g0 * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                let v1 = if gc < n && g0 + 1 < k {
+                    b[((g0 + 1) * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                unsafe {
+                    BS[e as usize] = pack_f16x2(v0, v1);
+                }
+                q2 += 1;
+            }
+            thread::sync_threads();
+
+            // One A fragment for this warp's 16 rows, reused by all 8 tiles.
+            let arow = warp * 16;
+            let a0 = unsafe { AS[((arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[((arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[((arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[((arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 8 {
+                let ncol = t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+            thread::sync_threads();
+            k0 += 16;
+        }
+
+        // Epilogue: rows gid and gid+8 of this warp's strip, columns
+        // 2*tig and 2*tig+1 of each 8-wide tile.
+        let bias_len = bias.len();
+        let mut t = 0usize;
+        #[unroll]
+        while t < 8 {
+            let gc = col0 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + warp * 16 + gid + half * 8;
+                if gr < m {
+                    let b_val = if has_bias != 0u32 && (gr as usize) < bias_len {
+                        bias[gr as usize]
+                    } else {
+                        0.0f32
+                    };
+                    let base = gr * n;
+                    let v0 = alpha * acc[t][(half * 2) as usize] + b_val;
+                    let v1 = alpha * acc[t][(half * 2 + 1) as usize] + b_val;
+                    if gc < n {
+                        unsafe {
+                            *c.get_unchecked_mut((base + gc) as usize) = apply_act(v0, act, lo, hi);
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *c.get_unchecked_mut((base + gc + 1) as usize) =
+                                apply_act(v1, act, lo, hi);
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
+    #[kernel]
+    pub fn sgemm_f16_tc_splitk(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a: &[f32],
+        b: &[f32],
+        mut partials: DisjointSlice<f32>,
+    ) {
+        // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
+        static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2; // groupID 0..7
+        let tig = lane & 3; // threadID_in_group 0..3
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 4]; 8];
+
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
+            let mut q = 0u32;
+            #[unroll]
+            while q < 4 {
+                let e = tid + q * 128;
+                let r = e >> 3;
+                let kk = (e & 7) * 2;
+                let gr = row0 + r;
+                let g0 = k0 + kk;
+                let v0 = if gr < m && g0 < k_stop {
+                    a[(gr * k + g0) as usize]
+                } else {
+                    0.0f32
+                };
+                let v1 = if gr < m && g0 + 1 < k_stop {
+                    a[(gr * k + g0 + 1) as usize]
+                } else {
+                    0.0f32
+                };
+                unsafe {
+                    AS[e as usize] = pack_f16x2(v0, v1);
+                }
+                q += 1;
+            }
+            // Stage B as BS[col][kpair] — transposed relative to A, because the
+            // B fragment wants a column's two K neighbours in one register.
+            let mut q2 = 0u32;
+            #[unroll]
+            while q2 < 4 {
+                let e = tid + q2 * 128;
+                let cc = e >> 3;
+                let kk = (e & 7) * 2;
+                let gc = col0 + cc;
+                let g0 = k0 + kk;
+                let v0 = if gc < n && g0 < k_stop {
+                    b[(g0 * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                let v1 = if gc < n && g0 + 1 < k_stop {
+                    b[((g0 + 1) * n + gc) as usize]
+                } else {
+                    0.0f32
+                };
+                unsafe {
+                    BS[e as usize] = pack_f16x2(v0, v1);
+                }
+                q2 += 1;
+            }
+            thread::sync_threads();
+
+            // One A fragment for this warp's 16 rows, reused by all 8 tiles.
+            let arow = warp * 16;
+            let a0 = unsafe { AS[((arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[((arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[((arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[((arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 8 {
+                let ncol = t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+            thread::sync_threads();
+            k0 += 16;
+        }
+
+        // Partial store; alpha, bias and activation belong to `reduce_splits`.
+        let plane = split * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 8 {
+            let gc = col0 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + warp * 16 + gid + half * 8;
+                if gr < m {
+                    let base = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
         }
     }
 

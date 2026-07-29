@@ -520,6 +520,141 @@ fn bench_kernels() -> Result<()> {
     );
     println!();
 
+    // f16 tensor cores: accuracy against the f32 kernel, then speed. f16 has a
+    // 10-bit mantissa, so the question is not whether it differs but whether
+    // the difference is small relative to the values involved.
+    println!("  sgemm_f16_tc (f16 tensor cores, f32 accumulate)");
+    println!(
+        "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>9} {:>9} {:>9} {:>10}",
+        "layer", "M", "N", "K", "sp", "µs", "GFLOP/s", "total ms", "max rel err"
+    );
+    let mut f16_total_ms = 0.0;
+    for (m, n, k, count, name) in gemm_shapes {
+        // Values in [-1, 1), as activations and weights are after training.
+        let host_a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 37 % 1000) as f32 / 500.0) - 1.0)
+            .collect();
+        let host_b: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 53 % 1000) as f32 / 500.0) - 1.0)
+            .collect();
+        let a = DeviceBuffer::from_host(&stream, &host_a)
+            .map_err(|e| anyhow::anyhow!("alloc a: {:?}", e))?;
+        let b = DeviceBuffer::from_host(&stream, &host_b)
+            .map_err(|e| anyhow::anyhow!("alloc b: {:?}", e))?;
+        let mut c_f16 = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+        let mut c_f32 = DeviceBuffer::<f32>::zeroed(&stream, m * n)
+            .map_err(|e| anyhow::anyhow!("alloc c: {:?}", e))?;
+        let bias = DeviceBuffer::<f32>::zeroed(&stream, m)
+            .map_err(|e| anyhow::anyhow!("alloc bias: {:?}", e))?;
+
+        // Same split policy as the f32 path: without it the small-N shapes
+        // starve the GPU exactly as they did there.
+        let splits = OnnxExecutor::split_factor(m, n, k);
+        let k_per_split = k.div_ceil(splits).next_multiple_of(16).max(16);
+        let mut partials = DeviceBuffer::<f32>::zeroed(&stream, splits * m * n)
+            .map_err(|e| anyhow::anyhow!("alloc partials: {:?}", e))?;
+        let tc_cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(64).max(1),
+                (m as u32).div_ceil(64).max(1),
+                splits as u32,
+            ),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let red_cfg2 = LaunchConfig::for_num_elems((m * n) as u32);
+        let secs = time_kernel(&stream, 50, || {
+            unsafe {
+                module.sgemm_f16_tc_splitk(
+                    &stream,
+                    tc_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    &a,
+                    &b,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("f16 tc: {:?}", e))?;
+            unsafe {
+                module.reduce_splits(
+                    &stream,
+                    red_cfg2,
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    1.0,
+                    &bias,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    &mut c_f16,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("reduce: {:?}", e))
+        })?;
+
+        // f32 reference through the existing tiled kernel.
+        let ref_cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            module.sgemm_tiled(
+                &stream, ref_cfg, m as u32, n as u32, k as u32, 1.0, &a, &b, 0.0, &mut c_f32,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("ref: {:?}", e))?;
+        stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("sync: {:?}", e))?;
+
+        let got = c_f16
+            .to_host_vec(&stream)
+            .map_err(|e| anyhow::anyhow!("d2h: {:?}", e))?;
+        let want = c_f32
+            .to_host_vec(&stream)
+            .map_err(|e| anyhow::anyhow!("d2h: {:?}", e))?;
+        let scale = want
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()))
+            .max(1e-6);
+        let max_rel = got
+            .iter()
+            .zip(want.iter())
+            .map(|(g, w)| (g - w).abs() / scale)
+            .fold(0.0f32, f32::max);
+
+        let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
+        let total_ms = secs * count as f64 * 1e3;
+        f16_total_ms += total_ms;
+        println!(
+            "    {:>11} {:>5} {:>6} {:>5} {:>3} {:>9.1} {:>9.0} {:>9.2} {:>10.2e}",
+            name,
+            m,
+            n,
+            k,
+            splits,
+            secs * 1e6,
+            gflops,
+            total_ms,
+            max_rel
+        );
+    }
+    println!("    {:>50} {:>9.2}", "f16 TC total:", f16_total_ms);
+    println!(
+        "    {:>50} {:>9.2}x",
+        "vs split-K f32:",
+        splitk_total_ms / f16_total_ms
+    );
+    println!();
+
     // Would Winograd pay off here? F(4x4,3x3) cuts multiplies 3.4x on these
     // layers, but turns each convolution into 36 batched GEMMs whose N is the
     // tile count — 196 down to 4 at batch 1. FLOPs saved only become time
