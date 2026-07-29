@@ -2304,17 +2304,27 @@ pub mod gpu {
         mut y: DisjointSlice<f32>,
     ) {
         let idx = thread::index_1d();
-        let i = idx.get();
+        let i = idx.get() as u32;
         if let Some(o) = y.get_mut(idx) {
-            let inn = inner as usize;
-            let ni_inn = n_idx as usize * inn;
+            // 32-bit index unpacking: see the note in `im2col`.
+            let ni_inn = n_idx * inner;
             let oo = i / ni_inn;
             let rem = i % ni_inn;
-            let ii = rem / inn;
-            let k = rem % inn;
-            let g = indices[ii] as usize;
-            let src = oo * (axis_len as usize) * inn + g * inn + k;
-            *o = data[src];
+            let ii = rem / inner;
+            let k = rem % inner;
+            // Negative indices count from the end, as ONNX specifies. Doing it
+            // here rather than on the host is what lets the indices stay on the
+            // device: for BERT they are the input tokens, so normalising them
+            // host-side meant a device-to-host copy and a full synchronisation
+            // per Gather (measured at 3 ms each).
+            let raw = indices[ii as usize];
+            let g = if raw < 0.0f32 {
+                (raw + axis_len as f32) as u32
+            } else {
+                raw as u32
+            };
+            let src = oo * axis_len * inner + g * inner + k;
+            *o = data[src as usize];
         }
     }
 
