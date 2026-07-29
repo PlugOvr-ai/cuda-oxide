@@ -6,8 +6,9 @@
 //! WGMMA conversion for Hopper `sm_90a`.
 
 use crate::convert::intrinsics::common::*;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::ops::GepIndex;
+use llvm_export::ops as llvm;
+use llvm_export::ops::{AsmKind, GepIndex, InlineAsmOpExt};
+use llvm_export::types as llvm_types;
 use llvm_export::types::VoidType;
 use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -17,6 +18,7 @@ use pliron::irbuild::rewriter::Rewriter;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
+use pliron::r#type::TypeHandle;
 use pliron::value::Value;
 
 /// Convert WGMMA make_smem_desc to inline PTX.
@@ -169,12 +171,8 @@ pub(crate) fn convert_mma_sync(
     // Load c0..c3 from the accumulator (acc_ptr is f32*; index by element).
     let mut c = Vec::with_capacity(4);
     for i in 0..4u32 {
-        let gep = llvm::GetElementPtrOp::new(
-            ctx,
-            acc_ptr,
-            vec![GepIndex::Constant(i)],
-            f32_ty.into(),
-        )?;
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], f32_ty.into());
         rewriter.insert_operation(ctx, gep.get_operation());
         let gptr = gep.get_operation().deref(ctx).get_result(0);
         let ld = llvm::LoadOp::new(ctx, gptr, f32_ty.into());
@@ -182,33 +180,129 @@ pub(crate) fn convert_mma_sync(
         c.push(ld.get_operation().deref(ctx).get_result(0));
     }
 
-    // D = A·B + C. C/D are the 4 tied accumulator registers ($0..$3);
-    // A = {$4,$5,$6,$7}, B = {$8,$9}.
-    let asm = llvm::InlineAsmMultiOp::new_tied_convergent(
+    // D = A·B + C, with C/D tied so the MMA is a read-modify-write of the
+    // same four registers. LLVM inline asm returns multiple outputs as a
+    // literal struct, so the op yields `{float, float, float, float}` and the
+    // elements come back out with `extractvalue`.
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![f32_ty.into(); 4]).into();
+
+    // Inputs are ordered tied-first: c0..c3 (tied to outputs 0..3), then
+    // a0..a3, then b0,b1 — matching the constraint string below.
+    let mut inputs = c;
+    inputs.extend_from_slice(&[a0, a1, a2, a3, b0, b1]);
+
+    let asm = llvm::InlineAsmOp::build(
         ctx,
-        4,
-        f32_ty.into(),
-        c.clone(),
-        vec![a0, a1, a2, a3, b0, b1],
+        struct_ty,
+        inputs,
         // Operand numbering: $0..$3 = outputs (D). Inputs follow: the 4 tied
         // accumulator inputs are $4..$7 (alias $0..$3), then A = $8..$11,
         // B = $12,$13. C uses the tied outputs $0..$3.
         "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \
 {$0,$1,$2,$3}, {$8,$9,$10,$11}, {$12,$13}, {$0,$1,$2,$3};",
-        "f",
-        "r,r,r,r,r,r",
+        // 4 float outputs, 4 inputs tied to them, then 6 b32 register inputs.
+        "=f,=f,=f,=f,0,1,2,3,r,r,r,r,r,r",
+        // mma.sync is warp-collective and writes the accumulator: convergent
+        // with side effects.
+        AsmKind::Convergent,
     );
-    rewriter.insert_operation(ctx, asm.get_operation());
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
 
     // Store the 4 D results back into the accumulator.
-    for i in 0..4usize {
-        let d = asm.get_operation().deref(ctx).get_result(i);
-        let gep = llvm::GetElementPtrOp::new(
-            ctx,
-            acc_ptr,
-            vec![GepIndex::Constant(i as u32)],
-            f32_ty.into(),
-        )?;
+    for i in 0..4u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], f32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert Ampere `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+///
+/// Operands: `[acc_ptr, a0, a1, a2, a3, b0, b1]`. Loads the 4-f32
+/// accumulator from `acc_ptr`, issues the tensor-core MMA with the C/D
+/// accumulator tied (read-modify-write), and stores the 4 results back.
+pub(crate) fn convert_mma_sync_f16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 7 {
+        return pliron::input_err_noloc!(
+            "mma_sync_m16n8k16_f32_f16 requires 7 operands [acc_ptr, a0..a3, b0, b1]"
+        );
+    }
+    let acc_ptr = operands[0];
+    let (a0, a1, a2, a3) = (operands[1], operands[2], operands[3], operands[4]);
+    let (b0, b1) = (operands[5], operands[6]);
+
+    let f32_ty = FP32Type::get(ctx);
+
+    // Load c0..c3 from the accumulator (acc_ptr is f32*; index by element).
+    let mut c = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], f32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let ld = llvm::LoadOp::new(ctx, gptr, f32_ty.into());
+        rewriter.insert_operation(ctx, ld.get_operation());
+        c.push(ld.get_operation().deref(ctx).get_result(0));
+    }
+
+    // D = A·B + C, with C/D tied so the MMA is a read-modify-write of the
+    // same four registers. LLVM inline asm returns multiple outputs as a
+    // literal struct, so the op yields `{float, float, float, float}` and the
+    // elements come back out with `extractvalue`.
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![f32_ty.into(); 4]).into();
+
+    // Inputs are ordered tied-first: c0..c3 (tied to outputs 0..3), then
+    // a0..a3, then b0,b1 — matching the constraint string below.
+    let mut inputs = c;
+    inputs.extend_from_slice(&[a0, a1, a2, a3, b0, b1]);
+
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        inputs,
+        // Operand numbering: $0..$3 = outputs (D). Inputs follow: the 4 tied
+        // accumulator inputs are $4..$7 (alias $0..$3), then A = $8..$11,
+        // B = $12,$13. C uses the tied outputs $0..$3.
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \
+{$0,$1,$2,$3}, {$8,$9,$10,$11}, {$12,$13}, {$0,$1,$2,$3};",
+        // 4 float outputs, 4 inputs tied to them, then 6 b32 register inputs.
+        "=f,=f,=f,=f,0,1,2,3,r,r,r,r,r,r",
+        // mma.sync is warp-collective and writes the accumulator: convergent
+        // with side effects.
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+
+    // Store the 4 D results back into the accumulator.
+    for i in 0..4u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], f32_ty.into());
         rewriter.insert_operation(ctx, gep.get_operation());
         let gptr = gep.get_operation().deref(ctx).get_result(0);
         let st = llvm::StoreOp::new(ctx, d, gptr);
