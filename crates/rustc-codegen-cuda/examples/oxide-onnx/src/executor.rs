@@ -54,6 +54,9 @@ pub struct OnnxExecutor {
     /// Weight matrices pre-packed as f16 pairs for the tensor-core GEMM, keyed
     /// by (device pointer, rows, k). See [`Self::packed_weights`].
     f16_weights: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
+    /// Same, for weights that sit in the B operand — packed [n][ceil(k/2)].
+    /// See [`Self::packed_weights_cols`].
+    f16_weights_b: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
 }
 
 impl OnnxExecutor {
@@ -117,6 +120,7 @@ impl OnnxExecutor {
             meta_cache: RefCell::new(HashMap::new()),
             buf_pool: RefCell::new(HashMap::new()),
             f16_weights: RefCell::new(HashMap::new()),
+            f16_weights_b: RefCell::new(HashMap::new()),
         })
     }
 
@@ -501,9 +505,11 @@ impl OnnxExecutor {
         act: u32,
         lo: f32,
         hi: f32,
-        // True when `a` is a load-time constant (conv weights), which is what
-        // makes the f16 packing cacheable.
+        // True when the respective operand is a load-time constant, which is
+        // what makes its f16 packing cacheable. Conv puts weights in A; Gemm
+        // and MatMul put them in B.
         a_static: bool,
+        b_static: bool,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
@@ -524,11 +530,10 @@ impl OnnxExecutor {
         // GEMM is 1.55x the f32 split-K path on these shapes; the cost is f16's
         // 10-bit mantissa, so it is gated on the correctness harness rather
         // than assumed harmless. OXIDE_F16=0 disables it.
-        let f16_ok = a_static
-            && k >= 32
+        let f16_shape_ok = k >= 32
             && m * n >= 4096
             && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true);
-        if use_splitk && f16_ok {
+        if use_splitk && a_static && f16_shape_ok {
             let kpairs = k.div_ceil(2);
             let a_packed = self.packed_weights(a, m, k)?;
             let k_per_split = k.div_ceil(splits).next_multiple_of(16).max(16);
@@ -559,6 +564,60 @@ impl OnnxExecutor {
                 )
             }
             .map_err(|e| anyhow!("sgemm_f16_tc launch: {:?}", e))?;
+            let bias_operand = bias.unwrap_or(a);
+            unsafe {
+                self.module.reduce_splits(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((m * n) as u32),
+                    &partials,
+                    splits as u32,
+                    (m * n) as u32,
+                    n as u32,
+                    alpha,
+                    bias_operand,
+                    u32::from(bias.is_some()),
+                    act,
+                    lo,
+                    hi,
+                    c,
+                )
+            }
+            .map_err(|e| anyhow!("reduce_splits launch: {:?}", e))?;
+            return Ok(());
+        }
+
+        // Same, for the operand order ONNX linear layers use: weights in B.
+        if use_splitk && !a_static && b_static && f16_shape_ok {
+            let kpairs = k.div_ceil(2);
+            let b_packed = self.packed_weights_cols(b, k, n)?;
+            let k_per_split = k.div_ceil(splits).next_multiple_of(16).max(16);
+            let mut partials = self
+                .alloc_buf(splits * m * n)
+                .map_err(|e| anyhow!("f16 partials alloc: {}", e))?;
+            let gemm_cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64).max(1),
+                    (m as u32).div_ceil(64).max(1),
+                    splits as u32,
+                ),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.module.sgemm_f16_tc_splitk_bpacked(
+                    &self.stream,
+                    gemm_cfg,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    k_per_split as u32,
+                    a,
+                    &b_packed,
+                    kpairs as u32,
+                    &mut partials,
+                )
+            }
+            .map_err(|e| anyhow!("sgemm_f16_tc_bpacked launch: {:?}", e))?;
             let bias_operand = bias.unwrap_or(a);
             unsafe {
                 self.module.reduce_splits(
@@ -733,6 +792,7 @@ impl OnnxExecutor {
         a: &DeviceBuffer<f32>,
         b: &DeviceBuffer<f32>,
         beta: f32,
+        b_static: bool,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         // beta != 0 accumulates into C, which the split-K reduction does not
@@ -765,8 +825,9 @@ impl OnnxExecutor {
             graph_opt::ACT_NONE as u32,
             0.0,
             0.0,
-            // Gemm/MatMul take an activation as `a`, so nothing to cache.
+            // Gemm/MatMul take an activation as `a`; their weights are in `b`.
             false,
+            b_static,
             c,
         )
     }
@@ -1200,7 +1261,7 @@ impl OnnxExecutor {
                     )
                 });
                 // C[n_out × hw] = W[n_out × c_in] · X_b[c_in × hw]
-                self.dispatch_sgemm(n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, &mut out_b)
+                self.dispatch_sgemm(n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, false, &mut out_b)
                     .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {}", b, e))?;
             }
         } else if std::env::var("OXIDE_CONV_IMPLICIT").is_ok() {
@@ -1404,7 +1465,9 @@ impl OnnxExecutor {
                         act_lo,
                         act_hi,
                         // Conv's `a` is the weight tensor: constant, cacheable.
+                        // Its `b` is the im2col scratch, which is not.
                         true,
+                        false,
                         &mut out_g,
                     )
                     .map_err(|e| anyhow!("conv sgemm g={}: {}", g, e))?;
@@ -1567,6 +1630,48 @@ impl OnnxExecutor {
         };
         // SAFETY: aliases a cache entry that outlives the launch; ManuallyDrop
         // keeps the alias from freeing it.
+        Ok(ManuallyDrop::new(unsafe {
+            DeviceBuffer::<u32>::from_raw_parts(entry.cu_deviceptr(), entry.len(), self.ctx.clone())
+        }))
+    }
+
+    /// An f16-packed copy of a constant weight matrix used as the *B* operand,
+    /// laid out `[n][ceil(k/2)]`.
+    ///
+    /// Same lifetime rule as [`Self::packed_weights`]: only for tensors that
+    /// outlive the run, since the key is the device pointer and intermediates
+    /// are recycled. `Gemm` and `MatMul` put the weights here rather than in A,
+    /// which is what this exists for.
+    fn packed_weights_cols(
+        &self,
+        b: &DeviceBuffer<f32>,
+        k: usize,
+        n: usize,
+    ) -> Result<ManuallyDrop<DeviceBuffer<u32>>> {
+        let key = (b.cu_deviceptr(), k, n);
+        let kpairs = k.div_ceil(2);
+        let mut cache = self.f16_weights_b.borrow_mut();
+        let entry = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let mut packed = DeviceBuffer::<u32>::zeroed(&self.stream, n * kpairs)
+                    .map_err(|err| anyhow!("f16 B alloc: {:?}", err))?;
+                unsafe {
+                    self.module.pack_f16_cols(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((n * kpairs) as u32),
+                        b,
+                        k as u32,
+                        n as u32,
+                        kpairs as u32,
+                        &mut packed,
+                    )
+                }
+                .map_err(|err| anyhow!("f16 B pack: {:?}", err))?;
+                e.insert(packed)
+            }
+        };
+        // SAFETY: aliases a cache entry that outlives the launch.
         Ok(ManuallyDrop::new(unsafe {
             DeviceBuffer::<u32>::from_raw_parts(entry.cu_deviceptr(), entry.len(), self.ctx.clone())
         }))
@@ -1834,8 +1939,19 @@ impl OnnxExecutor {
             }
             .map_err(|e| anyhow!("gemm sgemm_transb: {:?}", e))?;
         } else {
-            self.dispatch_sgemm(m, n, k_a, alpha, ea.buf(), eb.buf(), 0.0, &mut out_dev)
-                .map_err(|e| anyhow!("gemm sgemm: {}", e))?;
+            let b_static = self.weights.contains_key(&node.input[1]);
+            self.dispatch_sgemm(
+                m,
+                n,
+                k_a,
+                alpha,
+                ea.buf(),
+                eb.buf(),
+                0.0,
+                b_static,
+                &mut out_dev,
+            )
+            .map_err(|e| anyhow!("gemm sgemm: {}", e))?;
         }
         drop(ea);
         drop(eb);
@@ -1927,6 +2043,9 @@ impl OnnxExecutor {
             .map_err(|e| anyhow!("matmul alloc: {}", e))?;
         let out_ptr = out.cu_deviceptr();
 
+        // The weights of a linear layer live in B; caching their packed f16
+        // form is only sound for tensors that outlive the run.
+        let b_static = self.weights.contains_key(&node.input[1]);
         for bi in 0..batch {
             let a_g = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(
@@ -1949,7 +2068,7 @@ impl OnnxExecutor {
                     self.ctx.clone(),
                 )
             });
-            self.dispatch_sgemm(m, n, k, 1.0, &a_g, &b_g, 0.0, &mut c_g)
+            self.dispatch_sgemm(m, n, k, 1.0, &a_g, &b_g, 0.0, b_static, &mut c_g)
                 .map_err(|e| anyhow!("matmul sgemm bi={}: {}", bi, e))?;
         }
 
