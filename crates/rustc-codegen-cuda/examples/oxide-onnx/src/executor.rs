@@ -622,7 +622,7 @@ impl OnnxExecutor {
             }
             .map_err(|e| anyhow!("f16 A pack: {:?}", e))?;
             unsafe {
-                self.module.sgemm_f16_tc_splitk_abpacked(
+                self.module.sgemm_f16_tc_splitk_ab_db(
                     &self.stream,
                     gemm_cfg,
                     m as u32,
@@ -635,7 +635,7 @@ impl OnnxExecutor {
                     &mut partials,
                 )
             }
-            .map_err(|e| anyhow!("sgemm_f16_tc_abpacked launch: {:?}", e))?;
+            .map_err(|e| anyhow!("sgemm_f16_tc_ab_db launch: {:?}", e))?;
             let bias_operand = bias.unwrap_or(a);
             unsafe {
                 self.module.reduce_splits(

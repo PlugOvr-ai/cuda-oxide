@@ -1410,6 +1410,193 @@ pub mod gpu {
         }
     }
 
+    // =========================================================================
+    // f16 tensor-core GEMM, both operands packed, double-buffered staging.
+    //
+    //   The single-buffered kernel stalls: it issues a K-step's global loads,
+    //   waits on them at the barrier, then does the math, so memory latency is
+    //   never hidden behind the MMAs. Here the loads for step i+1 are issued
+    //   into registers *before* the math for step i and land in the other
+    //   shared buffer afterwards, so the two overlap.
+    //
+    //   It also halves the barriers. Reading S[b] and writing S[b^1] cannot
+    //   conflict, so one sync per K-step suffices where the single-buffered
+    //   version needed two: the barrier ending step i guarantees every warp has
+    //   finished reading S[b] before any warp overwrites it in step i+1.
+    //
+    //   Shared: 2 x (64 x 8) u32 per operand = 8 KB per block.
+    //   Launch: grid=(ceil(n/64), ceil(m/64), splits), block=(128,1,1).
+    // =========================================================================
+    #[kernel]
+    pub fn sgemm_f16_tc_splitk_ab_db(
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        a_packed: &[u32],
+        b_packed: &[u32],
+        kpairs: u32,
+        mut partials: DisjointSlice<f32>,
+    ) {
+        static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let warp = tid >> 5;
+        let lane = tid & 31;
+        let gid = lane >> 2;
+        let tig = lane & 3;
+
+        let row0 = thread::blockIdx_y() * 64;
+        let col0 = thread::blockIdx_x() * 64;
+        let split = thread::blockIdx_z();
+
+        let k_begin = split * k_per_split;
+        let k_stop = if k_begin + k_per_split < k {
+            k_begin + k_per_split
+        } else {
+            k
+        };
+
+        let mut acc = [[0.0f32; 4]; 8];
+        let mut areg = [0u32; 4];
+        let mut breg = [0u32; 4];
+
+        // Both operands are [rows-or-cols][kpairs], 64 of the former and 8 of
+        // the latter per tile, so one index decomposition serves both.
+        let mut q = 0u32;
+        #[unroll]
+        while q < 4 {
+            let e = tid + q * 128;
+            let r = e >> 3;
+            let kk = (e & 7) * 2;
+            let g0 = k_begin + kk;
+            let gr = row0 + r;
+            let gc = col0 + r;
+            areg[q as usize] = if gr < m && g0 < k_stop {
+                a_packed[(gr * kpairs + g0 / 2) as usize]
+            } else {
+                0u32
+            };
+            breg[q as usize] = if gc < n && g0 < k_stop {
+                b_packed[(gc * kpairs + g0 / 2) as usize]
+            } else {
+                0u32
+            };
+            q += 1;
+        }
+        let mut q2 = 0u32;
+        #[unroll]
+        while q2 < 4 {
+            let e = tid + q2 * 128;
+            unsafe {
+                AS[e as usize] = areg[q2 as usize];
+                BS[e as usize] = breg[q2 as usize];
+            }
+            q2 += 1;
+        }
+        thread::sync_threads();
+
+        let mut buf = 0u32;
+        let mut k0 = k_begin;
+        while k0 < k_stop {
+            let k_next = k0 + 16;
+
+            // Issue the next tile's global loads before the math so they are in
+            // flight while the MMAs run.
+            if k_next < k_stop {
+                let mut qn = 0u32;
+                #[unroll]
+                while qn < 4 {
+                    let e = tid + qn * 128;
+                    let r = e >> 3;
+                    let kk = (e & 7) * 2;
+                    let g0 = k_next + kk;
+                    let gr = row0 + r;
+                    let gc = col0 + r;
+                    areg[qn as usize] = if gr < m && g0 < k_stop {
+                        a_packed[(gr * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                    breg[qn as usize] = if gc < n && g0 < k_stop {
+                        b_packed[(gc * kpairs + g0 / 2) as usize]
+                    } else {
+                        0u32
+                    };
+                    qn += 1;
+                }
+            }
+
+            let base = buf * 512;
+            let arow = warp * 16;
+            let a0 = unsafe { AS[(base + (arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[(base + (arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig + 4) as usize] };
+
+            let mut t = 0usize;
+            #[unroll]
+            while t < 8 {
+                let ncol = t as u32 * 8 + gid;
+                let b0 = unsafe { BS[(base + ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(base + ncol * 8 + tig + 4) as usize] };
+                unsafe {
+                    mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
+                }
+                t += 1;
+            }
+
+            // Land the prefetched tile in the other buffer; the reads above were
+            // from `buf`, so one barrier closes the step.
+            if k_next < k_stop {
+                let other = (buf ^ 1) * 512;
+                let mut qs = 0u32;
+                #[unroll]
+                while qs < 4 {
+                    let e = tid + qs * 128;
+                    unsafe {
+                        AS[(other + e) as usize] = areg[qs as usize];
+                        BS[(other + e) as usize] = breg[qs as usize];
+                    }
+                    qs += 1;
+                }
+            }
+            thread::sync_threads();
+            buf ^= 1;
+            k0 = k_next;
+        }
+
+        let plane = split * m * n;
+        let mut t = 0usize;
+        #[unroll]
+        while t < 8 {
+            let gc = col0 + t as u32 * 8 + 2 * tig;
+            let mut half = 0u32;
+            #[unroll]
+            while half < 2 {
+                let gr = row0 + warp * 16 + gid + half * 8;
+                if gr < m {
+                    let base_o = plane + gr * n;
+                    if gc < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base_o + gc) as usize) =
+                                acc[t][(half * 2) as usize];
+                        }
+                    }
+                    if gc + 1 < n {
+                        unsafe {
+                            *partials.get_unchecked_mut((base_o + gc + 1) as usize) =
+                                acc[t][(half * 2 + 1) as usize];
+                        }
+                    }
+                }
+                half += 1;
+            }
+            t += 1;
+        }
+    }
+
     #[kernel]
     pub fn sgemm_f16_tc_splitk_abpacked(
         m: u32,
