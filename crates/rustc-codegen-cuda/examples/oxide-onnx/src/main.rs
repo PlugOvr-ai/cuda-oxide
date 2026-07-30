@@ -1725,7 +1725,11 @@ fn run_generic_model(model_path: &str, model_name: &str, input_shape: &[usize]) 
             model_name, bench_ms, e
         ),
     }
-    match bench_trtexec(model_path) {
+    let trt_input = executor
+        .input_names
+        .first()
+        .map(|n| (n.as_str(), input_shape));
+    match bench_trtexec_shaped(model_path, trt_input) {
         Ok(t) => println!(
             "  {:<26} {:>13}   TRT {:>7.2} ms   [{:.2}x]",
             "",
@@ -2147,7 +2151,7 @@ fn run_benchmarks(model_path: &str, model_name: &str) -> Result<()> {
 
     let tract_ms = bench_tract(model_path, WARMUP, RUNS);
     let ort_gpu_ms = bench_ort_gpu(model_path, WARMUP, RUNS);
-    let trt_ms = bench_trtexec(model_path);
+    let trt_ms = bench_trtexec_shaped(model_path, Some(("input", &[1, 3, 224, 224])));
 
     println!();
     println!("  Model: {} (batch=1, 3×224×224)", model_name);
@@ -2295,22 +2299,68 @@ fn bench_ort_gpu_shaped(
 
 /// Run `trtexec` (TensorRT CLI) and return mean latency in milliseconds.
 fn bench_trtexec(model_path: &str) -> Result<f64> {
+    bench_trtexec_shaped(model_path, None)
+}
+
+/// Run `trtexec`, pinning the input shape when the model has dynamic dims.
+///
+/// Without `--shapes`, trtexec picks its own geometry for a dynamic input and
+/// only says so in a warning. FCN-ResNet50 declares `[batch, 3, height,
+/// width]`, and trtexec silently benchmarked it at **1x3x1x1** — one pixel —
+/// which read as 1.28 ms against our 4.52 at 224x224 and made the model look
+/// 3.5x slower than TensorRT. At the same shape it is 4.46 ms. So the shape is
+/// passed explicitly, and an override in the log is treated as a failure
+/// rather than a number.
+fn bench_trtexec_shaped(model_path: &str, input: Option<(&str, &[usize])>) -> Result<f64> {
     let exe = which_trtexec()?;
 
     print!("  Running TensorRT benchmark (trtexec)... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    let output = std::process::Command::new(&exe)
-        .args([
-            &format!("--onnx={}", model_path),
-            "--warmUp=2000",
-            "--iterations=20",
-        ])
-        .output()
-        .map_err(|e| anyhow::anyhow!("trtexec exec: {}", e))?;
+    let base = vec![
+        format!("--onnx={}", model_path),
+        "--warmUp=2000".to_string(),
+        "--iterations=20".to_string(),
+    ];
+    let run = |extra: Option<String>| -> Result<String> {
+        let mut args = base.clone();
+        if let Some(e) = extra {
+            args.push(e);
+        }
+        let out = std::process::Command::new(&exe)
+            .args(&args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("trtexec exec: {}", e))?;
+        // The shape-override warning goes to stderr while the latency summary
+        // goes to stdout; both matter here.
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    };
 
-    // trtexec writes the "Latency:" summary to stdout
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A static input rejects --shapes, so ask first and only pin the geometry
+    // when trtexec says it picked its own.
+    let mut stdout = run(None)?;
+    if let Some(l) = stdout
+        .lines()
+        .find(|l| l.contains("Automatically overriding shape"))
+        .map(|l| l.to_string())
+    {
+        let chose = l.split("to: ").nth(1).unwrap_or("?").trim().to_string();
+        let (name, shape) = input.ok_or_else(|| {
+            anyhow::anyhow!("trtexec chose input shape {} and none was supplied", chose)
+        })?;
+        let dims = shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("x");
+        if chose != dims {
+            stdout = run(Some(format!("--shapes={}:{}", name, dims)))?;
+        }
+    }
     for line in stdout.lines() {
         if line.contains("Latency:")
             && line.contains("mean =")
