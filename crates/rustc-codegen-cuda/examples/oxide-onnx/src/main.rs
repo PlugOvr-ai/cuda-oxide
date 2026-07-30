@@ -55,6 +55,7 @@ const SHUFFLENET_PATH: &str = "models/shufflenet-v2-10.onnx";
 const YOLO_PATH: &str = "models/tinyyolov2-8.onnx";
 const FCN_PATH: &str = "models/fcn-resnet50-11.onnx";
 const STYLE_PATH: &str = "models/mosaic-9.onnx";
+const LSTM_PATH: &str = "models/lstm-seq.onnx";
 
 fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════╗");
@@ -114,6 +115,7 @@ fn main() -> Result<()> {
                 vec![1, 3, 224, 224],
             ),
             (STYLE_PATH, "Mosaic (style transfer)", vec![1, 3, 224, 224]),
+            (LSTM_PATH, "LSTM sequence classifier", vec![1, 64, 128]),
         ] {
             if std::path::Path::new(path).exists() {
                 if let Err(e) = run_generic_model(path, name, &shape) {

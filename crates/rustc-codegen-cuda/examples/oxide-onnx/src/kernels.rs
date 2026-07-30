@@ -21,6 +21,13 @@ use cuda_host::cuda_module;
 // calls trigger NVVM IR mode and skip PTX embedding. Instead we use only
 // standard LLVM instructions: bitcast, integer arithmetic, fmul, fadd.
 
+/// Logistic sigmoid, built from `gpu_exp` for the same reason as `gpu_rsqrt`:
+/// calling libdevice would switch the backend to NVVM IR mode.
+#[inline(always)]
+fn gpu_sigmoid(x: f32) -> f32 {
+    1.0f32 / (1.0f32 + gpu_expf(-x))
+}
+
 /// Compute 1/sqrt(x) using the Carmack bit-hack followed by two Newton steps.
 /// Relative error < 0.001%.
 #[inline(always)]
@@ -1895,6 +1902,117 @@ pub mod gpu {
                 half += 1;
             }
             t += 1;
+        }
+    }
+
+    // =========================================================================
+    // One LSTM timestep, ONNX gate order (i, o, f, c).
+    //
+    //   Every other model here is feed-forward: each node runs once. A
+    //   recurrent layer applies the same weights T times with a serial
+    //   dependency between steps, so the step is the kernel and the loop over
+    //   time stays on the host. One thread per hidden unit computes all four
+    //   of that unit's gates, which keeps the four dot products that share the
+    //   same h_prev reads in one thread.
+    //
+    //   W is [4H, input] and R is [4H, H], both gate-major, so gate g of unit
+    //   j is row g*H + j. Bias is [8H]: input-side gates then recurrence-side.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_step(
+        x_t: &[f32],
+        w: &[f32],
+        r: &[f32],
+        b: &[f32],
+        h_prev: &[f32],
+        c_prev: &[f32],
+        input_size: u32,
+        hidden: u32,
+        has_bias: u32,
+        mut h_out: DisjointSlice<f32>,
+        mut c_out: DisjointSlice<f32>,
+    ) {
+        // Four partial sums per thread, reduced across the block.
+        static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
+
+        let j = thread::blockIdx_x();
+        let tid = thread::threadIdx_x();
+        if j >= hidden {
+            return;
+        }
+
+        // One block per hidden unit, so the whole block sweeps that unit's
+        // weight rows together and consecutive threads read consecutive
+        // weights. One thread per unit instead leaves a single block resident
+        // — one SM of 82 — and reads each row with a stride.
+        let mut acc = [0.0f32; 4];
+        let mut g = 0usize;
+        while g < 4 {
+            let row = g as u32 * hidden + j;
+            let wbase = row * input_size;
+            let mut k = tid;
+            let mut a = 0.0f32;
+            while k < input_size {
+                a += w[(wbase + k) as usize] * x_t[k as usize];
+                k += 256;
+            }
+            let rbase = row * hidden;
+            let mut m = tid;
+            while m < hidden {
+                a += r[(rbase + m) as usize] * h_prev[m as usize];
+                m += 256;
+            }
+            acc[g] = a;
+            g += 1;
+        }
+
+        let mut g2 = 0usize;
+        while g2 < 4 {
+            unsafe {
+                RED[(g2 as u32 * 256 + tid) as usize] = acc[g2];
+            }
+            g2 += 1;
+        }
+        thread::sync_threads();
+        let mut step = 128u32;
+        while step > 0 {
+            if tid < step {
+                let mut g3 = 0u32;
+                while g3 < 4 {
+                    unsafe {
+                        RED[(g3 * 256 + tid) as usize] += RED[(g3 * 256 + tid + step) as usize];
+                    }
+                    g3 += 1;
+                }
+            }
+            thread::sync_threads();
+            step >>= 1;
+        }
+
+        if tid == 0 {
+            let mut pre = [0.0f32; 4];
+            let mut g4 = 0usize;
+            while g4 < 4 {
+                let row = g4 as u32 * hidden + j;
+                let mut v = unsafe { RED[(g4 as u32 * 256) as usize] };
+                if has_bias != 0 {
+                    v += b[row as usize] + b[(4 * hidden + row) as usize];
+                }
+                pre[g4] = v;
+                g4 += 1;
+            }
+            // ONNX orders the gates i, o, f, c.
+            let i_g = gpu_sigmoid(pre[0]);
+            let o_g = gpu_sigmoid(pre[1]);
+            let f_g = gpu_sigmoid(pre[2]);
+            let c_g = gpu_tanh(pre[3]);
+            let c_new = f_g * c_prev[j as usize] + i_g * c_g;
+            let h_new = o_g * gpu_tanh(c_new);
+            unsafe {
+                *c_out.get_unchecked_mut(j as usize) = c_new;
+                *h_out.get_unchecked_mut(j as usize) = h_new;
+            }
         }
     }
 

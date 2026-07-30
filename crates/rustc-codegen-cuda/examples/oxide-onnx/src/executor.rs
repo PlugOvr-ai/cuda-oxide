@@ -249,9 +249,34 @@ impl OnnxExecutor {
             t_loop_ms = 0.0;
         } else {
             let t_loop = std::time::Instant::now();
+            // Shape tracing is what you want when standing up an unfamiliar
+            // architecture: a wrong rank surfaces as a mismatch several nodes
+            // later, and the useful question is which node first disagreed
+            // with the reference.
+            let trace = std::env::var("OXIDE_SHAPES").is_ok();
             for node in &self.nodes {
                 self.dispatch_node(node, &mut tensors)
                     .map_err(|e| anyhow!("op {} (inputs={:?}): {}", node.op_type, node.input, e))?;
+                if trace {
+                    for out in &node.output {
+                        if out.is_empty() {
+                            continue;
+                        }
+                        match Self::get_tensor(&tensors, &self.weights, out) {
+                            Ok(t) => eprintln!(
+                                "  [shape] {:<22} {:<28} {:?}",
+                                node.op_type,
+                                &out[out.len().saturating_sub(26)..],
+                                t.shape()
+                            ),
+                            Err(_) => eprintln!(
+                                "  [shape] {:<22} {:<28} <absent>",
+                                node.op_type,
+                                &out[out.len().saturating_sub(26)..]
+                            ),
+                        }
+                    }
+                }
             }
             t_loop_ms = t_loop.elapsed().as_secs_f64() * 1e3;
         }
@@ -336,6 +361,8 @@ impl OnnxExecutor {
             "LeakyRelu" => self.op_leaky_relu(node, tensors),
             "Floor" => self.op_floor(node, tensors),
             "Slice" => self.op_slice(node, tensors),
+            "Expand" => self.op_expand(node, tensors),
+            "LSTM" => self.op_lstm(node, tensors),
             "ReduceMean" => self.op_reduce_mean(node, tensors),
             "InstanceNormalization" => self.op_instance_norm(node, tensors),
             "Resize" | "Upsample" => self.op_resize(node, tensors),
@@ -2468,6 +2495,239 @@ impl OnnxExecutor {
     }
 
     // =========================================================================
+    // Expand — broadcast to a target shape
+    // =========================================================================
+    fn op_expand(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let x_shape = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            ex.shape().clone()
+        };
+        let target: Vec<usize> = self
+            .host_vals(tensors, &node.input[1])?
+            .into_iter()
+            .map(|v| v as usize)
+            .collect();
+
+        // Right-align the source against the target, as NumPy does.
+        let rank = target.len().max(x_shape.len());
+        let mut out_shape = vec![1usize; rank];
+        for (i, &d) in target.iter().enumerate() {
+            out_shape[rank - target.len() + i] = d;
+        }
+        let mut src = vec![1usize; rank];
+        for (i, &d) in x_shape.iter().enumerate() {
+            src[rank - x_shape.len() + i] = d;
+        }
+        for i in 0..rank {
+            if src[i] > out_shape[i] {
+                out_shape[i] = src[i];
+            }
+        }
+
+        // A broadcast axis advances by nothing, which `slice_nd` expresses as
+        // a step of zero — so Expand is a slice with the stretched axes
+        // stepping in place rather than a kernel of its own.
+        let src_strides = Self::row_major(&src);
+        let steps: Vec<f32> = (0..rank)
+            .map(|i| {
+                if src[i] == 1 && out_shape[i] > 1 {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let starts = vec![0.0f32; rank];
+        let out_strides = Self::row_major(&out_shape);
+        let out_numel: usize = out_shape.iter().product();
+
+        let osh = self.meta_buf(&Self::to_f32(&out_shape))?;
+        let ost = self.meta_buf(&Self::to_f32(&out_strides))?;
+        let ist = self.meta_buf(&Self::to_f32(&src_strides))?;
+        let stb = self.meta_buf(&starts)?;
+        let spb = self.meta_buf(&steps)?;
+
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let mut out = self
+            .alloc_buf(out_numel.max(1))
+            .map_err(|e| anyhow!("expand alloc: {}", e))?;
+        unsafe {
+            self.module.slice_nd(
+                &self.stream,
+                LaunchConfig::for_num_elems(out_numel as u32),
+                ex.buf(),
+                &osh,
+                &ost,
+                &ist,
+                &stb,
+                &spb,
+                rank as u32,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("expand launch: {:?}", e))?;
+        drop(ex);
+        tensors.insert(&out_name, out, out_shape);
+        Ok(())
+    }
+
+    // =========================================================================
+    // LSTM — recurrent layer, host-side loop over time
+    // =========================================================================
+    ///
+    /// The time loop stays on the host because each step depends on the
+    /// previous one, so there is nothing to parallelise across it; the
+    /// parallelism is within a step, over hidden units. Only the forward
+    /// direction with batch 1 is handled, which is what these graphs use.
+    ///
+    /// The hidden state is written straight into the output sequence rather
+    /// than into scratch, so step t reads its predecessor in place and no copy
+    /// is needed between steps.
+    fn op_lstm(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let hidden = attr_i(node, "hidden_size", 0) as usize;
+        if hidden == 0 {
+            return Err(anyhow!("LSTM: hidden_size attribute missing"));
+        }
+        let direction = attr_string(node, "direction");
+        if !direction.is_empty() && direction != "forward" {
+            return Err(anyhow!(
+                "LSTM: only forward direction supported, got {}",
+                direction
+            ));
+        }
+
+        let (x_ptr, x_shape) = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            (ex.buf().cu_deviceptr(), ex.shape().clone())
+        };
+        if x_shape.len() != 3 {
+            return Err(anyhow!(
+                "LSTM: expected [seq, batch, input], got {:?}",
+                x_shape
+            ));
+        }
+        let (seq, batch, input_size) = (x_shape[0], x_shape[1], x_shape[2]);
+        if batch != 1 {
+            return Err(anyhow!("LSTM: only batch 1 supported, got {}", batch));
+        }
+
+        let has_bias = node.input.len() > 3 && !node.input[3].is_empty();
+
+        // Output Y is [seq, num_dir, batch, hidden]; the state for step t
+        // lives in its own slice of it.
+        let mut y = self
+            .alloc_buf(seq * hidden)
+            .map_err(|e| anyhow!("lstm Y alloc: {}", e))?;
+        let y_ptr = y.cu_deviceptr();
+
+        let zeros = vec![0.0f32; hidden];
+        let mut c_a = DeviceBuffer::from_host(&self.stream, &zeros)
+            .map_err(|e| anyhow!("lstm C alloc: {:?}", e))?;
+        let mut c_b = DeviceBuffer::from_host(&self.stream, &zeros)
+            .map_err(|e| anyhow!("lstm C alloc: {:?}", e))?;
+        let h0 = DeviceBuffer::from_host(&self.stream, &zeros)
+            .map_err(|e| anyhow!("lstm H0 alloc: {:?}", e))?;
+
+        let cfg = LaunchConfig {
+            grid_dim: (hidden as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        for t in 0..seq {
+            let x_t = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    x_ptr + (t * input_size * 4) as u64,
+                    input_size,
+                    self.ctx.clone(),
+                )
+            });
+            let h_prev = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    if t == 0 {
+                        h0.cu_deviceptr()
+                    } else {
+                        y_ptr + ((t - 1) * hidden * 4) as u64
+                    },
+                    hidden,
+                    self.ctx.clone(),
+                )
+            });
+            let mut h_out = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    y_ptr + (t * hidden * 4) as u64,
+                    hidden,
+                    self.ctx.clone(),
+                )
+            });
+            let ew = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
+            let er = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+            let eb = if has_bias {
+                Some(Self::get_tensor(tensors, &self.weights, &node.input[3])?)
+            } else {
+                None
+            };
+            let bias_buf = eb.as_ref().map(|b| b.buf()).unwrap_or(ew.buf());
+            let (c_prev, c_next) = if t % 2 == 0 {
+                (&c_a, &mut c_b)
+            } else {
+                (&c_b, &mut c_a)
+            };
+            unsafe {
+                self.module.lstm_step(
+                    &self.stream,
+                    cfg,
+                    &x_t,
+                    ew.buf(),
+                    er.buf(),
+                    bias_buf,
+                    &h_prev,
+                    c_prev,
+                    input_size as u32,
+                    hidden as u32,
+                    if has_bias { 1 } else { 0 },
+                    &mut h_out,
+                    c_next,
+                )
+            }
+            .map_err(|e| anyhow!("lstm_step launch t={}: {:?}", t, e))?;
+        }
+
+        tensors.insert(&node.output[0], y, vec![seq, 1, batch, hidden]);
+        // Y_h and Y_c are the final states; emit them only if consumed.
+        if node.output.len() > 1 && !node.output[1].is_empty() {
+            let last = self.slice_tail(y_ptr, seq, hidden)?;
+            tensors.insert(&node.output[1], last, vec![1, batch, hidden]);
+        }
+        if node.output.len() > 2 && !node.output[2].is_empty() {
+            let final_c = if seq % 2 == 1 { &mut c_b } else { &mut c_a };
+            let copy = self.clone_buf(final_c)?;
+            tensors.insert(&node.output[2], copy, vec![1, batch, hidden]);
+        }
+        Ok(())
+    }
+
+    /// Copy the last `hidden` elements of an LSTM output sequence.
+    fn slice_tail(&self, y_ptr: u64, seq: usize, hidden: usize) -> Result<DeviceBuffer<f32>> {
+        let src = ManuallyDrop::new(unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(
+                y_ptr + ((seq - 1) * hidden * 4) as u64,
+                hidden,
+                self.ctx.clone(),
+            )
+        });
+        self.clone_buf(&src)
+    }
+
+    /// Device-to-device copy via the host; only used for the small LSTM state.
+    fn clone_buf(&self, src: &DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
+        let host = src
+            .to_host_vec(&self.stream)
+            .map_err(|e| anyhow!("lstm state d2h: {:?}", e))?;
+        DeviceBuffer::from_host(&self.stream, &host).map_err(|e| anyhow!("lstm state h2d: {:?}", e))
+    }
+
+    // =========================================================================
     // Slice — strided N-D gather
     // =========================================================================
     fn op_slice(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
@@ -3651,7 +3911,13 @@ impl OnnxExecutor {
             if attr.name == "value" {
                 if let Some(t) = &attr.t {
                     let data = tensor_to_f32(t).map_err(|e| anyhow!("Constant tensor: {}", e))?;
-                    let shape: Vec<usize> = if t.dims.is_empty() {
+                    let shape: Vec<usize> = if t.dims.is_empty() && data.len() == 1 {
+                        // A genuine rank-0 scalar. Giving it shape [1] instead
+                        // makes Gather keep the axis it should remove, which
+                        // turns `out[:, -1, :]` into a [1, 1, H] tensor and
+                        // breaks the matrix multiply that follows.
+                        Vec::new()
+                    } else if t.dims.is_empty() {
                         vec![data.len().max(1)]
                     } else {
                         t.dims.iter().map(|&d| d as usize).collect()
