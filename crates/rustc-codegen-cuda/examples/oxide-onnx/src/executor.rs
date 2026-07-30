@@ -54,6 +54,9 @@ pub struct OnnxExecutor {
     /// Weight matrices pre-packed as f16 pairs for the tensor-core GEMM, keyed
     /// by (device pointer, rows, k). See [`Self::packed_weights`].
     f16_weights: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
+    /// Whether this device has the Ampere tensor-core instructions the f16
+    /// GEMM path is built on. See [`Self::from_graph`].
+    tensor_cores: bool,
     /// Same, for weights that sit in the B operand — packed [n][ceil(k/2)].
     /// See [`Self::packed_weights_cols`].
     f16_weights_b: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
@@ -108,6 +111,26 @@ impl OnnxExecutor {
 
         let output_names = graph.output.iter().map(|vi| vi.name.clone()).collect();
 
+        // `mma.sync.aligned.m16n8k16` is Ampere and later. Without this check
+        // the engine is quietly sm_80-only: on anything older the f16 path
+        // would be selected and the kernel would fail to load. The f32
+        // register-tiled kernels cover every architecture the backend targets,
+        // so they are the fallback. OXIDE_F16=0 forces it for testing.
+        let tensor_cores = match ctx.compute_capability() {
+            Ok((major, _)) => major >= 8,
+            Err(e) => {
+                eprintln!(
+                    "[oxide_onnx] could not read compute capability ({:?}); \
+                     assuming no tensor cores",
+                    e
+                );
+                false
+            }
+        };
+        if !tensor_cores {
+            eprintln!("[oxide_onnx] device is pre-Ampere: using the f32 register-tiled GEMM path");
+        }
+
         Ok(Self {
             ctx,
             stream,
@@ -121,6 +144,7 @@ impl OnnxExecutor {
             buf_pool: RefCell::new(HashMap::new()),
             f16_weights: RefCell::new(HashMap::new()),
             f16_weights_b: RefCell::new(HashMap::new()),
+            tensor_cores,
         })
     }
 
@@ -585,6 +609,7 @@ impl OnnxExecutor {
         // than assumed harmless. OXIDE_F16=0 disables it.
         let f16_shape_ok = k >= 32
             && m * n >= 4096
+            && self.tensor_cores
             && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true);
         if use_splitk && a_static && f16_shape_ok {
             let kpairs = k.div_ceil(2);
@@ -1347,6 +1372,7 @@ impl OnnxExecutor {
             }
         } else if !is_depthwise
             && group == 1
+            && self.tensor_cores
             && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true)
             && col_rows_g >= 32
             && n_out * col_cols >= 4096
@@ -2315,7 +2341,15 @@ impl OnnxExecutor {
         // Attention runs the same small GEMM once per head. Done one launch at
         // a time it leaves the grid nearly empty and repeats the operand
         // packing per head; the batch rides in gridDim.z instead.
-        if batch > 1 && !fused_bias && !b_static && m >= 32 && n >= 32 && k >= 16 && k % 16 == 0 {
+        if batch > 1
+            && self.tensor_cores
+            && !fused_bias
+            && !b_static
+            && m >= 32
+            && n >= 32
+            && k >= 16
+            && k % 16 == 0
+        {
             let a_all = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(a_ptr, batch * m * k, self.ctx.clone())
             });
