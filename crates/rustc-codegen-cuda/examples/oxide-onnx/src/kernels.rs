@@ -3032,6 +3032,7 @@ pub mod gpu {
         // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
         static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
         static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut KTAB: SharedArray<u32, 256> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x();
         let warp = tid >> 5; // 0..8
@@ -3058,6 +3059,23 @@ pub mod gpu {
         let khw = kh * kw;
         let plane = h_in * w_in;
         let kk_t = (tid & 7) * 2;
+        // Tap lookup: krc -> (kr, kc), packed. Filled once, then the two
+        // divisions that decompose a tap index become one shared read. The
+        // remaining two — decomposing k into (channel, tap) — are replaced by
+        // an incremental update, since k advances by a fixed 16 per step.
+        let mut tap = 0u32;
+        while tap * 256 + tid < khw {
+            let idx = tap * 256 + tid;
+            unsafe {
+                KTAB[idx as usize] = ((idx / kw) << 16) | (idx % kw);
+            }
+            tap += 1;
+        }
+        thread::sync_threads();
+
+        let g_start = k_begin + kk_t;
+        let mut ci_c = g_start / khw;
+        let mut krc_c = g_start % khw;
         let gc_a = col0 + (tid >> 3);
         let gc_b = col0 + ((tid + 256) >> 3);
         let oh_a = gc_a / out_w;
@@ -3101,19 +3119,16 @@ pub mod gpu {
             // elements share the same k, so the tap they select is the same
             // for both and is now computed once per step instead of twice.
             let g0 = k0 + kk_t;
-            let (ci_lo, kr_lo, kc_lo) = if g0 < k_stop {
-                let krc = g0 % khw;
-                (g0 / khw, krc / kw, krc % kw)
-            } else {
-                (0u32, 0u32, 0u32)
-            };
             let g1 = g0 + 1;
-            let (ci_hi, kr_hi, kc_hi) = if g1 < k_stop {
-                let krc = g1 % khw;
-                (g1 / khw, krc / kw, krc % kw)
+            let packed_lo = unsafe { KTAB[krc_c as usize] };
+            let (ci_lo, kr_lo, kc_lo) = (ci_c, packed_lo >> 16, packed_lo & 0xffff);
+            let (ci_hi, krc_hi) = if krc_c + 1 >= khw {
+                (ci_c + 1, 0u32)
             } else {
-                (0u32, 0u32, 0u32)
+                (ci_c, krc_c + 1)
             };
+            let packed_hi = unsafe { KTAB[krc_hi as usize] };
+            let (kr_hi, kc_hi) = (packed_hi >> 16, packed_hi & 0xffff);
 
             let mut q2 = 0u32;
             #[unroll]
@@ -3167,6 +3182,13 @@ pub mod gpu {
                 t += 1;
             }
             thread::sync_threads();
+            // k advances by a constant, so the (channel, tap) split advances
+            // with it: no division needed after the first.
+            krc_c += 16;
+            while krc_c >= khw {
+                krc_c -= khw;
+                ci_c += 1;
+            }
             k0 += 16;
         }
 
