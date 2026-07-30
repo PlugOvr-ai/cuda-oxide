@@ -394,6 +394,7 @@ fn bench_kernels() -> Result<()> {
                     1.0,
                     &bias,
                     0,
+                    0,
                     &bias,
                     0,
                     0,
@@ -417,6 +418,7 @@ fn bench_kernels() -> Result<()> {
                     n as u32,
                     1.0,
                     &bias,
+                    0,
                     0,
                     &bias,
                     0,
@@ -512,6 +514,7 @@ fn bench_kernels() -> Result<()> {
                     n as u32,
                     1.0,
                     &bias,
+                    0,
                     0,
                     &bias,
                     0,
@@ -644,6 +647,7 @@ fn bench_kernels() -> Result<()> {
                     n as u32,
                     1.0,
                     &bias,
+                    0,
                     0,
                     &bias,
                     0,
@@ -1780,9 +1784,19 @@ fn run_bert(model_path: &str, model_name: &str) -> Result<()> {
                             .map(|(a, b)| (a - b).abs())
                             .fold(0.0f32, f32::max);
                         let rel = max_err / tv.iter().map(|v| v.abs()).fold(1e-9, f32::max);
+                        // A printed number nobody asserts on is not a test.
+                        // This comparison existed and read 3.4 (rel 0.5) for a
+                        // while without anything noticing, because BERT is the
+                        // only model with a fused per-column bias and nothing
+                        // failed when it was applied along the wrong axis.
+                        let ok = rel < 2e-2;
                         println!("  ┌─ '{}' {:?} vs ORT ───", name, shape);
                         println!("  │ max |oxide − ort|: {:.4e}  (rel {:.2e})", max_err, rel);
+                        println!("  │ MATCH: {}", ok);
                         println!("  └────────────────────");
+                        if !ok {
+                            println!("  !! {} output '{}' disagrees with ORT", model_name, name);
+                        }
                         off += n;
                     }
                 }

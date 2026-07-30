@@ -13,13 +13,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{AttributeProto, AttributeType, NodeProto, attr_f, attr_ints};
+use crate::model::{AttributeProto, AttributeType, NodeProto, attr_f, attr_i, attr_ints};
 
 /// Fused-activation codes written into the private `oxide_act` attribute and
 /// read back by the executor. Kept in sync with `kernels::gpu` ACT_* constants.
 pub const ACT_NONE: i64 = 0;
 pub const ACT_RELU: i64 = 1;
 pub const ACT_CLIP: i64 = 2;
+pub const ACT_GELU: i64 = 3;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OptStats {
@@ -37,6 +38,8 @@ pub struct OptStats {
     pub matmul_bias_fused: usize,
     /// Attention `Transpose` nodes folded into a MatMul's operand addressing.
     pub matmul_transpose_fused: usize,
+    /// GELU chains folded into the producing Gemm's epilogue.
+    pub gelu_fused: usize,
 }
 
 impl OptStats {
@@ -67,6 +70,7 @@ pub fn optimize(
     stats.residual_fused = fuse_residual_into_conv(nodes, graph_outputs);
     stats.matmul_bias_fused = fuse_bias_into_matmul(nodes, weights, graph_outputs);
     stats.matmul_transpose_fused = fuse_transpose_into_matmul(nodes, weights, graph_outputs);
+    stats.gelu_fused = fuse_gelu(nodes, weights, graph_outputs);
     stats
 }
 
@@ -768,6 +772,178 @@ fn fuse_activation_into(
         dead.insert(fuse.act_node);
     }
 
+    if !dead.is_empty() {
+        let mut idx = 0;
+        nodes.retain(|_| {
+            let keep = !dead.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+    fuses.len()
+}
+
+/// Resolve a name to a scalar constant, whether it is an initializer or the
+/// output of a `Constant` node.
+fn scalar_const(nodes: &[NodeProto], weights: &Weights, name: &str) -> Option<f32> {
+    if let Some((data, _)) = weights.get(name) {
+        return if data.len() == 1 { Some(data[0]) } else { None };
+    }
+    for n in nodes {
+        if n.op_type == "Constant" && n.output.first().map(|o| o.as_str()) == Some(name) {
+            for a in &n.attribute {
+                if a.name == "value" {
+                    if let Some(t) = &a.t {
+                        if let Ok(v) = crate::model::tensor_to_f32(t) {
+                            return if v.len() == 1 { Some(v[0]) } else { None };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fold the exact-GELU chain into the epilogue of the matrix multiply feeding it.
+///
+/// A transformer MLP writes GELU as five nodes:
+///
+///     Div(x, sqrt 2) -> Erf -> Add(_, 1) -> Mul(x, _) -> Mul(_, 0.5)
+///
+/// Each one reads and writes the whole 197x3072 activation, so the chain costs
+/// five round trips through DRAM to compute something the GEMM's epilogue is
+/// already holding in a register. ViT spends about half a millisecond there,
+/// spread across Div, Erf, Add and Mul, which is why none of them looked
+/// significant individually.
+///
+/// The producer is reached through an optional `Reshape`, which is metadata
+/// only; when one is present it inherits the chain's output name so the graph
+/// downstream is untouched.
+fn fuse_gelu(
+    nodes: &mut Vec<NodeProto>,
+    weights: &Weights,
+    graph_outputs: &HashSet<String>,
+) -> usize {
+    struct Fuse {
+        producer: usize,
+        rename: usize,
+        out_name: String,
+        dead: Vec<usize>,
+    }
+    let mut fuses: Vec<Fuse> = Vec::new();
+    {
+        let counts = consumer_counts(nodes);
+        let producer_of = producers(nodes);
+        let consumers = |name: &str| -> Vec<usize> {
+            nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.input.iter().any(|i| i == name))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let single = |name: &str| -> bool {
+            counts.get(name).copied().unwrap_or(0) == 1 && !graph_outputs.contains(name)
+        };
+        let mut claimed: HashSet<usize> = HashSet::new();
+
+        for (div_idx, div) in nodes.iter().enumerate() {
+            if div.op_type != "Div" || div.input.len() != 2 {
+                continue;
+            }
+            match scalar_const(nodes, weights, &div.input[1]) {
+                Some(v) if (v - std::f32::consts::SQRT_2).abs() < 1e-4 => {}
+                _ => continue,
+            }
+            let x = div.input[0].clone();
+            if !single(div.output[0].as_str()) {
+                continue;
+            }
+            // Div -> Erf
+            let erf_idx = match consumers(div.output[0].as_str()).as_slice() {
+                [i] if nodes[*i].op_type == "Erf" => *i,
+                _ => continue,
+            };
+            if !single(nodes[erf_idx].output[0].as_str()) {
+                continue;
+            }
+            // Erf -> Add(_, 1)
+            let add_idx = match consumers(nodes[erf_idx].output[0].as_str()).as_slice() {
+                [i] if nodes[*i].op_type == "Add" => *i,
+                _ => continue,
+            };
+            let add = &nodes[add_idx];
+            let one_ok = add
+                .input
+                .iter()
+                .any(|i| scalar_const(nodes, weights, i).is_some_and(|v| (v - 1.0).abs() < 1e-6));
+            if !one_ok || !single(add.output[0].as_str()) {
+                continue;
+            }
+            // Add -> Mul(x, _)
+            let mul_idx = match consumers(add.output[0].as_str()).as_slice() {
+                [i] if nodes[*i].op_type == "Mul" => *i,
+                _ => continue,
+            };
+            let mul = &nodes[mul_idx];
+            if !mul.input.iter().any(|i| *i == x) || !single(mul.output[0].as_str()) {
+                continue;
+            }
+            // Mul -> Mul(_, 0.5)
+            let half_idx = match consumers(mul.output[0].as_str()).as_slice() {
+                [i] if nodes[*i].op_type == "Mul" => *i,
+                _ => continue,
+            };
+            let half = &nodes[half_idx];
+            if !half
+                .input
+                .iter()
+                .any(|i| scalar_const(nodes, weights, i).is_some_and(|v| (v - 0.5).abs() < 1e-6))
+            {
+                continue;
+            }
+
+            // Walk back to the matrix multiply, through a Reshape if present.
+            let Some(&p0) = producer_of.get(x.as_str()) else {
+                continue;
+            };
+            let (prod_idx, rename_idx) = if nodes[p0].op_type == "Reshape" {
+                let Some(&p1) = producer_of.get(nodes[p0].input[0].as_str()) else {
+                    continue;
+                };
+                if !single(nodes[p0].input[0].as_str()) {
+                    continue;
+                }
+                (p1, p0)
+            } else {
+                (p0, p0)
+            };
+            let pt = nodes[prod_idx].op_type.as_str();
+            if pt != "Gemm" && pt != "MatMul" {
+                continue;
+            }
+            if claimed.contains(&prod_idx) || attr_i(&nodes[prod_idx], "oxide_act", 0) != 0 {
+                continue;
+            }
+            claimed.insert(prod_idx);
+            fuses.push(Fuse {
+                producer: prod_idx,
+                rename: rename_idx,
+                out_name: nodes[half_idx].output[0].clone(),
+                dead: vec![div_idx, erf_idx, add_idx, mul_idx, half_idx],
+            });
+        }
+    }
+
+    let mut dead: HashSet<usize> = HashSet::new();
+    for f in &fuses {
+        set_attr_i(&mut nodes[f.producer], "oxide_act", ACT_GELU);
+        nodes[f.rename].output[0] = f.out_name.clone();
+        for &d in &f.dead {
+            dead.insert(d);
+        }
+    }
     if !dead.is_empty() {
         let mut idx = 0;
         nodes.retain(|_| {

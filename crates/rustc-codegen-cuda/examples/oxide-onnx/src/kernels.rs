@@ -56,6 +56,12 @@ fn apply_act(v: f32, act: u32, lo: f32, hi: f32) -> f32 {
         } else {
             v
         }
+    } else if act == 3u32 {
+        // Exact GELU: x/2 * (1 + erf(x/sqrt(2))). A transformer's MLP spells
+        // this as five separate nodes, each a full round trip of the 197x3072
+        // activation through DRAM; here it costs a few instructions on a value
+        // the epilogue is already holding.
+        0.5f32 * v * (1.0f32 + gpu_erf(v * core::f32::consts::FRAC_1_SQRT_2))
     } else {
         v
     }
@@ -3456,6 +3462,12 @@ pub mod gpu {
         alpha: f32,
         bias: &[f32],
         has_bias: u32,
+        // Which axis the bias runs along. Convolution's bias is per output
+        // channel over a [channels][spatial] result, so it is indexed by row;
+        // a Gemm's is per output feature over [rows][features], so by column.
+        // Reading a column bias by row is silent and catastrophic — it was
+        // wrong on BERT by a relative half.
+        bias_per_col: u32,
         // Residual tensor added before the activation, for the skip connection
         // a ResNet block would otherwise spend a whole kernel and a full
         // round trip of the activation on.
@@ -3476,7 +3488,11 @@ pub mod gpu {
                 s += 1;
             }
             let b_val = if has_bias != 0u32 {
-                bias[(i / n) as usize]
+                if bias_per_col != 0u32 {
+                    bias[(i % n) as usize]
+                } else {
+                    bias[(i / n) as usize]
+                }
             } else {
                 0.0f32
             };

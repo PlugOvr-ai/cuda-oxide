@@ -587,6 +587,9 @@ impl OnnxExecutor {
         // and MatMul put them in B.
         a_static: bool,
         b_static: bool,
+        // True when `bias` is indexed by output column (Gemm, MatMul), false
+        // when by output row (convolution, whose result is [channels][spatial]).
+        bias_per_col: bool,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let choice = std::env::var("OXIDE_GEMM").unwrap_or_default();
@@ -654,6 +657,7 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    u32::from(bias_per_col),
                     bias_operand,
                     0, // no residual on this path
                     act,
@@ -728,6 +732,7 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    u32::from(bias_per_col),
                     bias_operand,
                     0, // no residual on this path
                     act,
@@ -848,6 +853,7 @@ impl OnnxExecutor {
                     alpha,
                     bias_operand,
                     u32::from(bias.is_some()),
+                    u32::from(bias_per_col),
                     bias_operand,
                     0, // no residual on this path
                     act,
@@ -930,6 +936,7 @@ impl OnnxExecutor {
             // Gemm/MatMul take an activation as `a`; their weights are in `b`.
             false,
             b_static,
+            true,
             c,
         )
     }
@@ -1495,6 +1502,7 @@ impl OnnxExecutor {
                         1.0,
                         &bias_view,
                         u32::from(has_bias),
+                        0, // conv bias is per output channel, indexed by row
                         &residual_view,
                         u32::from(has_residual),
                         act,
@@ -1711,6 +1719,7 @@ impl OnnxExecutor {
                         // Conv's `a` is the weight tensor: constant, cacheable.
                         // Its `b` is the im2col scratch, which is not.
                         true,
+                        false,
                         false,
                         &mut out_g,
                     )
@@ -2193,6 +2202,16 @@ impl OnnxExecutor {
             .alloc_buf(out_numel)
             .map_err(|e| anyhow!("gemm alloc: {}", e))?;
 
+        let (act, act_lo, act_hi) = Self::fused_act(node);
+        let has_c = node.input.len() > 2 && !node.input[2].is_empty();
+        // The epilogue applies bias then activation, which is the order the
+        // graph had; it can only stand in for the separate bias_add when beta
+        // is one.
+        let fuse_epilogue = !trans_b
+            && (act != graph_opt::ACT_NONE as u32)
+            && has_c
+            && (beta_val - 1.0).abs() < 1e-6;
+
         // C = alpha * A * op(B)  (beta=0, bias added separately below)
         let cfg = Self::sgemm_cfg(m, n);
         if trans_b {
@@ -2213,15 +2232,28 @@ impl OnnxExecutor {
             .map_err(|e| anyhow!("gemm sgemm_transb: {:?}", e))?;
         } else {
             let b_static = self.weights.contains_key(&node.input[1]);
-            self.dispatch_sgemm(
+            // A fused activation and a unit-beta bias both belong in the
+            // split-K reduction's epilogue; taking the plain path instead
+            // would silently drop the activation the graph rewrite removed.
+            let bias = if fuse_epilogue {
+                Some(Self::get_tensor(tensors, &self.weights, &node.input[2])?)
+            } else {
+                None
+            };
+            self.dispatch_sgemm_epilogue(
                 m,
                 n,
                 k_a,
                 alpha,
                 ea.buf(),
                 eb.buf(),
-                0.0,
+                bias.as_ref().map(|b| b.buf()),
+                act,
+                act_lo,
+                act_hi,
+                false,
                 b_static,
+                true,
                 &mut out_dev,
             )
             .map_err(|e| anyhow!("gemm sgemm: {}", e))?;
@@ -2230,7 +2262,7 @@ impl OnnxExecutor {
         drop(eb);
 
         // Add optional bias C: out[row, col] += beta * C[col]
-        if node.input.len() > 2 && !node.input[2].is_empty() {
+        if !fuse_epilogue && node.input.len() > 2 && !node.input[2].is_empty() {
             let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
             let c_len = eb.buf().len();
             if c_len > 0 && beta_val != 0.0 {
@@ -2337,12 +2369,16 @@ impl OnnxExecutor {
         // blocks — and repeats the operand packing per head. Folding the batch
         // into gridDim.z gives one launch with a grid `batch` times larger.
         let fused_bias = attr_i(node, "oxide_bias", 0) != 0 && node.input.len() > 2;
+        // The batched kernel has no epilogue, so a MatMul carrying a fused
+        // activation must take the per-item path that does.
+        let (mm_act, mm_lo, mm_hi) = Self::fused_act(node);
 
         // Attention runs the same small GEMM once per head. Done one launch at
         // a time it leaves the grid nearly empty and repeats the operand
         // packing per head; the batch rides in gridDim.z instead.
         if batch > 1
             && self.tensor_cores
+            && mm_act == graph_opt::ACT_NONE as u32
             && !fused_bias
             && !b_static
             && m >= 32
@@ -2426,11 +2462,12 @@ impl OnnxExecutor {
                 &a_g,
                 &b_g,
                 bias.as_ref().map(|b| b.buf()),
-                0,
-                0.0,
-                0.0,
+                mm_act,
+                mm_lo,
+                mm_hi,
                 false,
                 b_static,
+                true,
                 &mut c_g,
             )
             .map_err(|e| anyhow!("matmul sgemm bi={}: {}", bi, e))?;
