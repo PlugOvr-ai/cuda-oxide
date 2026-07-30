@@ -88,6 +88,40 @@ impl OnnxExecutor {
         // tensor.
         let graph_output_names: std::collections::HashSet<String> =
             graph.output.iter().map(|vi| vi.name.clone()).collect();
+        // `Constant` nodes hold load-time data, but re-running one per
+        // inference means a fresh cuMemAlloc, an H2D copy, and — because
+        // DeviceBuffer's drop is a synchronous cuMemFree — a device
+        // synchronisation when it is released. ShuffleNet-v2 has 32 of them
+        // and spent 0.2-0.3 ms of its 1.4 doing that. They are also what
+        // Reshape reads its target shape from, and a value that is not in
+        // `consts` costs a D2H stream sync to read.
+        //
+        // Promoting them to initializers before anything else runs fixes both:
+        // they become ordinary weights, and `op_constant` has nothing to do.
+        {
+            use crate::model::tensor_to_f32;
+            for node in &nodes {
+                if node.op_type != "Constant" || node.output.is_empty() {
+                    continue;
+                }
+                for attr in &node.attribute {
+                    if attr.name != "value" {
+                        continue;
+                    }
+                    let Some(t) = &attr.t else { continue };
+                    let Ok(data) = tensor_to_f32(t) else { continue };
+                    let shape: Vec<usize> = if t.dims.is_empty() && data.len() == 1 {
+                        Vec::new()
+                    } else if t.dims.is_empty() {
+                        vec![data.len().max(1)]
+                    } else {
+                        t.dims.iter().map(|&d| d as usize).collect()
+                    };
+                    host_weights.insert(node.output[0].clone(), (data, shape));
+                }
+            }
+        }
+
         let opt = graph_opt::optimize(&mut nodes, &mut host_weights, &graph_output_names);
         if opt.total() > 0 && std::env::var("OXIDE_QUIET").is_err() {
             eprintln!(
@@ -4431,6 +4465,10 @@ impl OnnxExecutor {
     fn op_constant(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
         use crate::model::tensor_to_f32;
         let out_name = node.output[0].clone();
+        // Hoisted to a weight at load time; nothing to do per inference.
+        if self.weights.contains_key(&out_name) {
+            return Ok(());
+        }
         for attr in &node.attribute {
             if attr.name == "value" {
                 if let Some(t) = &attr.t {
