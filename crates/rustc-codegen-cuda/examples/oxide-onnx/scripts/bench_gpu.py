@@ -25,7 +25,7 @@ import numpy as np
 import onnxruntime as ort
 
 
-def bench(model_path: str, warmup: int = 3, runs: int = 20):
+def bench(model_path: str, warmup: int = 3, runs: int = 20, shape=(1, 3, 224, 224)):
     opts = ort.SessionOptions()
     opts.log_severity_level = 3  # suppress INFO/WARNING noise
 
@@ -39,9 +39,9 @@ def bench(model_path: str, warmup: int = 3, runs: int = 20):
     provider_used = session.get_providers()[0]
 
     inp_name = session.get_inputs()[0].name
-    numel = 1 * 3 * 224 * 224
+    numel = int(np.prod(shape))
     # Same deterministic input as the Rust benchmark
-    input_data = (np.arange(numel, dtype=np.float32) / numel).reshape(1, 3, 224, 224)
+    input_data = (np.arange(numel, dtype=np.float32) / numel).reshape(shape)
 
     # Warm to a fixed wall time, not a fixed count: the GPU idles at 210 MHz
     # against a 2130 MHz boost clock, so a short benchmark otherwise measures
@@ -62,13 +62,18 @@ def bench(model_path: str, warmup: int = 3, runs: int = 20):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: bench_gpu.py <model.onnx> [warmup] [runs]", file=sys.stderr)
+        print("usage: bench_gpu.py <model.onnx> [warmup] [runs] [shape]", file=sys.stderr)
         sys.exit(1)
 
     model_path = sys.argv[1]
     warmup = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     runs = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    shape = (
+        tuple(int(x) for x in sys.argv[4].split(","))
+        if len(sys.argv) > 4
+        else (1, 3, 224, 224)
+    )
 
-    avg_ms, provider = bench(model_path, warmup, runs)
+    avg_ms, provider = bench(model_path, warmup, runs, shape)
     print(f"ort_cuda_ms={avg_ms:.4f}")
     print(f"provider={provider}", file=sys.stderr)

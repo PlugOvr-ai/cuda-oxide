@@ -129,6 +129,9 @@ fn main() -> Result<()> {
         if resnet_present {
             run_benchmarks(RESNET50_PATH, "ResNet50-v2")?;
         }
+        if mobilenet_present {
+            run_benchmarks(MOBILENET_PATH, "MobileNetV2")?;
+        }
         if vit_present {
             run_benchmarks(VIT_PATH, "ViT-B/16")?;
         }
@@ -1702,12 +1705,36 @@ fn run_generic_model(model_path: &str, model_name: &str, input_shape: &[usize]) 
     // discarded error turns that into an impossibly fast benchmark rather than
     // a failure. This reported 0.09 ms for a 5 GFLOP model — above the card's
     // peak — while the run was actually erroring out of memory.
-    let bench_ms = bench_fn(model_name, 3, 10, || {
+    let bench_ms = bench_fn(model_name, 3, 20, || {
         executor
             .run(&inputs)
             .expect("inference failed during benchmark");
     });
     let _ = bench_ms;
+
+    match bench_ort_gpu_shaped(model_path, 3, 20, input_shape) {
+        Ok(o) => println!(
+            "  {:<26} oxide {:>7.2} ms   ORT {:>7.2} ms   [{:.2}x]",
+            model_name,
+            bench_ms,
+            o,
+            bench_ms / o
+        ),
+        Err(e) => println!(
+            "  {:<26} oxide {:>7.2} ms   ORT skipped ({})",
+            model_name, bench_ms, e
+        ),
+    }
+    match bench_trtexec(model_path) {
+        Ok(t) => println!(
+            "  {:<26} {:>13}   TRT {:>7.2} ms   [{:.2}x]",
+            "",
+            "",
+            t,
+            bench_ms / t
+        ),
+        Err(e) => println!("  {:<26} {:>13}   TRT skipped ({})", "", "", e),
+    }
 
     print!("  [ort]   Running ORT CUDA reference... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -2206,6 +2233,16 @@ fn print_speed_row(model: &str, oxide_ms: f64, ort_ms: Option<f64>) {
 /// Run `scripts/bench_gpu.py` which benchmarks ONNX Runtime with the CUDA
 /// execution provider.  Returns the mean inference latency in milliseconds.
 fn bench_ort_gpu(model_path: &str, warmup: usize, runs: usize) -> Result<f64> {
+    bench_ort_gpu_shaped(model_path, warmup, runs, &[1, 3, 224, 224])
+}
+
+/// As [`bench_ort_gpu`], for models whose input is not a 224x224 RGB image.
+fn bench_ort_gpu_shaped(
+    model_path: &str,
+    warmup: usize,
+    runs: usize,
+    shape: &[usize],
+) -> Result<f64> {
     // The script is one directory above oxide-onnx/
     let script = std::path::Path::new(model_path)
         .parent() // models/
@@ -2220,11 +2257,17 @@ fn bench_ort_gpu(model_path: &str, warmup: usize, runs: usize) -> Result<f64> {
     print!("  Running ORT CUDA benchmark (python3 bench_gpu.py)... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
+    let shape_arg = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let output = std::process::Command::new("python3")
         .arg(&script)
         .arg(model_path)
         .arg(warmup.to_string())
         .arg(runs.to_string())
+        .arg(shape_arg)
         .output()
         .map_err(|e| anyhow::anyhow!("python3 exec: {}", e))?;
 
