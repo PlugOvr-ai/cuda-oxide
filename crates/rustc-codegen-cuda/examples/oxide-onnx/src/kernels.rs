@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::wgmma::{mma_sync_m16n8k8_f32_tf32, mma_sync_m16n8k16_f32_f16};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
@@ -101,9 +102,18 @@ fn f32_to_f16_bits(x: f32) -> u32 {
 
 /// Pack two f32 values as two f16 halves in one register, `lo` in the low 16
 /// bits — the order an `.f16x2` operand of `mma.sync` expects.
+///
+/// `cvt.rn.f16x2.f32` does this in one instruction with the same
+/// round-to-nearest-even semantics as the integer emulation below. The
+/// emulation exists because float intrinsics that route through libdevice
+/// would push the kernel into NVVM IR mode; this one is a generated PTX
+/// intrinsic, so it does not. It matters most in the convolution, which packs
+/// activations on the fly rather than at load time: the software form is about
+/// fifteen integer ops per value, four values per thread per K step, and the
+/// kernel's dominant stall is execution dependency.
 #[inline(always)]
 fn pack_f16x2(lo: f32, hi: f32) -> u32 {
-    f32_to_f16_bits(lo) | (f32_to_f16_bits(hi) << 16)
+    cvt_f16x2_f32(lo, hi)
 }
 
 /// Compute e^x via range reduction + degree-5 polynomial + 2^n scaling.
@@ -3042,6 +3052,19 @@ pub mod gpu {
 
         let mut acc = [[0.0f32; 4]; 4];
 
+        // Loop-invariant per-thread geometry: which output pixel each staged
+        // column belongs to, and which K offset this thread carries. 256 is a
+        // multiple of 8, so both staged elements share the same K offset.
+        let khw = kh * kw;
+        let plane = h_in * w_in;
+        let kk_t = (tid & 7) * 2;
+        let gc_a = col0 + (tid >> 3);
+        let gc_b = col0 + ((tid + 256) >> 3);
+        let oh_a = gc_a / out_w;
+        let ow_a = gc_a % out_w;
+        let oh_b = gc_b / out_w;
+        let ow_b = gc_b % out_w;
+
         let mut k0 = k_begin;
         while k0 < k_stop {
             // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
@@ -3068,40 +3091,52 @@ pub mod gpu {
             // never materialised. For a 3x3 convolution im2col inflates the
             // input ninefold, so reading X here saves both that write and the
             // inflated read the GEMM would otherwise do.
-            let khw = kh * kw;
-            let plane = h_in * w_in;
+            //
+            // The index arithmetic is what this kernel is actually limited by:
+            // occupancy is 62-80% and DRAM under 11%, but `wait` sits at 3.5
+            // with the tensor pipe at 9%, which is a dependency chain, not a
+            // memory or occupancy problem. Two things were recomputed for no
+            // reason. The output coordinates depend only on the thread, not on
+            // k, so they are hoisted out of the loop entirely; and both staged
+            // elements share the same k, so the tap they select is the same
+            // for both and is now computed once per step instead of twice.
+            let g0 = k0 + kk_t;
+            let (ci_lo, kr_lo, kc_lo) = if g0 < k_stop {
+                let krc = g0 % khw;
+                (g0 / khw, krc / kw, krc % kw)
+            } else {
+                (0u32, 0u32, 0u32)
+            };
+            let g1 = g0 + 1;
+            let (ci_hi, kr_hi, kc_hi) = if g1 < k_stop {
+                let krc = g1 % khw;
+                (g1 / khw, krc / kw, krc % kw)
+            } else {
+                (0u32, 0u32, 0u32)
+            };
+
             let mut q2 = 0u32;
             #[unroll]
             while q2 < 2 {
                 let e = tid + q2 * 256;
-                let cc = e >> 3;
-                let kk = (e & 7) * 2;
-                let gc = col0 + cc;
-                let g0 = k0 + kk;
-                // One register holds the two K-neighbours of a column, which
-                // for a convolution are two adjacent taps of the same patch.
-                let oh = gc / out_w;
-                let ow = gc % out_w;
+                let gc = if q2 == 0 { gc_a } else { gc_b };
+                let oh = if q2 == 0 { oh_a } else { oh_b };
+                let ow = if q2 == 0 { ow_a } else { ow_b };
                 let mut lo = 0.0f32;
                 let mut hi = 0.0f32;
                 if gc < n {
                     if g0 < k_stop {
-                        let ci = g0 / khw;
-                        let krc = g0 % khw;
-                        let ih = (oh * stride_h + (krc / kw) * dil_h) as i32 - pad_h as i32;
-                        let iw = (ow * stride_w + (krc % kw) * dil_w) as i32 - pad_w as i32;
+                        let ih = (oh * stride_h + kr_lo * dil_h) as i32 - pad_h as i32;
+                        let iw = (ow * stride_w + kc_lo * dil_w) as i32 - pad_w as i32;
                         if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
-                            lo = x[(ci * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                            lo = x[(ci_lo * plane + (ih as u32) * w_in + (iw as u32)) as usize];
                         }
                     }
-                    let g1 = g0 + 1;
                     if g1 < k_stop {
-                        let ci = g1 / khw;
-                        let krc = g1 % khw;
-                        let ih = (oh * stride_h + (krc / kw) * dil_h) as i32 - pad_h as i32;
-                        let iw = (ow * stride_w + (krc % kw) * dil_w) as i32 - pad_w as i32;
+                        let ih = (oh * stride_h + kr_hi * dil_h) as i32 - pad_h as i32;
+                        let iw = (ow * stride_w + kc_hi * dil_w) as i32 - pad_w as i32;
                         if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
-                            hi = x[(ci * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                            hi = x[(ci_hi * plane + (ih as u32) * w_in + (iw as u32)) as usize];
                         }
                     }
                 }
