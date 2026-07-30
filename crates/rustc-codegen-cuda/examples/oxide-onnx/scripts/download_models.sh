@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="$SCRIPT_DIR/../oxide-onnx/models"
+MODELS_DIR="$SCRIPT_DIR/../models"
 
 mkdir -p "$MODELS_DIR"
 
@@ -124,6 +124,49 @@ else
     echo "GPT-2 already present: $GPT2_FILE"
 fi
 
+# ---------------------------------------------------------------------------
+# Architectures beyond classification and transformers. These need no
+# pre-simplification: they are already static graphs.
+# ---------------------------------------------------------------------------
+ZOO="https://github.com/onnx/models/raw/main/validated"
+fetch() {
+    local file="$MODELS_DIR/$1"
+    local url="$ZOO/$2"
+    if [ ! -f "$file" ]; then
+        echo "Downloading $1..."
+        curl -fL "$url" -o "$file"
+        echo "  Saved to $file ($(du -sh "$file" | cut -f1))"
+    else
+        echo "$1 already present"
+    fi
+}
+
+fetch shufflenet-v2-10.onnx  "vision/classification/shufflenet/model/shufflenet-v2-10.onnx"
+fetch super-resolution-10.onnx \
+    "vision/super_resolution/sub_pixel_cnn_2016/model/super-resolution-10.onnx"
+fetch tinyyolov2-8.onnx \
+    "vision/object_detection_segmentation/tiny-yolov2/model/tinyyolov2-8.onnx"
+fetch fcn-resnet50-11.onnx \
+    "vision/object_detection_segmentation/fcn/model/fcn-resnet50-11.onnx"
+fetch mosaic-9.onnx "vision/style_transfer/fast_neural_style/model/mosaic-9.onnx"
+
+# ---------------------------------------------------------------------------
+# The recurrent model has no zoo equivalent worth using, so it is exported
+# here. Needs torch; skipped with a note if that is missing.
+# ---------------------------------------------------------------------------
+LSTM_FILE="$MODELS_DIR/lstm-seq.onnx"
+if [ ! -f "$LSTM_FILE" ]; then
+    if python3 -c "import torch" 2>/dev/null; then
+        echo "Exporting LSTM sequence classifier..."
+        python3 "$SCRIPT_DIR/export_lstm.py" "$LSTM_FILE"
+    else
+        echo "torch not installed; skipping lstm-seq.onnx (the LSTM model will be skipped)"
+    fi
+else
+    echo "LSTM already present: $LSTM_FILE"
+fi
+
 echo ""
 echo "Models ready in $MODELS_DIR"
-echo "Now run: cd oxide-onnx && cargo oxide run"
+echo "Now run, from the repository root:"
+echo "  cargo run --package cargo-oxide -- run oxide-onnx"
