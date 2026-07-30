@@ -21,8 +21,8 @@ use crate::graph_opt;
 use crate::kernels::gpu;
 use crate::model::{
     GraphProto, NodeProto, attr_f, attr_i, attr_ints, attr_string, conv2d_output_shape,
-    load_initializers, maxpool_output_shape, parse_dilations, parse_kernel_shape, parse_pads,
-    parse_pads_auto, parse_strides, topological_sort,
+    load_initializers, maxpool_output_shape, parse_dilations, parse_kernel_shape, parse_pads_auto,
+    parse_strides, topological_sort,
 };
 use crate::tensor::TensorMap;
 
@@ -675,9 +675,18 @@ impl OnnxExecutor {
             let kpairs = k.div_ceil(2);
             let b_packed = self.packed_weights_cols(b, k, n)?;
             let k_per_split = k.div_ceil(splits).next_multiple_of(16).max(16);
-            let mut partials = self
-                .alloc_buf(splits * m * n)
-                .map_err(|e| anyhow!("f16 partials alloc: {}", e))?;
+            // With one split there is nothing to reduce, and the reduction pass
+            // degenerates into a full extra read and write of the result just
+            // to apply the epilogue. The GEMM applies it and writes the
+            // finished values instead, so no partials buffer is needed.
+            let direct = splits == 1;
+            let partials_owned = if direct {
+                self.alloc_buf(1)
+            } else {
+                self.alloc_buf(splits * m * n)
+            }
+            .map_err(|e| anyhow!("f16 partials alloc: {}", e))?;
+            let mut partials = partials_owned;
             let gemm_cfg = LaunchConfig {
                 grid_dim: (
                     (n as u32).div_ceil(64).max(1),
@@ -705,6 +714,10 @@ impl OnnxExecutor {
                 )
             }
             .map_err(|e| anyhow!("f16 A pack: {:?}", e))?;
+            // With one split the reduction is a pure copy plus epilogue — a
+            // full extra read and write of the result. Let the GEMM apply the
+            // epilogue and write the finished values instead.
+            let bias_operand = bias.unwrap_or(a);
             unsafe {
                 self.module.sgemm_f16_tc_splitk_ab_w8(
                     &self.stream,
@@ -716,11 +729,20 @@ impl OnnxExecutor {
                     &a_packed,
                     &b_packed,
                     kpairs as u32,
-                    &mut partials,
+                    alpha,
+                    bias_operand,
+                    u32::from(bias.is_some()),
+                    act,
+                    lo,
+                    hi,
+                    u32::from(direct),
+                    if direct { c } else { &mut partials },
                 )
             }
             .map_err(|e| anyhow!("sgemm_f16_tc_ab_w8 launch: {:?}", e))?;
-            let bias_operand = bias.unwrap_or(a);
+            if direct {
+                return Ok(());
+            }
             unsafe {
                 self.module.reduce_splits(
                     &self.stream,
@@ -2709,7 +2731,7 @@ impl OnnxExecutor {
 
         // Output Y is [seq, num_dir, batch, hidden]; the state for step t
         // lives in its own slice of it.
-        let mut y = self
+        let y = self
             .alloc_buf(seq * hidden)
             .map_err(|e| anyhow!("lstm Y alloc: {}", e))?;
         let y_ptr = y.cu_deviceptr();

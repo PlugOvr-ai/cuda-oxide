@@ -76,6 +76,11 @@ fn apply_act(v: f32, act: u32, lo: f32, hi: f32) -> f32 {
 
 /// IEEE-754 binary32 → binary16 bit pattern, round-to-nearest-even.
 ///
+/// Superseded on device by `cvt.rn.f16x2.f32` (see `pack_f16x2`); kept because
+/// it documents the rounding the hardware instruction performs and needs no
+/// device to run.
+#[allow(dead_code)]
+///
 /// Integer ops only, for the same reason as `gpu_rsqrt`: float intrinsics map
 /// to libdevice, which pulls the kernel into NVVM IR mode and skips PTX
 /// embedding. Infinities and NaNs saturate to infinity; subnormal results
@@ -1635,6 +1640,17 @@ pub mod gpu {
         a_packed: &[u32],
         b_packed: &[u32],
         kpairs: u32,
+        // When the split factor is one there is nothing to reduce, and the
+        // reduction pass degenerates into a full extra read and write of the
+        // result to apply an epilogue. `direct` makes this kernel apply it
+        // instead and write the finished value.
+        alpha: f32,
+        bias: &[f32],
+        has_bias: u32,
+        act: u32,
+        act_lo: f32,
+        act_hi: f32,
+        direct: u32,
         mut partials: DisjointSlice<f32>,
     ) {
         static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
@@ -1779,15 +1795,35 @@ pub mod gpu {
                 if gr < m {
                     let base_o = plane + gr * n;
                     if gc < n {
+                        let v = acc[t][(half * 2) as usize];
+                        let v = if direct != 0 {
+                            let b = if has_bias != 0 {
+                                bias[gc as usize]
+                            } else {
+                                0.0f32
+                            };
+                            apply_act(alpha * v + b, act, act_lo, act_hi)
+                        } else {
+                            v
+                        };
                         unsafe {
-                            *partials.get_unchecked_mut((base_o + gc) as usize) =
-                                acc[t][(half * 2) as usize];
+                            *partials.get_unchecked_mut((base_o + gc) as usize) = v;
                         }
                     }
                     if gc + 1 < n {
+                        let v = acc[t][(half * 2 + 1) as usize];
+                        let v = if direct != 0 {
+                            let b = if has_bias != 0 {
+                                bias[(gc + 1) as usize]
+                            } else {
+                                0.0f32
+                            };
+                            apply_act(alpha * v + b, act, act_lo, act_hi)
+                        } else {
+                            v
+                        };
                         unsafe {
-                            *partials.get_unchecked_mut((base_o + gc + 1) as usize) =
-                                acc[t][(half * 2 + 1) as usize];
+                            *partials.get_unchecked_mut((base_o + gc + 1) as usize) = v;
                         }
                     }
                 }
@@ -2852,7 +2888,7 @@ pub mod gpu {
         a_packed: &[u32],
         kpairs: u32,
         x: &[f32],
-        c_in: u32,
+        _c_in: u32,
         h_in: u32,
         w_in: u32,
         kh: u32,
@@ -3021,7 +3057,7 @@ pub mod gpu {
         a_packed: &[u32],
         kpairs: u32,
         x: &[f32],
-        c_in: u32,
+        _c_in: u32,
         h_in: u32,
         w_in: u32,
         kh: u32,
@@ -3302,7 +3338,6 @@ pub mod gpu {
             }
             t += 1;
         }
-        let _ = c_in;
     }
 
     #[kernel]
@@ -3655,7 +3690,7 @@ pub mod gpu {
         x: &[f32],
         bias: &[f32],
         has_bias: u32,
-        c_in: u32,
+        _c_in: u32,
         h_in: u32,
         w_in: u32,
         kh: u32,
