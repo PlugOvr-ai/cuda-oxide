@@ -219,6 +219,27 @@ impl OnnxExecutor {
                 .synchronize()
                 .map_err(|e| anyhow!("sync: {:?}", e))?;
 
+            // Per-node, for comparing layer by layer against another engine's
+            // profile. The aggregate below hides which of thirteen 3x3
+            // convolutions is the expensive one.
+            if std::env::var("OXIDE_PROFILE_NODES").is_ok() {
+                let mut per: Vec<(f64, String, String)> = marks
+                    .iter()
+                    .map(|(idx, s, e)| {
+                        (
+                            s.elapsed_ms(*&e).unwrap_or(0.0) as f64,
+                            self.nodes[*idx].op_type.clone(),
+                            self.nodes[*idx].output.first().cloned().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                per.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                eprintln!("  ── OXIDE_PROFILE_NODES (per node, us) ──");
+                for (ms, op, name) in per.iter().take(24) {
+                    eprintln!("  {:>8.1} us  {:<22} {}", ms * 1000.0, op, name);
+                }
+            }
+
             let mut acc: BTreeMap<String, (f64, u32)> = BTreeMap::new();
             for (idx, start, end) in &marks {
                 let ms = start.elapsed_ms(end).unwrap_or(0.0) as f64;
@@ -926,6 +947,9 @@ impl OnnxExecutor {
         a: &DeviceBuffer<f32>,
         b: &DeviceBuffer<f32>,
         beta: f32,
+        // Which operand is a load-time constant, and so has a cacheable f16
+        // packing. Assuming neither is costs the tensor-core path entirely.
+        a_static: bool,
         b_static: bool,
         c: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
@@ -959,8 +983,7 @@ impl OnnxExecutor {
             graph_opt::ACT_NONE as u32,
             0.0,
             0.0,
-            // Gemm/MatMul take an activation as `a`; their weights are in `b`.
-            false,
+            a_static,
             b_static,
             true,
             c,
@@ -1381,6 +1404,12 @@ impl OnnxExecutor {
             .map_err(|e| anyhow!("conv depthwise: {:?}", e))?;
         } else if is_pointwise {
             let hw = h_in * w_in; // == out_h * out_w
+            // A 1x1 convolution is a GEMM whose A operand is the weights, and
+            // those are load-time constants — so the f16 packing is cacheable
+            // and the tensor-core path applies. It was being told otherwise,
+            // which sent every pointwise convolution in the network down the
+            // f32 register-tiled path. ResNet50 has twenty-five of them.
+            let w_static = self.weights.contains_key(&node.input[1]);
             let w_full = ManuallyDrop::new(unsafe {
                 DeviceBuffer::<f32>::from_raw_parts(w_ptr, n_out * c_in, self.ctx.clone())
             });
@@ -1400,8 +1429,10 @@ impl OnnxExecutor {
                     )
                 });
                 // C[n_out × hw] = W[n_out × c_in] · X_b[c_in × hw]
-                self.dispatch_sgemm(n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, false, &mut out_b)
-                    .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {}", b, e))?;
+                self.dispatch_sgemm(
+                    n_out, hw, c_in, 1.0, &w_full, &x_b, 0.0, w_static, false, &mut out_b,
+                )
+                .map_err(|e| anyhow!("conv 1x1 sgemm b={}: {}", b, e))?;
             }
         } else if !is_depthwise
             && group == 1
