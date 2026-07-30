@@ -2528,6 +2528,42 @@ impl OnnxExecutor {
             && has_c
             && (beta_val - 1.0).abs() < 1e-6;
 
+        // A single-row Gemm is a matrix-vector product; the tiled kernel
+        // wastes fifteen of its sixteen rows on it. The classifier head of
+        // every CNN here is exactly that shape.
+        if trans_b && m == 1 {
+            let bias_stub;
+            let bias_ref = if has_c {
+                bias_stub = Some(Self::get_tensor(tensors, &self.weights, &node.input[2])?);
+                bias_stub.as_ref().map(|e| e.buf()).unwrap()
+            } else {
+                ea.buf()
+            };
+            unsafe {
+                self.module.gemv_transb(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (n as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    eb.buf(),
+                    ea.buf(),
+                    bias_ref,
+                    u32::from(has_c),
+                    k_a as u32,
+                    alpha,
+                    if has_c { beta_val } else { 0.0 },
+                    &mut out_dev,
+                )
+            }
+            .map_err(|e| anyhow!("gemv_transb launch: {:?}", e))?;
+            drop(ea);
+            drop(eb);
+            tensors.insert(&out_name, out_dev, vec![m, n]);
+            return Ok(());
+        }
+
         // C = alpha * A * op(B)  (beta=0, bias added separately below)
         let cfg = Self::sgemm_cfg(m, n);
         if trans_b {

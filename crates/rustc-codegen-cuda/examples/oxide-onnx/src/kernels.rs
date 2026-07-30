@@ -2157,6 +2157,68 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // GEMV for a classifier head: y = alpha * W x + beta * bias, W row-major
+    // [n][k] — the layout a `Gemm` with transB=1 already has.
+    //
+    //   A 1x2048 by 2048x1000 product is a matrix-vector product, and running
+    //   it on the 16x16 tiled GEMM leaves fifteen of every sixteen rows idle:
+    //   ResNet50's classifier measured 102 us for 2M multiply-adds, 8x off the
+    //   memory-bound floor of reading the 8 MB weight matrix once.
+    //
+    //   One block per output, reducing over k in shared memory, which makes
+    //   the weight reads consecutive.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_transb(
+        w: &[f32],
+        x: &[f32],
+        bias: &[f32],
+        has_bias: u32,
+        k: u32,
+        alpha: f32,
+        beta: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let j = thread::blockIdx_x();
+        let tid = thread::threadIdx_x();
+        let base = j * k;
+
+        let mut acc = 0.0f32;
+        let mut i = tid;
+        while i < k {
+            acc += w[(base + i) as usize] * x[i as usize];
+            i += 256;
+        }
+        unsafe {
+            RED[tid as usize] = acc;
+        }
+        thread::sync_threads();
+        let mut step = 128u32;
+        while step > 0 {
+            if tid < step {
+                unsafe {
+                    RED[tid as usize] += RED[(tid + step) as usize];
+                }
+            }
+            thread::sync_threads();
+            step >>= 1;
+        }
+        if tid == 0 {
+            let b = if has_bias != 0 {
+                bias[j as usize]
+            } else {
+                0.0f32
+            };
+            unsafe {
+                *y.get_unchecked_mut(j as usize) = alpha * RED[0] + beta * b;
+            }
+        }
+    }
+
+    // =========================================================================
     // LeakyRelu: y = x for x >= 0, alpha*x otherwise.
     //   Detection backbones (Tiny-YOLOv2, the Darknet family) use this in
     //   place of Relu throughout.
