@@ -307,6 +307,44 @@ pub fn parse_pads(node: &NodeProto) -> (usize, usize) {
     }
 }
 
+/// Padding for a spatial op, honouring `auto_pad` when `pads` is absent.
+///
+/// Older exporters — Tiny-YOLOv2 among them — give no `pads` at all and say
+/// `auto_pad="SAME_UPPER"` instead, which asks for whatever padding keeps the
+/// output the same size as the input (for unit stride). Reading only `pads`
+/// silently produces valid-mode convolution: Tiny-YOLOv2's 416x416 input comes
+/// out 4x4 instead of 13x13, because every 3x3 convolution eats two pixels.
+///
+/// SAME padding can be odd, in which case ONNX puts the extra pixel at the end
+/// (SAME_UPPER) or the start (SAME_LOWER). The kernels here take one symmetric
+/// pad per axis, so the extra pixel is dropped; that is exact for odd kernels
+/// with unit stride, which is what these graphs use.
+pub fn parse_pads_auto(
+    node: &NodeProto,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+) -> (usize, usize) {
+    let explicit = attr_ints(node, "pads");
+    if explicit.len() >= 2 {
+        return (explicit[0] as usize, explicit[1] as usize);
+    }
+    let mode = attr_string(node, "auto_pad");
+    if mode == "SAME_UPPER" || mode == "SAME_LOWER" {
+        let need = |input: usize, k: usize, stride: usize| -> usize {
+            let out = input.div_ceil(stride);
+            let total = (out.saturating_sub(1) * stride + k).saturating_sub(input);
+            total / 2
+        };
+        (need(in_h, kh, stride_h), need(in_w, kw, stride_w))
+    } else {
+        (0, 0)
+    }
+}
+
 /// Extract `strides` attribute as `[stride_h, stride_w]`.
 pub fn parse_strides(node: &NodeProto) -> (usize, usize) {
     let s = attr_ints(node, "strides");

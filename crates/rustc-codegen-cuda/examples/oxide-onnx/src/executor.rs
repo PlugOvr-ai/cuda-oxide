@@ -20,9 +20,9 @@ use std::mem::ManuallyDrop;
 use crate::graph_opt;
 use crate::kernels::gpu;
 use crate::model::{
-    GraphProto, NodeProto, attr_f, attr_i, attr_ints, conv2d_output_shape, load_initializers,
-    maxpool_output_shape, parse_dilations, parse_kernel_shape, parse_pads, parse_strides,
-    topological_sort,
+    GraphProto, NodeProto, attr_f, attr_i, attr_ints, attr_string, conv2d_output_shape,
+    load_initializers, maxpool_output_shape, parse_dilations, parse_kernel_shape, parse_pads,
+    parse_pads_auto, parse_strides, topological_sort,
 };
 use crate::tensor::TensorMap;
 
@@ -333,6 +333,13 @@ impl OnnxExecutor {
     fn dispatch_node(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
         match node.op_type.as_str() {
             "Relu" => self.op_relu(node, tensors),
+            "LeakyRelu" => self.op_leaky_relu(node, tensors),
+            "Floor" => self.op_floor(node, tensors),
+            "Slice" => self.op_slice(node, tensors),
+            "ReduceMean" => self.op_reduce_mean(node, tensors),
+            "InstanceNormalization" => self.op_instance_norm(node, tensors),
+            "Resize" | "Upsample" => self.op_resize(node, tensors),
+            "Pad" => self.op_pad(node, tensors),
             "Clip" => self.op_clip(node, tensors),
             "Add" => self.op_add(node, tensors),
             "Mul" => self.op_mul(node, tensors),
@@ -1210,12 +1217,16 @@ impl OnnxExecutor {
         let group = attr_i(node, "group", 1) as usize;
         let c_out_per_group = n_out / group;
 
-        let (pad_h, pad_w) = parse_pads(node);
         let (stride_h, stride_w) = parse_strides(node);
+        let (pad_h, pad_w) = parse_pads_auto(node, h_in, w_in, kh, kw, stride_h, stride_w);
         let (dil_h, dil_w) = parse_dilations(node);
-        let (out_h, out_w) = conv2d_output_shape(
-            h_in, w_in, kh, kw, pad_h, pad_w, stride_h, stride_w, dil_h, dil_w,
-        );
+        let (out_h, out_w) = if attr_string(node, "auto_pad").starts_with("SAME") {
+            (h_in.div_ceil(stride_h), w_in.div_ceil(stride_w))
+        } else {
+            conv2d_output_shape(
+                h_in, w_in, kh, kw, pad_h, pad_w, stride_h, stride_w, dil_h, dil_w,
+            )
+        };
 
         let col_rows_g = c_in_per_group * kh * kw;
         let col_cols = out_h * out_w;
@@ -2006,14 +2017,23 @@ impl OnnxExecutor {
     fn op_maxpool(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
         let out_name = node.output[0].clone();
         let (kh, kw) = parse_kernel_shape(node);
-        let (pad_h, pad_w) = parse_pads(node);
         let (stride_h, stride_w) = parse_strides(node);
 
         let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
         let x_shape = ex.shape().clone();
         let (n, c, in_h, in_w) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
-        let (out_h, out_w) =
-            maxpool_output_shape(in_h, in_w, kh, kw, pad_h, pad_w, stride_h, stride_w);
+        let (pad_h, pad_w) = parse_pads_auto(node, in_h, in_w, kh, kw, stride_h, stride_w);
+        // SAME asks for ceil(in/stride) regardless of how the padding splits.
+        // With an even kernel the split is uneven — Tiny-YOLOv2's final 2x2
+        // stride-1 pool pads only at the end — and the symmetric pad above
+        // would otherwise lose the last row and column. The kernel treats
+        // out-of-range window reads as -inf, so only the size needs fixing.
+        let same = attr_string(node, "auto_pad").starts_with("SAME");
+        let (out_h, out_w) = if same {
+            (in_h.div_ceil(stride_h), in_w.div_ceil(stride_w))
+        } else {
+            maxpool_output_shape(in_h, in_w, kh, kw, pad_h, pad_w, stride_h, stride_w)
+        };
         let out_numel = n * c * out_h * out_w;
 
         let mut out = self
@@ -2448,6 +2468,469 @@ impl OnnxExecutor {
     }
 
     // =========================================================================
+    // Slice — strided N-D gather
+    // =========================================================================
+    fn op_slice(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let x_shape = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            ex.shape().clone()
+        };
+        let ndim = x_shape.len();
+
+        // opset < 10 carries starts/ends/axes as attributes; later opsets pass
+        // them as inputs, with optional axes and steps.
+        let read = |exec: &Self, tensors: &mut TensorMap, i: usize| -> Vec<i64> {
+            if node.input.len() > i && !node.input[i].is_empty() {
+                exec.host_vals(tensors, &node.input[i])
+                    .map(|v| v.into_iter().map(|f| f as i64).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        let mut starts = attr_ints(node, "starts");
+        let mut ends = attr_ints(node, "ends");
+        let mut axes = attr_ints(node, "axes");
+        let mut steps: Vec<i64> = Vec::new();
+        if starts.is_empty() {
+            starts = read(self, tensors, 1);
+            ends = read(self, tensors, 2);
+            axes = read(self, tensors, 3);
+            steps = read(self, tensors, 4);
+        }
+        if starts.is_empty() || starts.len() != ends.len() {
+            return Err(anyhow!("Slice: bad starts/ends {:?}/{:?}", starts, ends));
+        }
+        if axes.is_empty() {
+            axes = (0..starts.len() as i64).collect();
+        }
+        if steps.is_empty() {
+            steps = vec![1; starts.len()];
+        }
+
+        // Start from the identity slice and apply each axis that is named.
+        let mut sel_start = vec![0i64; ndim];
+        let mut sel_step = vec![1i64; ndim];
+        let mut out_shape = x_shape.clone();
+        for (i, &ax_raw) in axes.iter().enumerate() {
+            let ax = if ax_raw < 0 {
+                (ax_raw + ndim as i64) as usize
+            } else {
+                ax_raw as usize
+            };
+            if ax >= ndim {
+                return Err(anyhow!("Slice: axis {} out of range", ax));
+            }
+            let dim = x_shape[ax] as i64;
+            let clamp = |v: i64| -> i64 {
+                let v = if v < 0 { v + dim } else { v };
+                v.clamp(0, dim)
+            };
+            let st = clamp(starts[i]);
+            let en = clamp(ends[i]);
+            let step = if steps[i] == 0 { 1 } else { steps[i] };
+            if step < 0 {
+                return Err(anyhow!("Slice: negative step not supported"));
+            }
+            sel_start[ax] = st;
+            sel_step[ax] = step;
+            out_shape[ax] = ((en - st).max(0) as usize).div_ceil(step as usize);
+        }
+
+        let out_numel: usize = out_shape.iter().product();
+        let in_strides = Self::row_major(&x_shape);
+        let out_strides = Self::row_major(&out_shape);
+        let osh = self.meta_buf(&Self::to_f32(&out_shape))?;
+        let ost = self.meta_buf(&Self::to_f32(&out_strides))?;
+        let ist = self.meta_buf(&Self::to_f32(&in_strides))?;
+        let stb = self.meta_buf(&sel_start.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+        let spb = self.meta_buf(&sel_step.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let mut out = self
+            .alloc_buf(out_numel.max(1))
+            .map_err(|e| anyhow!("slice alloc: {}", e))?;
+        unsafe {
+            self.module.slice_nd(
+                &self.stream,
+                LaunchConfig::for_num_elems(out_numel as u32),
+                ex.buf(),
+                &osh,
+                &ost,
+                &ist,
+                &stb,
+                &spb,
+                ndim as u32,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("slice launch: {:?}", e))?;
+        drop(ex);
+        tensors.insert(&out_name, out, out_shape);
+        Ok(())
+    }
+
+    /// Elementwise binary op with full NumPy broadcasting.
+    /// `op`: 0 add, 1 sub, 2 mul, 3 div.
+    fn binary_broadcast(&self, node: &NodeProto, tensors: &mut TensorMap, op: u32) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let eb = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
+        let a_shape = ea.shape().clone();
+        let b_shape = eb.shape().clone();
+        let (out_shape, out_str, a_str, b_str, ndim) = Self::broadcast_meta(&a_shape, &b_shape)?;
+        let out_numel: usize = out_shape.iter().product();
+        let osh = self.meta_buf(&Self::to_f32(&out_shape))?;
+        let ost = self.meta_buf(&Self::to_f32(&out_str))?;
+        let ast = self.meta_buf(&Self::to_f32(&a_str))?;
+        let bst = self.meta_buf(&Self::to_f32(&b_str))?;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("binary bcast alloc: {}", e))?;
+        unsafe {
+            self.module.binary_bcast(
+                &self.stream,
+                LaunchConfig::for_num_elems(out_numel as u32),
+                ea.buf(),
+                eb.buf(),
+                &osh,
+                &ost,
+                &ast,
+                &bst,
+                ndim as u32,
+                op,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("binary_bcast launch: {:?}", e))?;
+        drop(ea);
+        drop(eb);
+        tensors.insert(&out_name, out, out_shape);
+        Ok(())
+    }
+
+    // =========================================================================
+    // LeakyRelu / Floor — elementwise
+    // =========================================================================
+    fn op_leaky_relu(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let alpha = attr_f(node, "alpha", 0.01);
+        let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let numel = ea.buf().len();
+        let shape = ea.shape().clone();
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("leaky_relu alloc: {}", e))?;
+        unsafe {
+            self.module.leaky_relu(
+                &self.stream,
+                LaunchConfig::for_num_elems(numel as u32),
+                ea.buf(),
+                alpha,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("leaky_relu launch: {:?}", e))?;
+        drop(ea);
+        tensors.insert(&out_name, out, shape);
+        Ok(())
+    }
+
+    fn op_floor(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let ea = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let numel = ea.buf().len();
+        let shape = ea.shape().clone();
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("floor alloc: {}", e))?;
+        unsafe {
+            self.module.floor_fwd(
+                &self.stream,
+                LaunchConfig::for_num_elems(numel as u32),
+                ea.buf(),
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("floor launch: {:?}", e))?;
+        drop(ea);
+        tensors.insert(&out_name, out, shape);
+        Ok(())
+    }
+
+    // =========================================================================
+    // ReduceMean over trailing axes
+    // =========================================================================
+    fn op_reduce_mean(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let keepdims = attr_i(node, "keepdims", 1) != 0;
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let x_shape = ex.shape().clone();
+        let ndim = x_shape.len() as i64;
+
+        // Axes arrive as an attribute in opset < 18 and as an input after.
+        let mut axes: Vec<i64> = attr_ints(node, "axes");
+        if axes.is_empty() && node.input.len() > 1 && !node.input[1].is_empty() {
+            drop(ex);
+            if let Ok(v) = self.host_vals(tensors, &node.input[1]) {
+                axes = v.into_iter().map(|f| f as i64).collect();
+            }
+        }
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        if axes.is_empty() {
+            axes = (0..ndim).collect();
+        }
+        let mut norm: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                if a < 0 {
+                    (a + ndim) as usize
+                } else {
+                    a as usize
+                }
+            })
+            .collect();
+        norm.sort_unstable();
+
+        // The kernel averages a contiguous run, which covers the reductions
+        // these graphs actually use: a suffix of the axes (global pooling and
+        // the mean before a classifier head).
+        let contiguous_suffix = norm
+            .iter()
+            .enumerate()
+            .all(|(i, &a)| a == x_shape.len() - norm.len() + i);
+        if !contiguous_suffix {
+            return Err(anyhow!(
+                "ReduceMean over non-trailing axes {:?} of shape {:?} not supported",
+                norm,
+                x_shape
+            ));
+        }
+        let inner: usize = norm.iter().map(|&a| x_shape[a]).product();
+        let outer: usize = ex.buf().len() / inner.max(1);
+
+        let mut out_shape: Vec<usize> = x_shape.clone();
+        if keepdims {
+            for &a in &norm {
+                out_shape[a] = 1;
+            }
+        } else {
+            for &a in norm.iter().rev() {
+                out_shape.remove(a);
+            }
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+        }
+
+        let mut out = self
+            .alloc_buf(outer)
+            .map_err(|e| anyhow!("reduce_mean alloc: {}", e))?;
+        unsafe {
+            self.module.reduce_mean_inner(
+                &self.stream,
+                LaunchConfig::for_num_elems(outer as u32),
+                ex.buf(),
+                inner as u32,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("reduce_mean launch: {:?}", e))?;
+        drop(ex);
+        tensors.insert(&out_name, out, out_shape);
+        Ok(())
+    }
+
+    // =========================================================================
+    // InstanceNormalization
+    // =========================================================================
+    fn op_instance_norm(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let eps = attr_f(node, "epsilon", 1e-5);
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let x_shape = ex.shape().clone();
+        if x_shape.len() < 3 {
+            return Err(anyhow!(
+                "InstanceNormalization expects NCHW, got {:?}",
+                x_shape
+            ));
+        }
+        let (n, c) = (x_shape[0], x_shape[1]);
+        let hw: usize = x_shape[2..].iter().product();
+        let numel = ex.buf().len();
+        let escale = Self::get_tensor(tensors, &self.weights, &node.input[1])?;
+        let ebias = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+
+        let mut out = self
+            .alloc_buf(numel)
+            .map_err(|e| anyhow!("instance_norm alloc: {}", e))?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n * c) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.module.instance_norm(
+                &self.stream,
+                cfg,
+                ex.buf(),
+                escale.buf(),
+                ebias.buf(),
+                c as u32,
+                hw as u32,
+                eps,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("instance_norm launch: {:?}", e))?;
+        drop(ex);
+        drop(escale);
+        drop(ebias);
+        tensors.insert(&out_name, out, x_shape);
+        Ok(())
+    }
+
+    // =========================================================================
+    // Resize / Upsample — nearest and bilinear, spatial axes only
+    // =========================================================================
+    fn op_resize(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let mode_s = attr_string(node, "mode");
+        let mode: u32 = if mode_s.is_empty() || mode_s == "nearest" {
+            0
+        } else {
+            1
+        };
+
+        let x_shape = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            ex.shape().clone()
+        };
+        if x_shape.len() != 4 {
+            return Err(anyhow!("Resize expects NCHW, got {:?}", x_shape));
+        }
+        let (n, c, in_h, in_w) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+
+        // Target geometry comes either from `sizes` or from `scales`, and
+        // which input holds them moved between opsets; take whichever is
+        // present and non-empty, preferring an explicit size.
+        let mut out_h = 0usize;
+        let mut out_w = 0usize;
+        for idx in (1..node.input.len()).rev() {
+            if node.input[idx].is_empty() {
+                continue;
+            }
+            let Ok(v) = self.host_vals(tensors, &node.input[idx]) else {
+                continue;
+            };
+            if v.len() < 4 {
+                continue;
+            }
+            // sizes are absolute and integral; scales are multipliers.
+            let looks_like_size = v[2] > 8.0 && v[2].fract() == 0.0 && v[3].fract() == 0.0;
+            if looks_like_size {
+                out_h = v[2] as usize;
+                out_w = v[3] as usize;
+            } else {
+                out_h = (in_h as f32 * v[2]).round() as usize;
+                out_w = (in_w as f32 * v[3]).round() as usize;
+            }
+            if out_h > 0 && out_w > 0 {
+                break;
+            }
+        }
+        if out_h == 0 || out_w == 0 {
+            return Err(anyhow!("Resize: no usable scales or sizes input"));
+        }
+
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let out_numel = n * c * out_h * out_w;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("resize alloc: {}", e))?;
+        unsafe {
+            self.module.resize2d(
+                &self.stream,
+                LaunchConfig::for_num_elems(out_numel as u32),
+                ex.buf(),
+                in_h as u32,
+                in_w as u32,
+                out_h as u32,
+                out_w as u32,
+                mode,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("resize launch: {:?}", e))?;
+        drop(ex);
+        tensors.insert(&out_name, out, vec![n, c, out_h, out_w]);
+        Ok(())
+    }
+
+    // =========================================================================
+    // Pad — spatial, constant or reflect
+    // =========================================================================
+    fn op_pad(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
+        let out_name = node.output[0].clone();
+        let mode_s = attr_string(node, "mode");
+        let mode: u32 = if mode_s == "reflect" { 1 } else { 0 };
+
+        let x_shape = {
+            let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+            ex.shape().clone()
+        };
+        if x_shape.len() != 4 {
+            return Err(anyhow!("Pad expects NCHW, got {:?}", x_shape));
+        }
+        let (n, c, in_h, in_w) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+
+        // opset < 11 puts pads in an attribute, later ones in input 1.
+        let mut pads: Vec<i64> = attr_ints(node, "pads");
+        if pads.is_empty() && node.input.len() > 1 && !node.input[1].is_empty() {
+            if let Ok(v) = self.host_vals(tensors, &node.input[1]) {
+                pads = v.into_iter().map(|f| f as i64).collect();
+            }
+        }
+        if pads.len() < 8 {
+            return Err(anyhow!("Pad: expected 8 pad values, got {:?}", pads));
+        }
+        let value = attr_f(node, "value", 0.0);
+        let (pt, pl) = (pads[2].max(0) as usize, pads[3].max(0) as usize);
+        let (pb, pr) = (pads[6].max(0) as usize, pads[7].max(0) as usize);
+        if pads[0] != 0 || pads[1] != 0 || pads[4] != 0 || pads[5] != 0 {
+            return Err(anyhow!("Pad on batch or channel axis not supported"));
+        }
+        let (out_h, out_w) = (in_h + pt + pb, in_w + pl + pr);
+
+        let ex = Self::get_tensor(tensors, &self.weights, &node.input[0])?;
+        let out_numel = n * c * out_h * out_w;
+        let mut out = self
+            .alloc_buf(out_numel)
+            .map_err(|e| anyhow!("pad alloc: {}", e))?;
+        unsafe {
+            self.module.pad2d(
+                &self.stream,
+                LaunchConfig::for_num_elems(out_numel as u32),
+                ex.buf(),
+                in_h as u32,
+                in_w as u32,
+                out_h as u32,
+                out_w as u32,
+                pt as u32,
+                pl as u32,
+                mode,
+                value,
+                &mut out,
+            )
+        }
+        .map_err(|e| anyhow!("pad launch: {:?}", e))?;
+        drop(ex);
+        tensors.insert(&out_name, out, vec![n, c, out_h, out_w]);
+        Ok(())
+    }
+
+    // =========================================================================
     // Softmax
     // =========================================================================
     fn op_softmax(&self, node: &NodeProto, tensors: &mut TensorMap) -> Result<()> {
@@ -2745,11 +3228,12 @@ impl OnnxExecutor {
             tensors.insert(&out_name, out, shape);
             return Ok(());
         }
-        Err(anyhow!(
-            "Div: only tensor÷scalar supported (na={} nb={})",
-            na,
-            nb
-        ))
+        // Anything else — including a tensor divided by a broadcast tensor,
+        // which is how style-transfer graphs normalise by a computed size —
+        // goes through the general broadcasting path.
+        drop(ea);
+        drop(eb);
+        self.binary_broadcast(node, tensors, 3)
     }
 
     // =========================================================================

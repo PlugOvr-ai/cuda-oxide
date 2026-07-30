@@ -1899,6 +1899,343 @@ pub mod gpu {
     }
 
     // =========================================================================
+    // Broadcasting elementwise binary op.
+    //
+    //   `op`: 0 add, 1 sub, 2 mul, 3 div. Only Add had a broadcasting path,
+    //   which meant a graph dividing by a broadcast tensor — style transfer
+    //   normalising by a computed size — simply failed. One kernel covers all
+    //   four rather than four near-identical ones.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn binary_bcast(
+        a: &[f32],
+        b: &[f32],
+        out_shape: &[f32],
+        out_strides: &[f32],
+        a_strides: &[f32],
+        b_strides: &[f32],
+        ndim: u32,
+        op: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            let nd = ndim as usize;
+            let mut ao = 0usize;
+            let mut bo = 0usize;
+            let mut d = 0usize;
+            while d < nd {
+                let os = out_strides[d] as usize;
+                let osz = out_shape[d] as usize;
+                let coord = (lin / os) % osz;
+                ao += coord * (a_strides[d] as usize);
+                bo += coord * (b_strides[d] as usize);
+                d += 1;
+            }
+            let va = a[ao];
+            let vb = b[bo];
+            *o = if op == 0 {
+                va + vb
+            } else if op == 1 {
+                va - vb
+            } else if op == 2 {
+                va * vb
+            } else {
+                va / vb
+            };
+        }
+    }
+
+    // =========================================================================
+    // Strided N-D slice: gather `y` from `x` given per-axis start and step.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn slice_nd(
+        x: &[f32],
+        out_shape: &[f32],
+        out_strides: &[f32],
+        in_strides: &[f32],
+        starts: &[f32],
+        steps: &[f32],
+        ndim: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            let nd = ndim as usize;
+            let mut off = 0i64;
+            let mut d = 0usize;
+            while d < nd {
+                let os = out_strides[d] as usize;
+                let osz = out_shape[d] as usize;
+                let coord = ((lin / os) % osz) as i64;
+                off += (starts[d] as i64 + coord * (steps[d] as i64)) * (in_strides[d] as i64);
+                d += 1;
+            }
+            *o = x[off as usize];
+        }
+    }
+
+    // =========================================================================
+    // LeakyRelu: y = x for x >= 0, alpha*x otherwise.
+    //   Detection backbones (Tiny-YOLOv2, the Darknet family) use this in
+    //   place of Relu throughout.
+    // =========================================================================
+    #[kernel]
+    pub fn leaky_relu(a: &[f32], alpha: f32, mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            let v = a[i];
+            *o = if v >= 0.0f32 { v } else { alpha * v };
+        }
+    }
+
+    // =========================================================================
+    // Floor.
+    // =========================================================================
+    #[kernel]
+    pub fn floor_fwd(a: &[f32], mut c: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = c.get_mut(idx) {
+            let v = a[i];
+            // Truncation rounds toward zero, so negatives need a nudge; this
+            // avoids pulling in libdevice, which would switch the backend to
+            // NVVM IR mode and skip PTX embedding.
+            let t = v as i64 as f32;
+            *o = if t > v { t - 1.0f32 } else { t };
+        }
+    }
+
+    // =========================================================================
+    // Mean over a contiguous run of `inner` elements, for each of `outer`.
+    //   ReduceMean over trailing axes reduces to exactly this after the shape
+    //   bookkeeping is done on the host.
+    // =========================================================================
+    #[kernel]
+    pub fn reduce_mean_inner(x: &[f32], inner: u32, mut y: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        if let Some(o) = y.get_mut(idx) {
+            let base = lin * inner;
+            let mut acc = 0.0f32;
+            let mut i = 0u32;
+            while i < inner {
+                acc += x[(base + i) as usize];
+                i += 1;
+            }
+            *o = acc / inner as f32;
+        }
+    }
+
+    // =========================================================================
+    // InstanceNormalization: normalise each (n, c) plane by its own mean and
+    // variance, then apply the per-channel affine.
+    //
+    //   Style-transfer networks use this instead of BatchNorm, and unlike
+    //   BatchNorm it cannot be folded into the convolution weights, because
+    //   the statistics depend on the image rather than on the training set.
+    //   One block per plane, reduced in shared memory.
+    // =========================================================================
+    #[kernel]
+    pub fn instance_norm(
+        x: &[f32],
+        scale: &[f32],
+        bias: &[f32],
+        channels: u32,
+        hw: u32,
+        eps: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let plane = thread::blockIdx_x();
+        let tid = thread::threadIdx_x();
+        let base = plane * hw;
+
+        let mut sum = 0.0f32;
+        let mut i = tid;
+        while i < hw {
+            sum += x[(base + i) as usize];
+            i += 256;
+        }
+        unsafe {
+            RED[tid as usize] = sum;
+        }
+        thread::sync_threads();
+        let mut step = 128u32;
+        while step > 0 {
+            if tid < step {
+                unsafe {
+                    RED[tid as usize] += RED[(tid + step) as usize];
+                }
+            }
+            thread::sync_threads();
+            step >>= 1;
+        }
+        let mean = unsafe { RED[0] } / hw as f32;
+        thread::sync_threads();
+
+        let mut vs = 0.0f32;
+        let mut j = tid;
+        while j < hw {
+            let d = x[(base + j) as usize] - mean;
+            vs += d * d;
+            j += 256;
+        }
+        unsafe {
+            RED[tid as usize] = vs;
+        }
+        thread::sync_threads();
+        let mut step2 = 128u32;
+        while step2 > 0 {
+            if tid < step2 {
+                unsafe {
+                    RED[tid as usize] += RED[(tid + step2) as usize];
+                }
+            }
+            thread::sync_threads();
+            step2 >>= 1;
+        }
+        let var = unsafe { RED[0] } / hw as f32;
+        let inv = gpu_rsqrt(var + eps);
+
+        let c = plane % channels;
+        let sc = scale[c as usize] * inv;
+        let sh = bias[c as usize] - mean * sc;
+        let mut t = tid;
+        while t < hw {
+            unsafe {
+                *y.get_unchecked_mut((base + t) as usize) = x[(base + t) as usize] * sc + sh;
+            }
+            t += 256;
+        }
+    }
+
+    // =========================================================================
+    // Nearest-neighbour and bilinear resize of an NCHW tensor.
+    //   `mode`: 0 = nearest, 1 = bilinear. Covers both Resize and the older
+    //   Upsample, which differ only in how the scales reach the node.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn resize2d(
+        x: &[f32],
+        in_h: u32,
+        in_w: u32,
+        out_h: u32,
+        out_w: u32,
+        mode: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        if let Some(o) = y.get_mut(idx) {
+            let i = lin;
+            let ow = i % out_w;
+            let oh = (i / out_w) % out_h;
+            let plane = i / (out_w * out_h);
+            let base = plane * in_h * in_w;
+
+            let sh = in_h as f32 / out_h as f32;
+            let sw = in_w as f32 / out_w as f32;
+
+            if mode == 0 {
+                let ih = {
+                    let v = (oh as f32 * sh) as u32;
+                    if v >= in_h { in_h - 1 } else { v }
+                };
+                let iw = {
+                    let v = (ow as f32 * sw) as u32;
+                    if v >= in_w { in_w - 1 } else { v }
+                };
+                *o = x[(base + ih * in_w + iw) as usize];
+            } else {
+                // half-pixel centres, which is what both ORT and PyTorch use
+                // for align_corners=false.
+                let fy = (oh as f32 + 0.5f32) * sh - 0.5f32;
+                let fx = (ow as f32 + 0.5f32) * sw - 0.5f32;
+                let fy = if fy < 0.0f32 { 0.0f32 } else { fy };
+                let fx = if fx < 0.0f32 { 0.0f32 } else { fx };
+                let y0 = fy as u32;
+                let x0 = fx as u32;
+                let y1 = if y0 + 1 < in_h { y0 + 1 } else { in_h - 1 };
+                let x1 = if x0 + 1 < in_w { x0 + 1 } else { in_w - 1 };
+                let wy = fy - y0 as f32;
+                let wx = fx - x0 as f32;
+                let p00 = x[(base + y0 * in_w + x0) as usize];
+                let p01 = x[(base + y0 * in_w + x1) as usize];
+                let p10 = x[(base + y1 * in_w + x0) as usize];
+                let p11 = x[(base + y1 * in_w + x1) as usize];
+                let top = p00 + (p01 - p00) * wx;
+                let bot = p10 + (p11 - p10) * wx;
+                *o = top + (bot - top) * wy;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Spatial padding of an NCHW tensor with a constant value.
+    //   `mode`: 0 = constant, 1 = reflect. Style-transfer graphs pad by
+    //   reflection before every convolution to avoid border artefacts.
+    // =========================================================================
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pad2d(
+        x: &[f32],
+        in_h: u32,
+        in_w: u32,
+        out_h: u32,
+        out_w: u32,
+        pad_top: u32,
+        pad_left: u32,
+        mode: u32,
+        value: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        if let Some(o) = y.get_mut(idx) {
+            let i = lin;
+            let ow = i % out_w;
+            let oh = (i / out_w) % out_h;
+            let plane = i / (out_w * out_h);
+            let base = plane * in_h * in_w;
+
+            let sy = oh as i32 - pad_top as i32;
+            let sx = ow as i32 - pad_left as i32;
+
+            if mode == 0 {
+                if sy < 0 || sx < 0 || sy >= in_h as i32 || sx >= in_w as i32 {
+                    *o = value;
+                } else {
+                    *o = x[(base + sy as u32 * in_w + sx as u32) as usize];
+                }
+            } else {
+                // Reflect without repeating the edge pixel.
+                let refl = |v: i32, n: i32| -> u32 {
+                    let mut t = v;
+                    if t < 0 {
+                        t = -t;
+                    }
+                    if t >= n {
+                        t = 2 * (n - 1) - t;
+                    }
+                    if t < 0 { 0u32 } else { t as u32 }
+                };
+                let ry = refl(sy, in_h as i32);
+                let rx = refl(sx, in_w as i32);
+                *o = x[(base + ry * in_w + rx) as usize];
+            }
+        }
+    }
+
+    // =========================================================================
     // Pack a row-major [k][n] matrix into f16 pairs laid out as [n][ceil(k/2)].
     //   Each register holds rows k and k+1 of one column, which is what the
     //   tensor-core B fragment reads. Odd k pads the final half with zero.

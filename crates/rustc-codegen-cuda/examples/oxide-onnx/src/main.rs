@@ -48,6 +48,13 @@ const MOBILENET_PATH: &str = "models/mobilenetv2-10.onnx";
 const VIT_PATH: &str = "models/vit-base-patch16-224.onnx";
 const BERT_PATH: &str = "models/bert-base-uncased.onnx";
 const GPT2_PATH: &str = "models/gpt2-lmhead.onnx";
+// Architectures beyond classification and transformers, used to keep the
+// engine honest about ops it would otherwise never see.
+const SUPERRES_PATH: &str = "models/super-resolution-10.onnx";
+const SHUFFLENET_PATH: &str = "models/shufflenet-v2-10.onnx";
+const YOLO_PATH: &str = "models/tinyyolov2-8.onnx";
+const FCN_PATH: &str = "models/fcn-resnet50-11.onnx";
+const STYLE_PATH: &str = "models/mosaic-9.onnx";
 
 fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════╗");
@@ -90,6 +97,29 @@ fn main() -> Result<()> {
         }
         if gpt2_present {
             run_gpt2(GPT2_PATH, "GPT-2-LMHead")?;
+        }
+
+        // Same engine, architectures it was not built around.
+        for (path, name, shape) in [
+            (SHUFFLENET_PATH, "ShuffleNet-v2", vec![1usize, 3, 224, 224]),
+            (
+                SUPERRES_PATH,
+                "Sub-pixel CNN (super-res)",
+                vec![1, 1, 224, 224],
+            ),
+            (YOLO_PATH, "Tiny-YOLOv2 (detection)", vec![1, 3, 416, 416]),
+            (
+                FCN_PATH,
+                "FCN-ResNet50 (segmentation)",
+                vec![1, 3, 224, 224],
+            ),
+            (STYLE_PATH, "Mosaic (style transfer)", vec![1, 3, 224, 224]),
+        ] {
+            if std::path::Path::new(path).exists() {
+                if let Err(e) = run_generic_model(path, name, &shape) {
+                    println!("  {} FAILED: {}", name, e);
+                }
+            }
         }
         println!();
 
@@ -1474,12 +1504,140 @@ fn run_model(model_path: &str, model_name: &str) -> Result<()> {
 }
 
 // ===========================================================================
+// Generic model runner — architecture-agnostic correctness and timing
+// ===========================================================================
+
+/// Run any single-input, single-output model and check it numerically against
+/// ONNX Runtime.
+///
+/// The classification runner compares top-1 indices, which only means anything
+/// for a classifier. Super-resolution, style transfer, segmentation and
+/// detection all produce dense tensors where the right question is how far the
+/// values are from the reference, so this reports absolute and relative error
+/// over the whole output instead. That keeps the engine honest on any
+/// architecture rather than on the two it started with.
+fn run_generic_model(model_path: &str, model_name: &str, input_shape: &[usize]) -> Result<()> {
+    print!("  Loading {}... ", model_name);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let model = load_model(model_path)?;
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Model has no graph"))?;
+    let ctx = CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA: {:?}", e))?;
+    let executor = OnnxExecutor::from_graph(graph, ctx)?;
+    println!(
+        "{} nodes, {} inputs, {} outputs",
+        executor.nodes.len(),
+        executor.input_names.len(),
+        executor.output_names.len()
+    );
+
+    let numel: usize = input_shape.iter().product();
+    let input_data: Vec<f32> = (0..numel)
+        .map(|i| ((i * 6271 + 1337) % 1000) as f32 / 1000.0)
+        .collect();
+    let input_name = executor
+        .input_names
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No input names"))?
+        .clone();
+    let mut inputs = HashMap::new();
+    inputs.insert(input_name, (input_data.clone(), input_shape.to_vec()));
+
+    let t0 = Instant::now();
+    let outputs = executor.run(&inputs)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let first_out = executor
+        .output_names
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No output names"))?;
+    let (oxide_out, oshape) = outputs
+        .get(first_out)
+        .ok_or_else(|| anyhow::anyhow!("Output '{}' missing from run", first_out))?;
+    println!(
+        "  [oxide] Output '{}' shape={:?}  ({:.1} ms)",
+        first_out, oshape, elapsed_ms
+    );
+
+    print!("  [ort]   Running ORT CUDA reference... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match run_ort_cuda_inference_shaped(model_path, &input_data, input_shape) {
+        Ok(reference) => {
+            println!("done");
+            let n = oxide_out.len().min(reference.len());
+            if n == 0 {
+                println!("  │ empty output, nothing to compare");
+                return Ok(());
+            }
+            let mut max_abs = 0.0f32;
+            let mut sum_abs = 0.0f64;
+            let mut ref_mag = 0.0f64;
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for i in 0..n {
+                let (a, b) = (oxide_out[i], reference[i]);
+                let d = (a - b).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                sum_abs += d as f64;
+                ref_mag += b.abs() as f64;
+                dot += (a as f64) * (b as f64);
+                na += (a as f64) * (a as f64);
+                nb += (b as f64) * (b as f64);
+            }
+            let mean_abs = sum_abs / n as f64;
+            let rel = if ref_mag > 0.0 {
+                sum_abs / ref_mag
+            } else {
+                0.0
+            };
+            let cos = if na > 0.0 && nb > 0.0 {
+                dot / (na.sqrt() * nb.sqrt())
+            } else {
+                0.0
+            };
+            // f16 tensor cores carry about three decimal digits, so agreement
+            // is judged on relative error and direction rather than on bits.
+            let ok = rel < 2e-2 && cos > 0.999;
+            println!("  ┌─ vs ORT CUDA ────────────────────────────────────");
+            println!("  │ elements compared : {}", n);
+            println!("  │ max abs diff      : {:.5}", max_abs);
+            println!("  │ mean abs diff     : {:.6}", mean_abs);
+            println!("  │ relative L1 error : {:.6}", rel);
+            println!("  │ cosine similarity : {:.6}", cos);
+            println!("  │ MATCH             : {}", ok);
+            println!("  └──────────────────────────────────────────────────");
+            if !ok {
+                println!("  !! {} disagrees with ORT beyond tolerance", model_name);
+            }
+        }
+        Err(e) => println!("skipped ({})", e),
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
 // ORT CUDA single-shot inference (correctness check)
 // ===========================================================================
 
 /// Run one forward pass via the Python bench_gpu.py in correctness mode.
 /// Returns the output logits by writing them to a temp file.
 fn run_ort_cuda_inference(model_path: &str, input_data: &[f32]) -> Result<Vec<f32>> {
+    run_ort_cuda_inference_shaped(model_path, input_data, &[1, 3, 224, 224])
+}
+
+/// As [`run_ort_cuda_inference`], for models whose input is not a 224x224 RGB
+/// image — grayscale super-resolution, 416x416 detection, and so on.
+fn run_ort_cuda_inference_shaped(
+    model_path: &str,
+    input_data: &[f32],
+    shape: &[usize],
+) -> Result<Vec<f32>> {
     let script = std::path::Path::new(model_path)
         .parent()
         .and_then(|p| p.parent())
@@ -1499,11 +1657,17 @@ fn run_ort_cuda_inference(model_path: &str, input_data: &[f32]) -> Result<Vec<f3
         std::fs::File::create(&tmp_in)?.write_all(&bytes)?;
     }
 
+    let shape_arg = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let status = std::process::Command::new("python3")
         .arg(&script)
         .arg(model_path)
         .arg(&tmp_in)
         .arg(&tmp_out)
+        .arg(&shape_arg)
         .status()
         .map_err(|e| anyhow::anyhow!("python3: {}", e))?;
 
