@@ -21,6 +21,7 @@ pub const ACT_NONE: i64 = 0;
 pub const ACT_RELU: i64 = 1;
 pub const ACT_CLIP: i64 = 2;
 pub const ACT_GELU: i64 = 3;
+pub const ACT_GELU_TANH: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OptStats {
@@ -71,6 +72,7 @@ pub fn optimize(
     stats.matmul_bias_fused = fuse_bias_into_matmul(nodes, weights, graph_outputs);
     stats.matmul_transpose_fused = fuse_transpose_into_matmul(nodes, weights, graph_outputs);
     stats.gelu_fused = fuse_gelu(nodes, weights, graph_outputs);
+    stats.gelu_fused += fuse_gelu_tanh(nodes, weights, graph_outputs);
     stats
 }
 
@@ -939,6 +941,167 @@ fn fuse_gelu(
     let mut dead: HashSet<usize> = HashSet::new();
     for f in &fuses {
         set_attr_i(&mut nodes[f.producer], "oxide_act", ACT_GELU);
+        nodes[f.rename].output[0] = f.out_name.clone();
+        for &d in &f.dead {
+            dead.insert(d);
+        }
+    }
+    if !dead.is_empty() {
+        let mut idx = 0;
+        nodes.retain(|_| {
+            let keep = !dead.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+    fuses.len()
+}
+
+/// Fold the tanh-approximation GELU into the producing matrix multiply.
+///
+/// GPT-2 exports the other GELU:
+///
+///     Pow(x,3) -> Mul(.044715) -> Add(x) -> Mul(sqrt 2/pi) -> Tanh
+///       -> Add(1) -> Mul(Mul(x, 0.5), _)
+///
+/// Eight nodes, each reading and writing the whole 128x3072 activation, for
+/// an expression the epilogue evaluates on a register it already holds. The
+/// constants are checked rather than assumed, so a graph that spells a
+/// different function this way will not match.
+fn fuse_gelu_tanh(
+    nodes: &mut Vec<NodeProto>,
+    weights: &Weights,
+    graph_outputs: &HashSet<String>,
+) -> usize {
+    struct Fuse {
+        producer: usize,
+        rename: usize,
+        out_name: String,
+        dead: Vec<usize>,
+    }
+    let mut fuses: Vec<Fuse> = Vec::new();
+    {
+        let counts = consumer_counts(nodes);
+        let producer_of = producers(nodes);
+        let consumers = |name: &str| -> Vec<usize> {
+            nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.input.iter().any(|i| i == name))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let single = |name: &str| -> bool {
+            counts.get(name).copied().unwrap_or(0) == 1 && !graph_outputs.contains(name)
+        };
+        let has_scalar = |n: &NodeProto, want: f32| -> bool {
+            n.input
+                .iter()
+                .any(|i| scalar_const(nodes, weights, i).is_some_and(|v| (v - want).abs() < 1e-4))
+        };
+        let mut claimed: HashSet<usize> = HashSet::new();
+
+        for (pow_idx, pw) in nodes.iter().enumerate() {
+            if pw.op_type != "Pow" || pw.input.len() != 2 || !has_scalar(pw, 3.0) {
+                continue;
+            }
+            let x = pw.input[0].clone();
+            let mut chain = vec![pow_idx];
+            let mut cur = pw.output[0].clone();
+
+            // The five single-consumer steps from Pow to Add(_, 1).
+            let steps: [(&str, Option<f32>); 5] = [
+                ("Mul", Some(0.044715)),
+                ("Add", None),
+                ("Mul", Some(0.7978846)),
+                ("Tanh", None),
+                ("Add", Some(1.0)),
+            ];
+            let mut ok = true;
+            for (want_op, want_scalar) in steps {
+                if !single(cur.as_str()) {
+                    ok = false;
+                    break;
+                }
+                let next = match consumers(cur.as_str()).as_slice() {
+                    [i] if nodes[*i].op_type == want_op => *i,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                if let Some(w) = want_scalar {
+                    if !has_scalar(&nodes[next], w) {
+                        ok = false;
+                        break;
+                    }
+                } else if want_op == "Add" && !nodes[next].input.iter().any(|i| *i == x) {
+                    // The Add that reintroduces x.
+                    ok = false;
+                    break;
+                }
+                chain.push(next);
+                cur = nodes[next].output[0].clone();
+            }
+            if !ok || !single(cur.as_str()) {
+                continue;
+            }
+
+            // Final: Mul(Mul(x, 0.5), tanh_term).
+            let last = match consumers(cur.as_str()).as_slice() {
+                [i] if nodes[*i].op_type == "Mul" => *i,
+                _ => continue,
+            };
+            let Some(half_name) = nodes[last].input.iter().find(|i| **i != cur).cloned() else {
+                continue;
+            };
+            let Some(&half_idx) = producer_of.get(half_name.as_str()) else {
+                continue;
+            };
+            if nodes[half_idx].op_type != "Mul"
+                || !nodes[half_idx].input.iter().any(|i| *i == x)
+                || !has_scalar(&nodes[half_idx], 0.5)
+                || !single(half_name.as_str())
+            {
+                continue;
+            }
+            chain.push(last);
+            chain.push(half_idx);
+
+            let Some(&p0) = producer_of.get(x.as_str()) else {
+                continue;
+            };
+            let (prod_idx, rename_idx) = if nodes[p0].op_type == "Reshape" {
+                let Some(&p1) = producer_of.get(nodes[p0].input[0].as_str()) else {
+                    continue;
+                };
+                if !single(nodes[p0].input[0].as_str()) {
+                    continue;
+                }
+                (p1, p0)
+            } else {
+                (p0, p0)
+            };
+            let pt = nodes[prod_idx].op_type.as_str();
+            if pt != "Gemm" && pt != "MatMul" {
+                continue;
+            }
+            if claimed.contains(&prod_idx) || attr_i(&nodes[prod_idx], "oxide_act", 0) != 0 {
+                continue;
+            }
+            claimed.insert(prod_idx);
+            fuses.push(Fuse {
+                producer: prod_idx,
+                rename: rename_idx,
+                out_name: nodes[last].output[0].clone(),
+                dead: chain,
+            });
+        }
+    }
+
+    let mut dead: HashSet<usize> = HashSet::new();
+    for f in &fuses {
+        set_attr_i(&mut nodes[f.producer], "oxide_act", ACT_GELU_TANH);
         nodes[f.rename].output[0] = f.out_name.clone();
         for &d in &f.dead {
             dead.insert(d);

@@ -57,6 +57,12 @@ fn apply_act(v: f32, act: u32, lo: f32, hi: f32) -> f32 {
         } else {
             v
         }
+    } else if act == 4u32 {
+        // tanh-approximate GELU, the form GPT-2 exports:
+        //   x/2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x^3)))
+        // Eight graph nodes, each a full pass over the activation, for this.
+        let inner = 0.7978845608f32 * (v + 0.044715f32 * v * v * v);
+        0.5f32 * v * (1.0f32 + gpu_tanh(inner))
     } else if act == 3u32 {
         // Exact GELU: x/2 * (1 + erf(x/sqrt(2))). A transformer's MLP spells
         // this as five separate nodes, each a full round trip of the 197x3072
