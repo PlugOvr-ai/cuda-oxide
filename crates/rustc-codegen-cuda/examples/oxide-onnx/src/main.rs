@@ -954,6 +954,7 @@ fn unit_tests() -> Result<()> {
     all_pass &= test_bias_add(&stream, &module)?;
     all_pass &= test_batchnorm(&stream, &module)?;
     all_pass &= test_conv2d(&stream, &module)?;
+    all_pass &= test_winograd(&stream, &module)?;
     all_pass &= test_maxpool(&stream, &module)?;
     all_pass &= test_global_avg_pool(&stream, &module)?;
     all_pass &= test_softmax(&stream, &module)?;
@@ -1160,6 +1161,131 @@ fn test_batchnorm(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) ->
     println!(
         "  batch_norm   max_err={:.2e}  {}",
         err,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
+/// Winograd F(2x2, 3x3) end to end: filter, input and output transforms with
+/// a plain f32 GEMM standing in for the batched tensor-core one, checked
+/// against the direct convolution.
+///
+/// The Winograd path is off by default — it measured neutral at batch 1, for
+/// reasons recorded in `conv_winograd` — so without a test it would quietly rot.
+fn test_winograd(stream: &cuda_core::CudaStream, module: &gpu::LoadedModule) -> Result<bool> {
+    let (c_in, h_in, w_in, n_out) = (16usize, 8usize, 8usize, 8usize);
+    let (kh, kw, pad) = (3usize, 3usize, 1usize);
+    let x: Vec<f32> = (0..c_in * h_in * w_in)
+        .map(|i| ((i * 37 % 100) as f32 - 50.0) * 0.01)
+        .collect();
+    let w: Vec<f32> = (0..n_out * c_in * kh * kw)
+        .map(|i| ((i * 53 % 100) as f32 - 50.0) * 0.01)
+        .collect();
+    let (expected, out_h, out_w) = cpu_ref::conv2d(
+        &x, &w, None, 1, c_in, h_in, w_in, n_out, kh, kw, pad, pad, 1, 1,
+    );
+
+    let tiles_h = out_h.div_ceil(2);
+    let tiles_w = out_w.div_ceil(2);
+    let t_total = tiles_h * tiles_w;
+
+    let x_dev = DeviceBuffer::from_host(stream, &x).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let w_dev = DeviceBuffer::from_host(stream, &w).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut u = DeviceBuffer::<f32>::zeroed(stream, 16 * n_out * c_in)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut v = DeviceBuffer::<f32>::zeroed(stream, 16 * c_in * t_total)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut mm = DeviceBuffer::<f32>::zeroed(stream, 16 * n_out * t_total)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, n_out * out_h * out_w)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    unsafe {
+        module.winograd_filter_transform(
+            stream,
+            LaunchConfig::for_num_elems((n_out * c_in) as u32),
+            &w_dev,
+            n_out as u32,
+            c_in as u32,
+            &mut u,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    unsafe {
+        module.winograd_input_transform(
+            stream,
+            LaunchConfig::for_num_elems((c_in * t_total) as u32),
+            &x_dev,
+            c_in as u32,
+            h_in as u32,
+            w_in as u32,
+            pad as u32,
+            pad as u32,
+            tiles_h as u32,
+            tiles_w as u32,
+            &mut v,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    // M[p] = U[p] * V[p], one plane at a time with the naive kernel so the
+    // test checks the transforms rather than the GEMM.
+    let u_host = u
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let v_host = v
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut m_host = vec![0.0f32; 16 * n_out * t_total];
+    for p in 0..16 {
+        for kk in 0..n_out {
+            for t in 0..t_total {
+                let mut acc = 0.0f32;
+                for c in 0..c_in {
+                    acc += u_host[p * n_out * c_in + kk * c_in + c]
+                        * v_host[p * c_in * t_total + c * t_total + t];
+                }
+                m_host[p * n_out * t_total + kk * t_total + t] = acc;
+            }
+        }
+    }
+    mm = DeviceBuffer::from_host(stream, &m_host).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let stub = DeviceBuffer::<f32>::zeroed(stream, 1).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    unsafe {
+        module.winograd_output_transform(
+            stream,
+            LaunchConfig::for_num_elems((n_out * t_total) as u32),
+            &mm,
+            n_out as u32,
+            tiles_h as u32,
+            tiles_w as u32,
+            out_h as u32,
+            out_w as u32,
+            &stub,
+            0,
+            &stub,
+            0,
+            0,
+            0.0,
+            0.0,
+            &mut y,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let got = y
+        .to_host_vec(stream)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let max_err = got
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let pass = max_err < 1e-4;
+    println!(
+        "  winograd F(2x2,3x3)     : max_err {:.2e}   {}",
+        max_err,
         if pass { "PASS" } else { "FAIL" }
     );
     Ok(pass)

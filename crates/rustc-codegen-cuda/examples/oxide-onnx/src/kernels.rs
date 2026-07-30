@@ -2879,6 +2879,255 @@ pub mod gpu {
         }
     }
 
+    // =========================================================================
+    // Winograd F(2x2, 3x3).
+    //
+    //   A 3x3 convolution over a 2x2 output tile needs 36 multiplies done
+    //   directly and 16 in the Winograd domain — 2.25x fewer. That ratio is
+    //   not the main attraction here. The implicit-GEMM convolution is limited
+    //   by address arithmetic and memory latency, not by arithmetic: its
+    //   tensor pipe runs at 13-20% while `wait` sits at 2.5. Winograd replaces
+    //   it with three cheap elementwise passes and a plain batched GEMM, which
+    //   has no im2col addressing at all.
+    //
+    //   Layout is transform-plane-major throughout — U is [16][K][C], V is
+    //   [16][C][T], M is [16][K][T] — so each of the sixteen planes is a
+    //   contiguous matrix and the whole thing is one batched GEMM with the
+    //   plane as the batch index.
+    //
+    //   The transforms are the standard F(2,3) ones:
+    //     U = G g G^T,   V = B^T d B,   Y = A^T (U .* V) A
+    //   with G = [[1,0,0],[.5,.5,.5],[.5,-.5,.5],[0,0,1]],
+    //        B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]],
+    //        A^T = [[1,1,1,0],[0,1,-1,-1]].
+    // =========================================================================
+
+    /// Filter transform: `w[K][C][3][3]` -> `u[16][K][C]`.
+    ///
+    /// The weights are load-time constants, so this runs once per convolution
+    /// and the result is cached.
+    #[kernel]
+    pub fn winograd_filter_transform(w: &[f32], k_out: u32, c_in: u32, mut u: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        let total = k_out * c_in;
+        if lin >= total {
+            return;
+        }
+        let kk = lin / c_in;
+        let cc = lin % c_in;
+        let base = (kk * c_in + cc) * 9;
+
+        let mut g = [0.0f32; 9];
+        let mut i = 0usize;
+        while i < 9 {
+            g[i] = w[(base + i as u32) as usize];
+            i += 1;
+        }
+
+        // tmp = G g   (4x3)
+        let mut tmp = [0.0f32; 12];
+        let mut j = 0usize;
+        while j < 3 {
+            let g0 = g[j];
+            let g1 = g[3 + j];
+            let g2 = g[6 + j];
+            tmp[j] = g0;
+            tmp[3 + j] = 0.5f32 * (g0 + g1 + g2);
+            tmp[6 + j] = 0.5f32 * (g0 - g1 + g2);
+            tmp[9 + j] = g2;
+            j += 1;
+        }
+        // U = tmp G^T  (4x4), written plane-major.
+        let mut r = 0usize;
+        while r < 4 {
+            let t0 = tmp[r * 3];
+            let t1 = tmp[r * 3 + 1];
+            let t2 = tmp[r * 3 + 2];
+            let v0 = t0;
+            let v1 = 0.5f32 * (t0 + t1 + t2);
+            let v2 = 0.5f32 * (t0 - t1 + t2);
+            let v3 = t2;
+            unsafe {
+                *u.get_unchecked_mut(((r as u32 * 4) * total + lin) as usize) = v0;
+                *u.get_unchecked_mut(((r as u32 * 4 + 1) * total + lin) as usize) = v1;
+                *u.get_unchecked_mut(((r as u32 * 4 + 2) * total + lin) as usize) = v2;
+                *u.get_unchecked_mut(((r as u32 * 4 + 3) * total + lin) as usize) = v3;
+            }
+            r += 1;
+        }
+    }
+
+    /// Input transform: `x[C][H][W]` -> `v[16][C][T]`, T tiles of 2x2 output.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn winograd_input_transform(
+        x: &[f32],
+        c_in: u32,
+        h_in: u32,
+        w_in: u32,
+        pad_h: u32,
+        pad_w: u32,
+        tiles_h: u32,
+        tiles_w: u32,
+        mut v: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        let t_total = tiles_h * tiles_w;
+        let total = c_in * t_total;
+        if lin >= total {
+            return;
+        }
+        let cc = lin / t_total;
+        let t = lin % t_total;
+        let th = t / tiles_w;
+        let tw = t % tiles_w;
+
+        let ih0 = (th * 2) as i32 - pad_h as i32;
+        let iw0 = (tw * 2) as i32 - pad_w as i32;
+        let plane = cc * h_in * w_in;
+
+        let mut d = [0.0f32; 16];
+        let mut r = 0i32;
+        while r < 4 {
+            let ih = ih0 + r;
+            let mut c = 0i32;
+            while c < 4 {
+                let iw = iw0 + c;
+                if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                    d[(r * 4 + c) as usize] =
+                        x[(plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                }
+                c += 1;
+            }
+            r += 1;
+        }
+
+        // B^T d, column by column.
+        let mut tmp = [0.0f32; 16];
+        let mut j = 0usize;
+        while j < 4 {
+            let d0 = d[j];
+            let d1 = d[4 + j];
+            let d2 = d[8 + j];
+            let d3 = d[12 + j];
+            tmp[j] = d0 - d2;
+            tmp[4 + j] = d1 + d2;
+            tmp[8 + j] = d2 - d1;
+            tmp[12 + j] = d1 - d3;
+            j += 1;
+        }
+        // (B^T d) B, row by row.
+        let mut i = 0usize;
+        while i < 4 {
+            let t0 = tmp[i * 4];
+            let t1 = tmp[i * 4 + 1];
+            let t2 = tmp[i * 4 + 2];
+            let t3 = tmp[i * 4 + 3];
+            let o0 = t0 - t2;
+            let o1 = t1 + t2;
+            let o2 = t2 - t1;
+            let o3 = t1 - t3;
+            unsafe {
+                *v.get_unchecked_mut(((i as u32 * 4) * total + lin) as usize) = o0;
+                *v.get_unchecked_mut(((i as u32 * 4 + 1) * total + lin) as usize) = o1;
+                *v.get_unchecked_mut(((i as u32 * 4 + 2) * total + lin) as usize) = o2;
+                *v.get_unchecked_mut(((i as u32 * 4 + 3) * total + lin) as usize) = o3;
+            }
+            i += 1;
+        }
+    }
+
+    /// Output transform: `m[16][K][T]` -> `y[K][out_h][out_w]`, with the same
+    /// epilogue the direct path fuses (bias, residual, activation).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn winograd_output_transform(
+        mm: &[f32],
+        k_out: u32,
+        tiles_h: u32,
+        tiles_w: u32,
+        out_h: u32,
+        out_w: u32,
+        bias: &[f32],
+        has_bias: u32,
+        residual: &[f32],
+        has_residual: u32,
+        act: u32,
+        lo: f32,
+        hi: f32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let lin = idx.get() as u32;
+        let t_total = tiles_h * tiles_w;
+        let total = k_out * t_total;
+        if lin >= total {
+            return;
+        }
+        let kk = lin / t_total;
+        let t = lin % t_total;
+        let th = t / tiles_w;
+        let tw = t % tiles_w;
+
+        let mut d = [0.0f32; 16];
+        let mut i = 0usize;
+        while i < 16 {
+            d[i] = mm[((i as u32) * total + lin) as usize];
+            i += 1;
+        }
+
+        // A^T m, column by column -> 2x4.
+        let mut tmp = [0.0f32; 8];
+        let mut j = 0usize;
+        while j < 4 {
+            let m0 = d[j];
+            let m1 = d[4 + j];
+            let m2 = d[8 + j];
+            let m3 = d[12 + j];
+            tmp[j] = m0 + m1 + m2;
+            tmp[4 + j] = m1 - m2 - m3;
+            j += 1;
+        }
+
+        let b_val = if has_bias != 0 {
+            bias[kk as usize]
+        } else {
+            0.0f32
+        };
+        let plane = kk * out_h * out_w;
+        let mut r = 0u32;
+        while r < 2 {
+            let t0 = tmp[(r * 4) as usize];
+            let t1 = tmp[(r * 4 + 1) as usize];
+            let t2 = tmp[(r * 4 + 2) as usize];
+            let t3 = tmp[(r * 4 + 3) as usize];
+            let oh = th * 2 + r;
+            if oh < out_h {
+                let mut c = 0u32;
+                while c < 2 {
+                    let ow = tw * 2 + c;
+                    if ow < out_w {
+                        let val = if c == 0 { t0 + t1 + t2 } else { t1 - t2 - t3 };
+                        let off = plane + oh * out_w + ow;
+                        let res = if has_residual != 0 {
+                            residual[off as usize]
+                        } else {
+                            0.0f32
+                        };
+                        unsafe {
+                            *y.get_unchecked_mut(off as usize) =
+                                apply_act(val + b_val + res, act, lo, hi);
+                        }
+                    }
+                    c += 1;
+                }
+            }
+            r += 1;
+        }
+    }
+
     #[kernel]
     pub fn conv2d_f16_tc_splitk(
         m: u32,

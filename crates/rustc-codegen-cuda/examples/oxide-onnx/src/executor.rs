@@ -60,6 +60,9 @@ pub struct OnnxExecutor {
     /// Same, for weights that sit in the B operand — packed [n][ceil(k/2)].
     /// See [`Self::packed_weights_cols`].
     f16_weights_b: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<u32>>>,
+    /// Winograd-domain filters, keyed by (weight pointer, K, C). The filter
+    /// transform depends only on load-time constants, so it runs once.
+    wino_filters: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<f32>>>,
 }
 
 impl OnnxExecutor {
@@ -144,6 +147,7 @@ impl OnnxExecutor {
             buf_pool: RefCell::new(HashMap::new()),
             f16_weights: RefCell::new(HashMap::new()),
             f16_weights_b: RefCell::new(HashMap::new()),
+            wino_filters: RefCell::new(HashMap::new()),
             tensor_cores,
         })
     }
@@ -1402,6 +1406,43 @@ impl OnnxExecutor {
         } else if !is_depthwise
             && group == 1
             && self.tensor_cores
+            && kh == 3
+            && kw == 3
+            && stride_h == 1
+            && stride_w == 1
+            && dil_h == 1
+            && dil_w == 1
+            && c_in >= 32
+            && n_out >= 32
+            && c_in % 16 == 0
+            && out_h.div_ceil(2) * out_w.div_ceil(2) >= Self::wino_min_tiles()
+            && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true)
+        {
+            // ── Winograd F(2x2, 3x3) ────────────────────────────────────────
+            // The output transform applies bias, residual and the activation,
+            // so this returns rather than falling through to the shared
+            // epilogue below, which would apply them a second time.
+            self.conv_winograd(
+                node,
+                tensors,
+                x_ptr,
+                w_ptr,
+                &mut result_buf,
+                batch_n,
+                c_in,
+                h_in,
+                w_in,
+                n_out,
+                pad_h,
+                pad_w,
+                out_h,
+                out_w,
+            )?;
+            tensors.insert(&out_name, result_buf, vec![batch_n, n_out, out_h, out_w]);
+            return Ok(());
+        } else if !is_depthwise
+            && group == 1
+            && self.tensor_cores
             && std::env::var("OXIDE_F16").map(|v| v != "0").unwrap_or(true)
             && col_rows_g >= 32
             && n_out * col_cols >= 4096
@@ -1984,6 +2025,228 @@ impl OnnxExecutor {
             block_dim: (BLOCK_X, 1, 1),
             shared_mem_bytes: 0,
         }
+    }
+
+    /// Smallest tile count worth transforming. `OXIDE_WINOGRAD=<n>` enables
+    /// the path for convolutions with at least `n` tiles; it is off otherwise.
+    ///
+    /// Off by default because it measured neutral at batch 1 — see
+    /// [`Self::conv_winograd`] for why, and why that should change with batch.
+    fn wino_min_tiles() -> usize {
+        std::env::var("OXIDE_WINOGRAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Convolution by Winograd F(2x2, 3x3).
+    ///
+    /// Three elementwise transform passes around one batched GEMM. The GEMM
+    /// runs over the sixteen transform planes as its batch dimension, so it is
+    /// the same kernel the attention MatMuls use and gets the tensor cores and
+    /// the f16 packing for free.
+    ///
+    /// Correct, and off by default, because at batch 1 it measured neutral:
+    /// ResNet50 1.87/1.87/2.01 ms with it against 1.87/1.89 without.
+    ///
+    /// The reason is worth recording, because the 2.25x fewer multiplies makes
+    /// it look like it should win. Two things cancel it:
+    ///
+    ///   Winograd divides the GEMM's K by nine — a 64-channel layer goes from
+    ///   k=576 to k=64 — which is exactly the arithmetic intensity the kernel
+    ///   needs. And it materialises V and M, costing 8-10x the DRAM traffic of
+    ///   the direct path (12.8 MB against 1.6 MB for 64 channels at 56x56).
+    ///
+    /// The convolution was never arithmetic-bound — its tensor pipe runs at
+    /// 13-20% — so trading arithmetic for memory traffic and intensity is the
+    /// wrong direction on this hardware.
+    ///
+    /// Both problems shrink as batch grows, since the tile count scales with
+    /// it: batch 1 is this algorithm's worst case. Making it win at batch 1
+    /// would need the transforms fused into the GEMM's staging so that V and M
+    /// never reach DRAM, which is what cuDNN and TensorRT do.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_winograd(
+        &self,
+        node: &NodeProto,
+        tensors: &mut TensorMap,
+        x_ptr: u64,
+        w_ptr: u64,
+        result_buf: &mut DeviceBuffer<f32>,
+        batch_n: usize,
+        c_in: usize,
+        h_in: usize,
+        w_in: usize,
+        n_out: usize,
+        pad_h: usize,
+        pad_w: usize,
+        out_h: usize,
+        out_w: usize,
+    ) -> Result<()> {
+        let (act, act_lo, act_hi) = Self::fused_act(node);
+        let has_bias = node.input.len() > 2 && !node.input[2].is_empty();
+        let bias_ptr = if has_bias {
+            let eb = Self::get_tensor(tensors, &self.weights, &node.input[2])?;
+            Some(eb.buf().cu_deviceptr())
+        } else {
+            None
+        };
+        let has_residual = attr_i(node, "oxide_residual", 0) != 0 && node.input.len() > 3;
+        let residual_ptr = if has_residual {
+            let er = Self::get_tensor(tensors, &self.weights, &node.input[3])?;
+            Some(er.buf().cu_deviceptr())
+        } else {
+            None
+        };
+
+        let tiles_h = out_h.div_ceil(2);
+        let tiles_w = out_w.div_ceil(2);
+        let t_total = tiles_h * tiles_w;
+
+        // U = G g G^T, once per weight tensor.
+        let u_buf = {
+            let key = (w_ptr, n_out, c_in);
+            let mut cache = self.wino_filters.borrow_mut();
+            if !cache.contains_key(&key) {
+                let w_full = ManuallyDrop::new(unsafe {
+                    DeviceBuffer::<f32>::from_raw_parts(w_ptr, n_out * c_in * 9, self.ctx.clone())
+                });
+                let mut u = DeviceBuffer::<f32>::zeroed(&self.stream, 16 * n_out * c_in)
+                    .map_err(|e| anyhow!("winograd U alloc: {:?}", e))?;
+                unsafe {
+                    self.module.winograd_filter_transform(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((n_out * c_in) as u32),
+                        &w_full,
+                        n_out as u32,
+                        c_in as u32,
+                        &mut u,
+                    )
+                }
+                .map_err(|e| anyhow!("winograd filter transform: {:?}", e))?;
+                cache.insert(key, u);
+            }
+            cache[&key].cu_deviceptr()
+        };
+        let u_view = ManuallyDrop::new(unsafe {
+            DeviceBuffer::<f32>::from_raw_parts(u_buf, 16 * n_out * c_in, self.ctx.clone())
+        });
+
+        let mut v = self
+            .alloc_buf(16 * c_in * t_total)
+            .map_err(|e| anyhow!("winograd V alloc: {}", e))?;
+        let mut mm = self
+            .alloc_buf(16 * n_out * t_total)
+            .map_err(|e| anyhow!("winograd M alloc: {}", e))?;
+
+        for b in 0..batch_n {
+            let x_b = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    x_ptr + (b * c_in * h_in * w_in * 4) as u64,
+                    c_in * h_in * w_in,
+                    self.ctx.clone(),
+                )
+            });
+            unsafe {
+                self.module.winograd_input_transform(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((c_in * t_total) as u32),
+                    &x_b,
+                    c_in as u32,
+                    h_in as u32,
+                    w_in as u32,
+                    pad_h as u32,
+                    pad_w as u32,
+                    tiles_h as u32,
+                    tiles_w as u32,
+                    &mut v,
+                )
+            }
+            .map_err(|e| anyhow!("winograd input transform: {:?}", e))?;
+
+            // M[p] = U[p] (K x C) * V[p] (C x T), p = 0..15.
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (t_total as u32).div_ceil(64).max(1),
+                    (n_out as u32).div_ceil(64).max(1),
+                    16,
+                ),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.module.sgemm_f16_tc_bmm_strided(
+                    &self.stream,
+                    cfg,
+                    n_out as u32,
+                    t_total as u32,
+                    c_in as u32,
+                    &u_view,
+                    &v,
+                    (n_out * c_in) as u32,
+                    c_in as u32,
+                    (c_in * t_total) as u32,
+                    1,
+                    t_total as u32,
+                    0,
+                    1.0,
+                    &mut mm,
+                )
+            }
+            .map_err(|e| anyhow!("winograd gemm: {:?}", e))?;
+
+            let bias_view = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    bias_ptr.unwrap_or(x_ptr),
+                    if has_bias { n_out } else { 1 },
+                    self.ctx.clone(),
+                )
+            });
+            let res_view = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    residual_ptr
+                        .map(|p| p + (b * n_out * out_h * out_w * 4) as u64)
+                        .unwrap_or(x_ptr),
+                    if has_residual {
+                        n_out * out_h * out_w
+                    } else {
+                        1
+                    },
+                    self.ctx.clone(),
+                )
+            });
+            let mut y_b = ManuallyDrop::new(unsafe {
+                DeviceBuffer::<f32>::from_raw_parts(
+                    result_buf.cu_deviceptr() + (b * n_out * out_h * out_w * 4) as u64,
+                    n_out * out_h * out_w,
+                    self.ctx.clone(),
+                )
+            });
+            unsafe {
+                self.module.winograd_output_transform(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((n_out * t_total) as u32),
+                    &mm,
+                    n_out as u32,
+                    tiles_h as u32,
+                    tiles_w as u32,
+                    out_h as u32,
+                    out_w as u32,
+                    &bias_view,
+                    u32::from(has_bias),
+                    &res_view,
+                    u32::from(has_residual),
+                    act,
+                    act_lo,
+                    act_hi,
+                    &mut y_b,
+                )
+            }
+            .map_err(|e| anyhow!("winograd output transform: {:?}", e))?;
+        }
+        tensors.push_scratch(v);
+        tensors.push_scratch(mm);
+        Ok(())
     }
 
     /// Read the activation the load-time graph rewrite fused into this node.
