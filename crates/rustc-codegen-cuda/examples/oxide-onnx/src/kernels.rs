@@ -2613,6 +2613,7 @@ pub mod gpu {
         b_col: u32,
         b_k: u32,
         b_k_contig: u32,
+        alpha: f32,
         mut out: DisjointSlice<f32>,
     ) {
         static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
@@ -2804,13 +2805,13 @@ pub mod gpu {
                     if gc < n {
                         unsafe {
                             *out.get_unchecked_mut((base_o + gc) as usize) =
-                                acc[t][(half * 2) as usize];
+                                acc[t][(half * 2) as usize] * alpha;
                         }
                     }
                     if gc + 1 < n {
                         unsafe {
                             *out.get_unchecked_mut((base_o + gc + 1) as usize) =
-                                acc[t][(half * 2 + 1) as usize];
+                                acc[t][(half * 2 + 1) as usize] * alpha;
                         }
                     }
                 }

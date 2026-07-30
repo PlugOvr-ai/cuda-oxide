@@ -66,7 +66,7 @@ pub fn optimize(
     stats.bn_affine = precompute_batchnorm_affine(nodes, weights);
     stats.residual_fused = fuse_residual_into_conv(nodes, graph_outputs);
     stats.matmul_bias_fused = fuse_bias_into_matmul(nodes, weights, graph_outputs);
-    stats.matmul_transpose_fused = fuse_transpose_into_matmul(nodes, graph_outputs);
+    stats.matmul_transpose_fused = fuse_transpose_into_matmul(nodes, weights, graph_outputs);
     stats
 }
 
@@ -89,6 +89,7 @@ pub fn optimize(
 /// transpose feeds nothing else.
 fn fuse_transpose_into_matmul(
     nodes: &mut Vec<NodeProto>,
+    weights: &Weights,
     graph_outputs: &HashSet<String>,
 ) -> usize {
     struct Fuse {
@@ -96,7 +97,8 @@ fn fuse_transpose_into_matmul(
         slot: usize,
         src: String,
         perm: i64,
-        tr: usize,
+        scale: f32,
+        dead: Vec<usize>,
     }
     let mut fuses: Vec<Fuse> = Vec::new();
     {
@@ -108,23 +110,76 @@ fn fuse_transpose_into_matmul(
                 continue;
             }
             for slot in 0..2usize {
-                let name = mm.input[slot].as_str();
-                let Some(&tr_idx) = producer.get(name) else {
-                    continue;
-                };
-                let tr = &nodes[tr_idx];
-                if tr.op_type != "Transpose" || tr.input.len() != 1 {
-                    continue;
+                // Walk back from the operand to the transpose that produced
+                // its layout, stepping over the shape-only and scale-only
+                // nodes in between. ViT does not hand the MatMul a transpose
+                // directly: it reaches the same [H, S, D] operand through a
+                // 5-D perm, a Squeeze, and the attention scale.
+                let mut cur = mm.input[slot].clone();
+                let mut passed: Vec<usize> = Vec::new();
+                let mut scale = 1.0f32;
+                let mut found: Option<(usize, i64, String)> = None;
+
+                for _ in 0..6 {
+                    if counts.get(cur.as_str()).copied().unwrap_or(0) != 1
+                        || graph_outputs.contains(&cur)
+                    {
+                        break;
+                    }
+                    let Some(&idx) = producer.get(cur.as_str()) else {
+                        break;
+                    };
+                    let node = &nodes[idx];
+                    match node.op_type.as_str() {
+                        "Transpose" if node.input.len() == 1 => {
+                            let perm = attr_ints(node, "perm");
+                            // 0213 on [1,S,H,D] and 20314 on [1,S,1,H,D] both
+                            // land on [.., H, S, D] over a source whose non-1
+                            // dims are (S, H, D), so they need the same
+                            // strides and share a code.
+                            let code = if perm == [0, 2, 1, 3] || perm == [2, 0, 3, 1, 4] {
+                                213
+                            } else if perm == [0, 2, 3, 1] {
+                                231
+                            } else {
+                                break;
+                            };
+                            found = Some((idx, code, node.input[0].clone()));
+                            passed.push(idx);
+                            break;
+                        }
+                        // Shape-only: the buffer is unchanged, and the strides
+                        // are derived from the non-1 dims either way.
+                        "Squeeze" | "Unsqueeze" | "Identity" => {
+                            passed.push(idx);
+                            cur = node.input[0].clone();
+                        }
+                        // A scalar multiply commutes with everything here, so
+                        // it can move to the far side of the matrix product
+                        // and become an alpha on the result.
+                        "Mul" if node.input.len() == 2 => {
+                            let (data_in, scalar_in) = if weights
+                                .get(node.input[1].as_str())
+                                .is_some_and(|w| w.0.len() == 1)
+                            {
+                                (0usize, 1usize)
+                            } else if weights
+                                .get(node.input[0].as_str())
+                                .is_some_and(|w| w.0.len() == 1)
+                            {
+                                (1, 0)
+                            } else {
+                                break;
+                            };
+                            scale *= weights[node.input[scalar_in].as_str()].0[0];
+                            passed.push(idx);
+                            cur = node.input[data_in].clone();
+                        }
+                        _ => break,
+                    }
                 }
-                if counts.get(name).copied().unwrap_or(0) != 1 || graph_outputs.contains(name) {
-                    continue;
-                }
-                let perm = attr_ints(tr, "perm");
-                let code = if perm == [0, 2, 1, 3] {
-                    213
-                } else if perm == [0, 2, 3, 1] {
-                    231
-                } else {
+
+                let Some((_, code, src)) = found else {
                     continue;
                 };
                 // A must present K contiguously; only 0213 does that.
@@ -134,9 +189,10 @@ fn fuse_transpose_into_matmul(
                 fuses.push(Fuse {
                     mm: mm_idx,
                     slot,
-                    src: tr.input[0].clone(),
+                    src,
                     perm: code,
-                    tr: tr_idx,
+                    scale,
+                    dead: passed,
                 });
             }
         }
@@ -155,7 +211,13 @@ fn fuse_transpose_into_matmul(
             },
             f.perm,
         );
-        dead.insert(f.tr);
+        if f.scale != 1.0 {
+            let prev = attr_f(mm, "oxide_alpha", 1.0);
+            set_attr_f(mm, "oxide_alpha", prev * f.scale);
+        }
+        for &d in &f.dead {
+            dead.insert(d);
+        }
     }
     if !dead.is_empty() {
         let mut idx = 0;

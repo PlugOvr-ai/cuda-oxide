@@ -2346,6 +2346,7 @@ impl OnnxExecutor {
                     1,
                     n as u32,
                     0,
+                    1.0,
                     &mut out,
                 )
             }
@@ -2424,9 +2425,24 @@ impl OnnxExecutor {
         a_perm: i64,
         b_perm: i64,
     ) -> Result<()> {
-        // A: [1, S, H, D] read as [H, S, D] — batch H, rows S, K contiguous.
+        // The attention scale rode along with the absorbed transposes; scalars
+        // commute through the product, so it lands on the result instead.
+        let alpha = attr_f(node, "oxide_alpha", 1.0);
+        // The source may be [1, S, H, D] or [1, S, 1, H, D] depending on how
+        // the graph got there, and Squeeze may or may not have run. Only the
+        // non-unit dims carry stride information, so read (S, H, D) off those
+        // and the rank stops mattering.
+        let squeeze =
+            |sh: &[usize]| -> Vec<usize> { sh.iter().copied().filter(|&d| d != 1).collect() };
+        let a_dims = squeeze(a_shape);
+        let b_dims = squeeze(b_shape);
+
+        // A: [S, H, D] read as [H, S, D] — batch H, rows S, K contiguous.
         let (l_batch, l_m, l_k, a_batch_s, a_row_s) = if a_perm == 213 {
-            let (sd, hd, dd) = (a_shape[1], a_shape[2], a_shape[3]);
+            if a_dims.len() != 3 {
+                return Err(anyhow!("MatMul a_perm on unexpected shape {:?}", a_shape));
+            }
+            let (sd, hd, dd) = (a_dims[0], a_dims[1], a_dims[2]);
             (hd, sd, dd, dd, hd * dd)
         } else {
             let m = a_shape[a_shape.len() - 2];
@@ -2435,14 +2451,20 @@ impl OnnxExecutor {
             (batch, m, k, m * k, k)
         };
         let (l_n, b_batch_s, b_col_s, b_k_s, b_contig) = match b_perm {
-            // [1, S, H, D] read as [H, D, S]: K is D, N is S.
+            // [S, H, D] read as [H, D, S]: K is D, N is S.
             231 => {
-                let (sd, hd, dd) = (b_shape[1], b_shape[2], b_shape[3]);
+                if b_dims.len() != 3 {
+                    return Err(anyhow!("MatMul b_perm on unexpected shape {:?}", b_shape));
+                }
+                let (sd, hd, dd) = (b_dims[0], b_dims[1], b_dims[2]);
                 (sd, dd, hd * dd, 1usize, 1u32)
             }
-            // [1, S, H, D] read as [H, S, D]: K is S, N is D.
+            // [S, H, D] read as [H, S, D]: K is S, N is D.
             213 => {
-                let (hd, dd) = (b_shape[2], b_shape[3]);
+                if b_dims.len() != 3 {
+                    return Err(anyhow!("MatMul b_perm on unexpected shape {:?}", b_shape));
+                }
+                let (hd, dd) = (b_dims[1], b_dims[2]);
                 (dd, dd, 1usize, hd * dd, 0u32)
             }
             _ => {
@@ -2485,11 +2507,11 @@ impl OnnxExecutor {
                 b_col_s as u32,
                 b_k_s as u32,
                 b_contig,
+                alpha,
                 &mut out,
             )
         }
         .map_err(|e| anyhow!("sgemm_f16_tc_bmm_strided launch: {:?}", e))?;
-        let _ = node;
         tensors.insert(out_name, out, vec![1, l_batch, l_m, l_n]);
         Ok(())
     }
