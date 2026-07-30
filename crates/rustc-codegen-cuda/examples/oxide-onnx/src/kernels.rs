@@ -3035,9 +3035,9 @@ pub mod gpu {
         out_w: u32,
         mut partials: DisjointSlice<f32>,
     ) {
-        // 64 rows x 16 halves = 512 u32 each; 2 KB per tile, 4 KB per block.
-        static mut AS: SharedArray<u32, 512> = SharedArray::UNINIT;
-        static mut BS: SharedArray<u32, 512> = SharedArray::UNINIT;
+        // 64 rows x 16 halves = 512 u32 per tile, double-buffered.
+        static mut AS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, 1024> = SharedArray::UNINIT;
         static mut KTAB: SharedArray<u32, 256> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x();
@@ -3065,10 +3065,8 @@ pub mod gpu {
         let khw = kh * kw;
         let plane = h_in * w_in;
         let kk_t = (tid & 7) * 2;
-        // Tap lookup: krc -> (kr, kc), packed. Filled once, then the two
-        // divisions that decompose a tap index become one shared read. The
-        // remaining two — decomposing k into (channel, tap) — are replaced by
-        // an incremental update, since k advances by a fixed 16 per step.
+        // Tap lookup: krc -> (kr, kc), packed. Filled once, so the two
+        // divisions that decompose a tap index become one shared read.
         let mut tap = 0u32;
         while tap * 256 + tid < khw {
             let idx = tap * 256 + tid;
@@ -3089,117 +3087,194 @@ pub mod gpu {
         let oh_b = gc_b / out_w;
         let ow_b = gc_b % out_w;
 
+        // Global reads for the next K step are issued before the current
+        // step's MMAs and stored to shared only afterwards, so their latency
+        // is spent on tensor-core work. Single-buffered, this kernel stalled on
+        // long_scoreboard at 6.3 warps per issue-active cycle with the tensor
+        // pipe under 18% — the same shape the batched GEMM showed before it
+        // was given a prefetch.
+        let mut areg = [0u32; 2];
+        let mut blo = [0.0f32; 2];
+        let mut bhi = [0.0f32; 2];
+
+        // ---- prologue: stage the first tile -------------------------------
+        let mut q = 0u32;
+        #[unroll]
+        while q < 2 {
+            let e = tid + q * 256;
+            let r = e >> 3;
+            let kk = (e & 7) * 2;
+            let gr = row0 + r;
+            let g0 = k_begin + kk;
+            areg[q as usize] = if gr < m && g0 < k_stop {
+                a_packed[(gr * kpairs + g0 / 2) as usize]
+            } else {
+                0u32
+            };
+            q += 1;
+        }
+        let g0p = k_begin + kk_t;
+        let g1p = g0p + 1;
+        let plo_p = unsafe { KTAB[krc_c as usize] };
+        let (ci_lo_p, kr_lo_p, kc_lo_p) = (ci_c, plo_p >> 16, plo_p & 0xffff);
+        let (ci_hi_p, krc_hi_p) = if krc_c + 1 >= khw {
+            (ci_c + 1, 0u32)
+        } else {
+            (ci_c, krc_c + 1)
+        };
+        let phi_p = unsafe { KTAB[krc_hi_p as usize] };
+        let (kr_hi_p, kc_hi_p) = (phi_p >> 16, phi_p & 0xffff);
+        let mut qp = 0u32;
+        #[unroll]
+        while qp < 2 {
+            let gc = if qp == 0 { gc_a } else { gc_b };
+            let oh = if qp == 0 { oh_a } else { oh_b };
+            let ow = if qp == 0 { ow_a } else { ow_b };
+            let mut lo = 0.0f32;
+            let mut hi = 0.0f32;
+            if gc < n {
+                if g0p < k_stop {
+                    let ih = (oh * stride_h + kr_lo_p * dil_h) as i32 - pad_h as i32;
+                    let iw = (ow * stride_w + kc_lo_p * dil_w) as i32 - pad_w as i32;
+                    if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                        lo = x[(ci_lo_p * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                    }
+                }
+                if g1p < k_stop {
+                    let ih = (oh * stride_h + kr_hi_p * dil_h) as i32 - pad_h as i32;
+                    let iw = (ow * stride_w + kc_hi_p * dil_w) as i32 - pad_w as i32;
+                    if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                        hi = x[(ci_hi_p * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                    }
+                }
+            }
+            blo[qp as usize] = lo;
+            bhi[qp as usize] = hi;
+            qp += 1;
+        }
+        let mut qs0 = 0u32;
+        #[unroll]
+        while qs0 < 2 {
+            let e = tid + qs0 * 256;
+            unsafe {
+                AS[e as usize] = areg[qs0 as usize];
+                BS[e as usize] = pack_f16x2(blo[qs0 as usize], bhi[qs0 as usize]);
+            }
+            qs0 += 1;
+        }
+        thread::sync_threads();
+        krc_c += 16;
+        while krc_c >= khw {
+            krc_c -= khw;
+            ci_c += 1;
+        }
+
+        let mut buf = 0u32;
         let mut k0 = k_begin;
         while k0 < k_stop {
-            // Stage A as AS[row][kpair]: 512 registers, 4 per thread.
-            let mut q = 0u32;
-            #[unroll]
-            while q < 2 {
-                let e = tid + q * 256;
-                let r = e >> 3;
-                let kk = (e & 7) * 2;
-                let gr = row0 + r;
-                let g0 = k0 + kk;
-                // Already half-packed at load time: one 32-bit read, no
-                // conversion, half the bytes of the f32 form.
-                unsafe {
-                    AS[e as usize] = if gr < m && g0 < k_stop {
-                        a_packed[(gr * kpairs + g0 / 2) as usize]
+            let k_next = k0 + 16;
+
+            if k_next < k_stop {
+                let mut qa = 0u32;
+                #[unroll]
+                while qa < 2 {
+                    let e = tid + qa * 256;
+                    let r = e >> 3;
+                    let kk = (e & 7) * 2;
+                    let gr = row0 + r;
+                    let g = k_next + kk;
+                    areg[qa as usize] = if gr < m && g < k_stop {
+                        a_packed[(gr * kpairs + g / 2) as usize]
                     } else {
                         0u32
                     };
+                    qa += 1;
                 }
-                q += 1;
-            }
-            // Stage B directly from the input tensor: the column matrix is
-            // never materialised. For a 3x3 convolution im2col inflates the
-            // input ninefold, so reading X here saves both that write and the
-            // inflated read the GEMM would otherwise do.
-            //
-            // The index arithmetic is what this kernel is actually limited by:
-            // occupancy is 62-80% and DRAM under 11%, but `wait` sits at 3.5
-            // with the tensor pipe at 9%, which is a dependency chain, not a
-            // memory or occupancy problem. Two things were recomputed for no
-            // reason. The output coordinates depend only on the thread, not on
-            // k, so they are hoisted out of the loop entirely; and both staged
-            // elements share the same k, so the tap they select is the same
-            // for both and is now computed once per step instead of twice.
-            let g0 = k0 + kk_t;
-            let g1 = g0 + 1;
-            let packed_lo = unsafe { KTAB[krc_c as usize] };
-            let (ci_lo, kr_lo, kc_lo) = (ci_c, packed_lo >> 16, packed_lo & 0xffff);
-            let (ci_hi, krc_hi) = if krc_c + 1 >= khw {
-                (ci_c + 1, 0u32)
-            } else {
-                (ci_c, krc_c + 1)
-            };
-            let packed_hi = unsafe { KTAB[krc_hi as usize] };
-            let (kr_hi, kc_hi) = (packed_hi >> 16, packed_hi & 0xffff);
-
-            let mut q2 = 0u32;
-            #[unroll]
-            while q2 < 2 {
-                let e = tid + q2 * 256;
-                let gc = if q2 == 0 { gc_a } else { gc_b };
-                let oh = if q2 == 0 { oh_a } else { oh_b };
-                let ow = if q2 == 0 { ow_a } else { ow_b };
-                let mut lo = 0.0f32;
-                let mut hi = 0.0f32;
-                if gc < n {
-                    if g0 < k_stop {
-                        let ih = (oh * stride_h + kr_lo * dil_h) as i32 - pad_h as i32;
-                        let iw = (ow * stride_w + kc_lo * dil_w) as i32 - pad_w as i32;
-                        if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
-                            lo = x[(ci_lo * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                let g0 = k_next + kk_t;
+                let g1 = g0 + 1;
+                let plo = unsafe { KTAB[krc_c as usize] };
+                let (ci_lo, kr_lo, kc_lo) = (ci_c, plo >> 16, plo & 0xffff);
+                let (ci_hi, krc_hi) = if krc_c + 1 >= khw {
+                    (ci_c + 1, 0u32)
+                } else {
+                    (ci_c, krc_c + 1)
+                };
+                let phi = unsafe { KTAB[krc_hi as usize] };
+                let (kr_hi, kc_hi) = (phi >> 16, phi & 0xffff);
+                let mut qb = 0u32;
+                #[unroll]
+                while qb < 2 {
+                    let gc = if qb == 0 { gc_a } else { gc_b };
+                    let oh = if qb == 0 { oh_a } else { oh_b };
+                    let ow = if qb == 0 { ow_a } else { ow_b };
+                    let mut lo = 0.0f32;
+                    let mut hi = 0.0f32;
+                    if gc < n {
+                        if g0 < k_stop {
+                            let ih = (oh * stride_h + kr_lo * dil_h) as i32 - pad_h as i32;
+                            let iw = (ow * stride_w + kc_lo * dil_w) as i32 - pad_w as i32;
+                            if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                                lo = x[(ci_lo * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                            }
+                        }
+                        if g1 < k_stop {
+                            let ih = (oh * stride_h + kr_hi * dil_h) as i32 - pad_h as i32;
+                            let iw = (ow * stride_w + kc_hi * dil_w) as i32 - pad_w as i32;
+                            if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
+                                hi = x[(ci_hi * plane + (ih as u32) * w_in + (iw as u32)) as usize];
+                            }
                         }
                     }
-                    if g1 < k_stop {
-                        let ih = (oh * stride_h + kr_hi * dil_h) as i32 - pad_h as i32;
-                        let iw = (ow * stride_w + kc_hi * dil_w) as i32 - pad_w as i32;
-                        if ih >= 0 && ih < h_in as i32 && iw >= 0 && iw < w_in as i32 {
-                            hi = x[(ci_hi * plane + (ih as u32) * w_in + (iw as u32)) as usize];
-                        }
-                    }
+                    blo[qb as usize] = lo;
+                    bhi[qb as usize] = hi;
+                    qb += 1;
                 }
-                unsafe {
-                    BS[e as usize] = pack_f16x2(lo, hi);
-                }
-                q2 += 1;
             }
-            thread::sync_threads();
 
-            // One A fragment for this warp's 16 rows, reused by all 8 tiles.
+            let base = buf * 512;
             let arow = (warp & 3) * 16;
             let ncol_base = (warp >> 2) * 32;
-            let a0 = unsafe { AS[((arow + gid) * 8 + tig) as usize] };
-            let a1 = unsafe { AS[((arow + gid + 8) * 8 + tig) as usize] };
-            let a2 = unsafe { AS[((arow + gid) * 8 + tig + 4) as usize] };
-            let a3 = unsafe { AS[((arow + gid + 8) * 8 + tig + 4) as usize] };
+            let a0 = unsafe { AS[(base + (arow + gid) * 8 + tig) as usize] };
+            let a1 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig) as usize] };
+            let a2 = unsafe { AS[(base + (arow + gid) * 8 + tig + 4) as usize] };
+            let a3 = unsafe { AS[(base + (arow + gid + 8) * 8 + tig + 4) as usize] };
 
             let mut t = 0usize;
             #[unroll]
             while t < 4 {
                 let ncol = ncol_base + t as u32 * 8 + gid;
-                let b0 = unsafe { BS[(ncol * 8 + tig) as usize] };
-                let b1 = unsafe { BS[(ncol * 8 + tig + 4) as usize] };
+                let b0 = unsafe { BS[(base + ncol * 8 + tig) as usize] };
+                let b1 = unsafe { BS[(base + ncol * 8 + tig + 4) as usize] };
                 unsafe {
                     mma_sync_m16n8k16_f32_f16(&mut acc[t], a0, a1, a2, a3, b0, b1);
                 }
                 t += 1;
             }
-            thread::sync_threads();
-            // k advances by a constant, so the (channel, tap) split advances
-            // with it: no division needed after the first.
-            krc_c += 16;
-            while krc_c >= khw {
-                krc_c -= khw;
-                ci_c += 1;
+
+            if k_next < k_stop {
+                let other = (buf ^ 1) * 512;
+                let mut qs = 0u32;
+                #[unroll]
+                while qs < 2 {
+                    let e = tid + qs * 256;
+                    unsafe {
+                        AS[(other + e) as usize] = areg[qs as usize];
+                        BS[(other + e) as usize] = pack_f16x2(blo[qs as usize], bhi[qs as usize]);
+                    }
+                    qs += 1;
+                }
+                krc_c += 16;
+                while krc_c >= khw {
+                    krc_c -= khw;
+                    ci_c += 1;
+                }
             }
-            k0 += 16;
+            thread::sync_threads();
+            buf ^= 1;
+            k0 = k_next;
         }
 
-        // Partial store; alpha, bias and activation belong to `reduce_splits`.
-        let plane = split * m * n;
+        let plane_o = split * m * n;
         let mut t = 0usize;
         #[unroll]
         while t < 4 {
@@ -3209,16 +3284,16 @@ pub mod gpu {
             while half < 2 {
                 let gr = row0 + (warp & 3) * 16 + gid + half * 8;
                 if gr < m {
-                    let base = plane + gr * n;
+                    let base_o = plane_o + gr * n;
                     if gc < n {
                         unsafe {
-                            *partials.get_unchecked_mut((base + gc) as usize) =
+                            *partials.get_unchecked_mut((base_o + gc) as usize) =
                                 acc[t][(half * 2) as usize];
                         }
                     }
                     if gc + 1 < n {
                         unsafe {
-                            *partials.get_unchecked_mut((base + gc + 1) as usize) =
+                            *partials.get_unchecked_mut((base_o + gc + 1) as usize) =
                                 acc[t][(half * 2 + 1) as usize];
                         }
                     }
@@ -3227,26 +3302,9 @@ pub mod gpu {
             }
             t += 1;
         }
+        let _ = c_in;
     }
 
-    // =========================================================================
-    // Split-K GEMM — partial products over a slice of K, one per grid.z.
-    //
-    //   At batch 1 the output is often too small to occupy the GPU on its own:
-    //   ResNet50's last stage is M=512, N=49, i.e. 25 088 elements total. No
-    //   tiling of the output can fill 82 SMs with useful work, and giving each
-    //   thread more outputs (which is what buys arithmetic intensity) makes it
-    //   strictly worse — the 64x64 tile leaves 8 blocks.
-    //
-    //   Splitting the reduction dimension restores the parallelism: each block
-    //   accumulates over K/splits and writes a partial tile, and `reduce_splits`
-    //   sums them. Now a shape can have both intensity (4x4 per thread) and
-    //   enough blocks, which the fixed-tile kernels could not do at once.
-    //
-    //   Launch: grid=(ceil(n/64), ceil(m/64), splits), block=(16,16,1).
-    //   `partials` is [splits][m][n]; alpha, bias and activation are applied by
-    //   the reduction, not here.
-    // =========================================================================
     #[kernel]
     pub fn sgemm_reg_splitk(
         m: u32,
