@@ -63,6 +63,14 @@ pub struct OnnxExecutor {
     /// Winograd-domain filters, keyed by (weight pointer, K, C). The filter
     /// transform depends only on load-time constants, so it runs once.
     wino_filters: RefCell<HashMap<(u64, usize, usize), DeviceBuffer<f32>>>,
+    /// Tensors whose value is a function of the input *shapes* only — the
+    /// Shape/Slice/Concat arithmetic that feeds Reshape, Resize and Pad. See
+    /// [`Self::host_vals`].
+    shape_derived: std::collections::HashSet<String>,
+    /// Memoised host copies of those, and the input geometry they were
+    /// computed for.
+    shape_cache: RefCell<HashMap<String, Vec<f32>>>,
+    shape_cache_sig: RefCell<u64>,
 }
 
 impl OnnxExecutor {
@@ -112,7 +120,37 @@ impl OnnxExecutor {
             .map(|vi| vi.name.clone())
             .collect();
 
-        let output_names = graph.output.iter().map(|vi| vi.name.clone()).collect();
+        let output_names: Vec<String> = graph.output.iter().map(|vi| vi.name.clone()).collect();
+
+        // Which tensors carry shape arithmetic rather than data.
+        //
+        // Reading one back costs a `to_host_vec`, and that is a full stream
+        // sync: everything already queued has to finish first. FCN-ResNet50's
+        // final Resize measured 798 us that way while its kernel takes 19 —
+        // the rest was the pipeline draining. These values can be memoised,
+        // but only if they depend on the input shapes and not on the data, so
+        // membership is decided here rather than assumed at the call site: a
+        // `Shape` output is shape-derived, and so is any node all of whose
+        // inputs are constants or already shape-derived.
+        let mut shape_derived: std::collections::HashSet<String> = Default::default();
+        for node in &nodes {
+            let derived = if node.op_type == "Shape" {
+                true
+            } else {
+                !node.input.is_empty()
+                    && node.input.iter().all(|i| {
+                        i.is_empty()
+                            || weights.contains_key(i)
+                            || consts.contains_key(i)
+                            || shape_derived.contains(i)
+                    })
+            };
+            if derived {
+                for o in &node.output {
+                    shape_derived.insert(o.clone());
+                }
+            }
+        }
 
         // `mma.sync.aligned.m16n8k16` is Ampere and later. Without this check
         // the engine is quietly sm_80-only: on anything older the f16 path
@@ -148,6 +186,9 @@ impl OnnxExecutor {
             f16_weights: RefCell::new(HashMap::new()),
             f16_weights_b: RefCell::new(HashMap::new()),
             wino_filters: RefCell::new(HashMap::new()),
+            shape_derived,
+            shape_cache: RefCell::new(HashMap::new()),
+            shape_cache_sig: RefCell::new(0),
             tensor_cores,
         })
     }
@@ -159,6 +200,32 @@ impl OnnxExecutor {
     ) -> Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
         let t_setup = std::time::Instant::now();
         let mut tensors = TensorMap::new();
+
+        // Shape arithmetic is memoised per input geometry; if the caller feeds
+        // a different shape, the cached values no longer describe this run.
+        {
+            let mut sig: u64 = 1469598103934665603;
+            let mut names: Vec<&String> = inputs.keys().collect();
+            names.sort();
+            for n in names {
+                for b in n.as_bytes().iter().chain(
+                    inputs[n]
+                        .1
+                        .iter()
+                        .flat_map(|d| d.to_le_bytes().to_vec())
+                        .collect::<Vec<u8>>()
+                        .iter(),
+                ) {
+                    sig ^= *b as u64;
+                    sig = sig.wrapping_mul(1099511628211);
+                }
+            }
+            let mut stored = self.shape_cache_sig.borrow_mut();
+            if *stored != sig {
+                self.shape_cache.borrow_mut().clear();
+                *stored = sig;
+            }
+        }
 
         for (name, (data, shape)) in inputs {
             // Stream-ordered allocation, not `from_host`: that allocates with
@@ -469,10 +536,22 @@ impl OnnxExecutor {
         if let Some(v) = self.consts.get(name) {
             return Ok(v.clone());
         }
+        if self.shape_derived.contains(name) {
+            if let Some(v) = self.shape_cache.borrow().get(name) {
+                return Ok(v.clone());
+            }
+        }
         let eb = Self::get_tensor(tensors, &self.weights, name)?;
-        eb.buf()
+        let v = eb
+            .buf()
             .to_host_vec(&self.stream)
-            .map_err(|e| anyhow!("host_vals '{}' d2h: {:?}", name, e))
+            .map_err(|e| anyhow!("host_vals '{}' d2h: {:?}", name, e))?;
+        if self.shape_derived.contains(name) {
+            self.shape_cache
+                .borrow_mut()
+                .insert(name.to_string(), v.clone());
+        }
+        Ok(v)
     }
 
     fn dtod_copy(&self, dst: &DeviceBuffer<f32>, src_ptr: u64, num_bytes: usize) -> Result<()> {

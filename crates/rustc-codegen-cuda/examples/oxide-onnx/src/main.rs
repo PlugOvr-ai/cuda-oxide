@@ -1677,6 +1677,11 @@ fn run_generic_model(model_path: &str, model_name: &str, input_shape: &[usize]) 
     let mut inputs = HashMap::new();
     inputs.insert(input_name, (input_data.clone(), input_shape.to_vec()));
 
+    // One inference before anything is measured: the first pays for f16 weight
+    // packing, Winograd filter transforms, memory-pool growth and the shape
+    // memoisation, none of which recur. Profiling or timing that run describes
+    // start-up, not the model.
+    let _ = executor.run(&inputs)?;
     let t0 = Instant::now();
     let outputs = executor.run(&inputs)?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1692,6 +1697,17 @@ fn run_generic_model(model_path: &str, model_name: &str, input_shape: &[usize]) 
         "  [oxide] Output '{}' shape={:?}  ({:.1} ms)",
         first_out, oshape, elapsed_ms
     );
+
+    // Not `let _ = ...`: a failing inference returns immediately, and a
+    // discarded error turns that into an impossibly fast benchmark rather than
+    // a failure. This reported 0.09 ms for a 5 GFLOP model — above the card's
+    // peak — while the run was actually erroring out of memory.
+    let bench_ms = bench_fn(model_name, 3, 10, || {
+        executor
+            .run(&inputs)
+            .expect("inference failed during benchmark");
+    });
+    let _ = bench_ms;
 
     print!("  [ort]   Running ORT CUDA reference... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
