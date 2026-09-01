@@ -57,9 +57,42 @@ impl BackendOptions {
     /// crate is `CUDA_OXIDE_LLVM_LINK` in `llvm_tools::resolve_sibling_tool`
     /// (a per-toolchain tool override, not a compile option).
     pub fn from_env() -> Self {
+        // A per-crate target, which is what makes one binary able to carry
+        // kernels for two architectures.
+        //
+        // The device target is resolved once per rustc invocation, and cargo
+        // runs one invocation per crate, so a crate is already the unit that
+        // gets its own artifact bundle — `load_embedded_module` selects
+        // between them by name at run time. What was missing was any way to
+        // give those bundles *different* targets: `CUDA_OXIDE_TARGET` is one
+        // process-wide value, so asking for `sm_110a` anywhere asked for it
+        // everywhere, and the portable baseline stopped loading on the cards
+        // it was the baseline for.
+        //
+        // `CUDA_OXIDE_TARGET_<CRATE_NAME>` (upper-cased, `-` as `_`) overrides
+        // it for one crate. Cargo sets `CARGO_CRATE_NAME` per invocation, so
+        // this needs no new plumbing and no build-system cooperation:
+        //
+        //     CUDA_OXIDE_TARGET_OXIDE_BLACKWELL=sm_110a cargo oxide build
+        //
+        // leaves every other crate on its own detected target.
+        let per_crate = std::env::var("CARGO_CRATE_NAME").ok().and_then(|name| {
+            let key = format!("CUDA_OXIDE_TARGET_{}", name.to_uppercase().replace('-', "_"));
+            std::env::var(&key).ok().map(|value| (key, value))
+        });
+        let (target_arch_source, target_arch) = match per_crate {
+            Some((key, value)) => (
+                Box::leak(key.into_boxed_str()) as &'static str,
+                Some(value),
+            ),
+            None => (
+                "CUDA_OXIDE_TARGET",
+                std::env::var("CUDA_OXIDE_TARGET").ok(),
+            ),
+        };
         Self {
-            target_arch: std::env::var("CUDA_OXIDE_TARGET").ok(),
-            target_arch_source: "CUDA_OXIDE_TARGET",
+            target_arch,
+            target_arch_source,
             device_arch_hint: std::env::var("CUDA_OXIDE_DEVICE_ARCH").ok(),
             no_opt: std::env::var("CUDA_OXIDE_NO_OPT").is_ok(),
             no_fma: std::env::var("CUDA_OXIDE_NO_FMA").is_ok(),

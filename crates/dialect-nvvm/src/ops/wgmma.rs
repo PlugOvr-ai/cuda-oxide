@@ -286,6 +286,116 @@ impl Verify for MmaSyncM16N8K16F32F16Op {
     }
 }
 
+/// Ampere warp-level MMA: m16n8k32, s32 accumulator, s8 inputs.
+///
+/// The integer sibling of the f16 op above, with the identical operand shape:
+/// a pointer to four accumulator words and six u32 fragment registers. The
+/// accumulator words are s32 rather than f32, which only the lowering cares
+/// about.
+///
+/// PTX: `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`
+#[pliron_op(
+    name = "nvvm.mma_sync_m16n8k32_s32_s8",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<7>, NResultsInterface<0>],
+)]
+pub struct MmaSyncM16N8K32S32S8Op;
+
+impl MmaSyncM16N8K32S32S8Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MmaSyncM16N8K32S32S8Op { op }
+    }
+}
+
+/// Cooperative warp fragment load: `ldmatrix`, four 8x8 b16 matrices.
+///
+/// PTX: `ldmatrix.sync.aligned.m8n8.x4.b16`
+///
+/// # Operands
+///
+/// - `out_ptr` (ptr): pointer to four u32 words the fragment lands in
+/// - `addr` (ptr): shared-memory address this lane contributes
+#[pliron_op(
+    name = "nvvm.ldmatrix_x4_b16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+)]
+pub struct LdmatrixX4B16Op;
+
+impl LdmatrixX4B16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        LdmatrixX4B16Op { op }
+    }
+}
+
+/// Cooperative warp fragment load: `ldmatrix_x1_b16`.
+#[pliron_op(
+    name = "nvvm.ldmatrixx1b16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+)]
+pub struct LdmatrixX1B16Op;
+
+impl LdmatrixX1B16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        LdmatrixX1B16Op { op }
+    }
+}
+
+/// Cooperative warp fragment load: `ldmatrix_x2_b16`.
+#[pliron_op(
+    name = "nvvm.ldmatrixx2b16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+)]
+pub struct LdmatrixX2B16Op;
+
+impl LdmatrixX2B16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        LdmatrixX2B16Op { op }
+    }
+}
+
+/// Cooperative warp fragment load: `ldmatrix_x2_trans_b16`.
+#[pliron_op(
+    name = "nvvm.ldmatrixx2transb16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+)]
+pub struct LdmatrixX2TransB16Op;
+
+impl LdmatrixX2TransB16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        LdmatrixX2TransB16Op { op }
+    }
+}
+
+/// Cooperative warp fragment load: `ldmatrix_x4_trans_b16`.
+#[pliron_op(
+    name = "nvvm.ldmatrixx4transb16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+)]
+pub struct LdmatrixX4TransB16Op;
+
+impl LdmatrixX4TransB16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        LdmatrixX4TransB16Op { op }
+    }
+}
+
 /// Ampere warp-level MMA: m16n8k8, f32 accumulator, tf32 inputs.
 ///
 /// Performs `D = A × B + C` for one warp-collective 16×8×8 tile.
@@ -323,4 +433,10 @@ pub(super) fn register(ctx: &mut Context) {
     WgmmaMmaGroupM64N64K16F32Bf16Op::register(ctx);
     MmaSyncM16N8K8F32Tf32Op::register(ctx);
     MmaSyncM16N8K16F32F16Op::register(ctx);
+    MmaSyncM16N8K32S32S8Op::register(ctx);
+    LdmatrixX4B16Op::register(ctx);
+    LdmatrixX1B16Op::register(ctx);
+    LdmatrixX2B16Op::register(ctx);
+    LdmatrixX2TransB16Op::register(ctx);
+    LdmatrixX4TransB16Op::register(ctx);
 }

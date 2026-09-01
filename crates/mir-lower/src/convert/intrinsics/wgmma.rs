@@ -313,6 +313,330 @@ pub(crate) fn convert_mma_sync_f16(
     Ok(())
 }
 
+/// Convert Ampere `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`.
+///
+/// Operands: `[acc_ptr, a0, a1, a2, a3, b0, b1]`. Loads the 4-f32
+/// accumulator from `acc_ptr`, issues the tensor-core MMA with the C/D
+/// accumulator tied (read-modify-write), and stores the 4 results back.
+pub(crate) fn convert_mma_sync_s8(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 7 {
+        return pliron::input_err_noloc!(
+            "mma_sync_m16n8k32_s32_s8 requires 7 operands [acc_ptr, a0..a3, b0, b1]"
+        );
+    }
+    let acc_ptr = operands[0];
+    let (a0, a1, a2, a3) = (operands[1], operands[2], operands[3], operands[4]);
+    let (b0, b1) = (operands[5], operands[6]);
+
+    let s32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    // Load c0..c3 from the accumulator (acc_ptr is s32*; index by element).
+    let mut c = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], s32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let ld = llvm::LoadOp::new(ctx, gptr, s32_ty.into());
+        rewriter.insert_operation(ctx, ld.get_operation());
+        c.push(ld.get_operation().deref(ctx).get_result(0));
+    }
+
+    // D = A·B + C, with C/D tied so the MMA is a read-modify-write of the
+    // same four registers. LLVM inline asm returns multiple outputs as a
+    // literal struct, so the op yields `{float, float, float, float}` and the
+    // elements come back out with `extractvalue`.
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![s32_ty.into(); 4]).into();
+
+    // Inputs are ordered tied-first: c0..c3 (tied to outputs 0..3), then
+    // a0..a3, then b0,b1 — matching the constraint string below.
+    let mut inputs = c;
+    inputs.extend_from_slice(&[a0, a1, a2, a3, b0, b1]);
+
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        inputs,
+        // Operand numbering: $0..$3 = outputs (D). Inputs follow: the 4 tied
+        // accumulator inputs are $4..$7 (alias $0..$3), then A = $8..$11,
+        // B = $12,$13. C uses the tied outputs $0..$3.
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 \
+{$0,$1,$2,$3}, {$8,$9,$10,$11}, {$12,$13}, {$0,$1,$2,$3};",
+        // 4 s32 outputs, 4 inputs tied to them, then 6 b32 register inputs.
+        "=r,=r,=r,=r,0,1,2,3,r,r,r,r,r,r",
+        // mma.sync is warp-collective and writes the accumulator: convergent
+        // with side effects.
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+
+    // Store the 4 D results back into the accumulator.
+    for i in 0..4u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, acc_ptr, vec![GepIndex::Constant(i)], s32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `ldmatrix.sync.aligned.m8n8.x4.b16`.
+///
+/// Operands: `[out_ptr, addr]`. `addr` is a generic pointer into shared
+/// memory; PTX wants the shared-window offset, so the asm does the
+/// `cvta.to.shared` itself and the caller can pass an ordinary
+/// `SharedArray` element pointer.
+pub(crate) fn convert_ldmatrix_x4_b16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("ldmatrix_x4_b16 requires 2 operands [out_ptr, addr]");
+    }
+    let out_ptr = operands[0];
+    let addr = operands[1];
+
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![u32_ty.into(); 4]).into();
+
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        vec![addr],
+        "{\n\t.reg .u32 %ldm_s;\n\tcvt.u32.u64 %ldm_s, $4;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {$0,$1,$2,$3}, [%ldm_s];\n\t}",
+        "=r,=r,=r,=r,l",
+        // Warp-collective and reads memory the rest of the block writes.
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+
+    for i in 0..4u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, out_ptr, vec![GepIndex::Constant(i)], u32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `ldmatrix.sync.aligned.m8n8.x1.b16`.
+///
+/// Operands: `[out_ptr, addr]`. As `ldmatrix_x4_b16`: the pointer is already
+/// shared-space, so the asm converts it to u32 and indexes directly — a
+/// `cvta.to.shared` here is an illegal access.
+pub(crate) fn convert_ldmatrixx1b16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("LdmatrixX1B16Op requires 2 operands [out_ptr, addr]");
+    }
+    let out_ptr = operands[0];
+    let addr = operands[1];
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    // LLVM rejects a one-element struct return from inline asm: a single
+    // output must come back as the scalar itself.
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        u32_ty.into(),
+        vec![addr],
+        "{\n\t.reg .u32 %ldm_s;\n\t\
+cvt.u32.u64 %ldm_s, $1;\n\t\
+ldmatrix.sync.aligned.m8n8.x1.b16 {$0}, [%ldm_s];\n\t}",
+        "=r,l",
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let d = asm_op.deref(ctx).get_result(0);
+    let gep =
+        llvm::GetElementPtrOp::new(ctx, out_ptr, vec![GepIndex::Constant(0u32)], u32_ty.into());
+    rewriter.insert_operation(ctx, gep.get_operation());
+    let gptr = gep.get_operation().deref(ctx).get_result(0);
+    let st = llvm::StoreOp::new(ctx, d, gptr);
+    rewriter.insert_operation(ctx, st.get_operation());
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `ldmatrix.sync.aligned.m8n8.x2.b16`.
+///
+/// Operands: `[out_ptr, addr]`. As `ldmatrix_x4_b16`: the pointer is already
+/// shared-space, so the asm converts it to u32 and indexes directly — a
+/// `cvta.to.shared` here is an illegal access.
+pub(crate) fn convert_ldmatrixx2b16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("LdmatrixX2B16Op requires 2 operands [out_ptr, addr]");
+    }
+    let out_ptr = operands[0];
+    let addr = operands[1];
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![u32_ty.into(); 2]).into();
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        vec![addr],
+        "{\n\t.reg .u32 %ldm_s;\n\t\
+cvt.u32.u64 %ldm_s, $2;\n\t\
+ldmatrix.sync.aligned.m8n8.x2.b16 {$0,$1}, [%ldm_s];\n\t}",
+        "=r,=r,l",
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+    for i in 0..2u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, out_ptr, vec![GepIndex::Constant(i)], u32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `ldmatrix.sync.aligned.m8n8.x2.trans.b16`.
+///
+/// Operands: `[out_ptr, addr]`. As `ldmatrix_x4_b16`: the pointer is already
+/// shared-space, so the asm converts it to u32 and indexes directly — a
+/// `cvta.to.shared` here is an illegal access.
+pub(crate) fn convert_ldmatrixx2transb16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("LdmatrixX2TransB16Op requires 2 operands [out_ptr, addr]");
+    }
+    let out_ptr = operands[0];
+    let addr = operands[1];
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![u32_ty.into(); 2]).into();
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        vec![addr],
+        "{\n\t.reg .u32 %ldm_s;\n\t\
+cvt.u32.u64 %ldm_s, $2;\n\t\
+ldmatrix.sync.aligned.m8n8.x2.trans.b16 {$0,$1}, [%ldm_s];\n\t}",
+        "=r,=r,l",
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+    for i in 0..2u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, out_ptr, vec![GepIndex::Constant(i)], u32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `ldmatrix.sync.aligned.m8n8.x4.trans.b16`.
+///
+/// Operands: `[out_ptr, addr]`. As `ldmatrix_x4_b16`: the pointer is already
+/// shared-space, so the asm converts it to u32 and indexes directly — a
+/// `cvta.to.shared` here is an illegal access.
+pub(crate) fn convert_ldmatrixx4transb16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("LdmatrixX4TransB16Op requires 2 operands [out_ptr, addr]");
+    }
+    let out_ptr = operands[0];
+    let addr = operands[1];
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, vec![u32_ty.into(); 4]).into();
+    let asm = llvm::InlineAsmOp::build(
+        ctx,
+        struct_ty,
+        vec![addr],
+        "{\n\t.reg .u32 %ldm_s;\n\t\
+cvt.u32.u64 %ldm_s, $4;\n\t\
+ldmatrix.sync.aligned.m8n8.x4.trans.b16 {$0,$1,$2,$3}, [%ldm_s];\n\t}",
+        "=r,=r,=r,=r,l",
+        AsmKind::Convergent,
+    );
+    let asm_op = asm.get_operation();
+    rewriter.insert_operation(ctx, asm_op);
+    let aggregate = asm_op.deref(ctx).get_result(0);
+    for i in 0..4u32 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![i])?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        let d = extract.get_operation().deref(ctx).get_result(0);
+        let gep =
+            llvm::GetElementPtrOp::new(ctx, out_ptr, vec![GepIndex::Constant(i)], u32_ty.into());
+        rewriter.insert_operation(ctx, gep.get_operation());
+        let gptr = gep.get_operation().deref(ctx).get_result(0);
+        let st = llvm::StoreOp::new(ctx, d, gptr);
+        rewriter.insert_operation(ctx, st.get_operation());
+    }
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::deferred_group_template;

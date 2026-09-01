@@ -316,6 +316,167 @@ pub unsafe fn mma_sync_m16n8k16_f32_f16(
     unreachable!("mma_sync_m16n8k16_f32_f16 called outside CUDA kernel context")
 }
 
+/// Ampere warp-level MMA over int8: `m16n8k32`, s32 accumulator.
+///
+/// The integer sibling of [`mma_sync_m16n8k16_f32_f16`], and the primitive
+/// llama.cpp's `mmq` kernels are built on. Same 7-register shape — the wider
+/// K is absorbed by four s8 lanes per 32-bit register.
+///
+/// Per-thread fragment layout (PTX ISA, `mma.sync.aligned.m16n8k32`), with
+/// `group = lane / 4` and `tig = lane % 4`:
+/// - `acc`: 4 s32 registers, rows `group`/`group + 8`, columns `2·tig`,
+///   `2·tig + 1`.
+/// - `a0..a3`: A 16×32 s8 fragment — rows `group`/`group + 8`, k bytes
+///   `4·tig..4·tig+3` and `16 + 4·tig..`.
+/// - `b0,b1`: B 8×32 s8 fragment — column `group`, same two k spans.
+///
+/// PTX: `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`
+///
+/// # Safety
+/// As [`mma_sync_m16n8k16_f32_f16`]: warp-collective, sm_80+, caller owns the
+/// lane→element packing.
+#[inline(never)]
+pub unsafe fn mma_sync_m16n8k32_s32_s8(
+    acc: &mut [i32; 4],
+    a0: u32,
+    a1: u32,
+    a2: u32,
+    a3: u32,
+    b0: u32,
+    b1: u32,
+) {
+    let _ = (acc, a0, a1, a2, a3, b0, b1);
+    unreachable!("mma_sync_m16n8k32_s32_s8 called outside CUDA kernel context")
+}
+
+/// Cooperative warp load of four 8x8 b16 matrices from shared memory.
+///
+/// `ldmatrix` is how a warp fills MMA fragments: one instruction reads the
+/// whole warp's operand, with the swizzled lane-to-element mapping done in
+/// hardware. The scalar alternative is four shared loads per thread per
+/// fragment, which is measurably the difference between this engine's MMA
+/// kernels and llama.cpp's — 3.38 shared-load instructions per MMA against
+/// 0.70.
+///
+/// `addr` is a pointer to shared memory, 16-byte aligned, and each lane
+/// supplies the address of one matrix row: lanes 0..7 give the rows of the
+/// first matrix, 8..15 the second, and so on. The four loaded registers land
+/// in `out` in the layout `mma_sync_m16n8k16_f32_f16` and
+/// `mma_sync_m16n8k32_s32_s8` expect for their A operand.
+///
+/// # Safety
+///
+/// Warp-collective: every lane of the warp must reach this call, and `addr`
+/// must point into shared memory.
+#[inline(never)]
+pub unsafe fn ldmatrix_x4_b16(out: &mut [u32; 4], addr: *const u32) {
+    let _ = (out, addr);
+    unreachable!("ldmatrix_x4_b16 called outside CUDA kernel context")
+}
+
+/// Cooperative warp load of one 8x8 b16 matrix.
+///
+/// See [`ldmatrix_x4_b16`] for the addressing contract: warp-collective,
+/// `addr` in shared memory and 16-byte aligned, one row per lane.
+///
+/// # Safety
+///
+/// Every lane of the warp must reach this call with a shared-memory address.
+#[inline(never)]
+pub unsafe fn ldmatrix_x1_b16(out: &mut [u32; 1], addr: *const u32) {
+    let _ = (out, addr);
+    unreachable!("ldmatrix_x1_b16 called outside CUDA kernel context")
+}
+
+/// Cooperative warp load of two 8x8 b16 matrices — the B operand of `mma.m16n8k16`.
+///
+/// See [`ldmatrix_x4_b16`] for the addressing contract: warp-collective,
+/// `addr` in shared memory and 16-byte aligned, one row per lane.
+///
+/// # Safety
+///
+/// Every lane of the warp must reach this call with a shared-memory address.
+#[inline(never)]
+pub unsafe fn ldmatrix_x2_b16(out: &mut [u32; 2], addr: *const u32) {
+    let _ = (out, addr);
+    unreachable!("ldmatrix_x2_b16 called outside CUDA kernel context")
+}
+
+/// Cooperative warp load of two 8x8 b16 matrices, transposed in the load.
+///
+/// See [`ldmatrix_x4_b16`] for the addressing contract: warp-collective,
+/// `addr` in shared memory and 16-byte aligned, one row per lane.
+///
+/// # Safety
+///
+/// Every lane of the warp must reach this call with a shared-memory address.
+#[inline(never)]
+pub unsafe fn ldmatrix_x2_trans_b16(out: &mut [u32; 2], addr: *const u32) {
+    let _ = (out, addr);
+    unreachable!("ldmatrix_x2_trans_b16 called outside CUDA kernel context")
+}
+
+/// Cooperative warp load of four 8x8 b16 matrices, transposed in the load.
+///
+/// See [`ldmatrix_x4_b16`] for the addressing contract: warp-collective,
+/// `addr` in shared memory and 16-byte aligned, one row per lane.
+///
+/// # Safety
+///
+/// Every lane of the warp must reach this call with a shared-memory address.
+#[inline(never)]
+pub unsafe fn ldmatrix_x4_trans_b16(out: &mut [u32; 4], addr: *const u32) {
+    let _ = (out, addr);
+    unreachable!("ldmatrix_x4_trans_b16 called outside CUDA kernel context")
+}
+
+/// Transpose an 8x8 b16 matrix held in registers, one instruction.
+///
+/// The register-resident counterpart to `ldmatrix.trans`: use it when a
+/// fragment is already loaded and the other orientation is wanted, instead
+/// of a round trip through shared memory.
+///
+/// # Safety
+///
+/// Warp-collective: every lane must reach this call.
+#[inline(never)]
+pub unsafe fn movmatrix_trans_b16(value: u32) -> u32 {
+    let _ = value;
+    unreachable!("movmatrix_trans_b16 called outside CUDA kernel context")
+}
+
+/// Asynchronous 16-byte copy, global to shared, bypassing the register file.
+///
+/// Ampere's `cp.async` is how a staging loop overlaps its next tile's global
+/// loads with the current tile's math. Without it a kernel must land the
+/// bytes in registers first, which is what makes `long_scoreboard` the
+/// dominant stall in a hand-rolled GEMM.
+///
+/// Issue a batch, then [`cp_async_commit_group`], then
+/// [`cp_async_wait_all`] before reading the destination.
+///
+/// # Safety
+///
+/// `dst` must be 16-byte-aligned shared memory, `src` 16-byte-aligned
+/// global memory, and neither may be read until the wait completes.
+#[inline(never)]
+pub unsafe fn cp_async_shared_global_16(dst: *mut u32, src: *const u32) {
+    let _ = (dst, src);
+    unreachable!("cp_async_shared_global_16 called outside CUDA kernel context")
+}
+
+/// Close the current `cp.async` batch so it can be waited on.
+#[inline(never)]
+pub fn cp_async_commit_group() {
+    unreachable!("cp_async_commit_group called outside CUDA kernel context")
+}
+
+/// Wait for every committed `cp.async` batch to land.
+#[inline(never)]
+pub fn cp_async_wait_all() {
+    unreachable!("cp_async_wait_all called outside CUDA kernel context")
+}
+
 #[inline(never)]
 pub unsafe fn mma_sync_m16n8k8_f32_tf32(
     acc: &mut [f32; 4],

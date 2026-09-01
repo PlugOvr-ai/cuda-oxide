@@ -37,6 +37,12 @@ use dialect_mir::ops::{
 };
 use dialect_nvvm::ops::{
     AssertFailOp, InlinePtxOp, MmaSyncM16N8K8F32Tf32Op, MmaSyncM16N8K16F32F16Op,
+    LdmatrixX1B16Op,
+    LdmatrixX2B16Op,
+    LdmatrixX2TransB16Op,
+    LdmatrixX4B16Op,
+    LdmatrixX4TransB16Op,
+    MmaSyncM16N8K32S32S8Op,
     NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp, NvvmAtomicRmwOp, NvvmAtomicStoreOp,
     ReadPtxSregClusterIdxOp, ReadPtxSregNclusterIdOp, VprintfOp, WgmmaMakeSmemDescOp,
     WgmmaMmaGroupM64N64K16F32Bf16Op, WgmmaMmaM64N64K16F32Bf16Op,
@@ -1024,6 +1030,108 @@ impl MirToLlvmConversion for MmaSyncM16N8K16F32F16Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::wgmma::convert_mma_sync_f16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for LdmatrixX1B16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_ldmatrixx1b16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for LdmatrixX2B16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_ldmatrixx2b16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for LdmatrixX2TransB16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_ldmatrixx2transb16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for LdmatrixX4TransB16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_ldmatrixx4transb16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for LdmatrixX4B16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_ldmatrix_x4_b16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MmaSyncM16N8K32S32S8Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_sync_s8(
             ctx,
             rewriter,
             self.get_operation(),

@@ -2939,6 +2939,57 @@ fn try_dispatch_intrinsic(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
             )?))
         }
+        "cuda_device::wgmma::mma_sync_m16n8k32_s32_s8" => {
+            Ok(Some(intrinsics::wgmma::emit_mma_sync_m16n8k32_s32_s8(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::ldmatrix_x4_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_ldmatrix_x4_b16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::ldmatrix_x1_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_ldmatrix_x1_b16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::ldmatrix_x2_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_ldmatrix_x2_b16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::ldmatrix_x2_trans_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_ldmatrix_x2_trans_b16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::ldmatrix_x4_trans_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_ldmatrix_x4_trans_b16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::cp_async_shared_global_16" => {
+            Ok(Some(intrinsics::wgmma::emit_cp_async_shared_global_16(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::cp_async_commit_group" => {
+            Ok(Some(intrinsics::wgmma::emit_cp_async_commit_group(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::cp_async_wait_all" => {
+            Ok(Some(intrinsics::wgmma::emit_cp_async_wait_all(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+        "cuda_device::wgmma::movmatrix_trans_b16" => {
+            Ok(Some(intrinsics::wgmma::emit_movmatrix_trans_b16(
+                ctx, body, args, destination, target, block_ptr, prev_op, value_map, block_map,
+                loc,
+            )?))
+        }
 
         // =================================================================
         // DisjointSlice and SharedArray operations
