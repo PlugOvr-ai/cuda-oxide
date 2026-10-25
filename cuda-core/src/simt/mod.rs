@@ -37,6 +37,7 @@ pub mod context;
 pub mod device_buffer;
 pub mod embedded;
 pub mod event;
+pub mod graph;
 pub mod launch;
 pub mod memory;
 pub mod module;
@@ -52,6 +53,7 @@ pub use cuda_core_derive::DeviceCopy;
 pub use device_buffer::{DeviceBuffer, DeviceCopy};
 pub use embedded::{EmbeddedModule, EmbeddedModuleError};
 pub use event::CudaEvent;
+pub use graph::{capture_status, CaptureStatus, CudaGraph, CudaGraphExec, StreamCaptureMode};
 pub use launch::{
     BlockRequirement, DeviceLaunchLimits, DynamicSharedMemoryRequirement, KernelLaunchConfig,
     KernelLaunchContract, LaunchAxis, LaunchConfig, LaunchConfig1D, LaunchConfig2D, LaunchConfig3D,

@@ -613,6 +613,17 @@ impl CudaContext {
         .map(|value| value != 0)
     }
 
+    /// Total device memory in bytes (`cuDeviceTotalMem`). On an integrated
+    /// part this is the unified pool the CPU shares.
+    pub fn total_memory(&self) -> Result<usize, DriverError> {
+        self.bind_to_thread()?;
+        let mut bytes = MaybeUninit::<usize>::uninit();
+        unsafe {
+            cuda_bindings::cuDeviceTotalMem_v2(bytes.as_mut_ptr(), self.cu_device).result()?;
+            Ok(bytes.assume_init())
+        }
+    }
+
     /// Returns the number of streaming multiprocessors on this device.
     pub fn multiprocessor_count(&self) -> Result<u32, DriverError> {
         self.device_attribute(

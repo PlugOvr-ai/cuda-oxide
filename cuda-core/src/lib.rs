@@ -31,7 +31,7 @@ pub use simt::{
     launch_kernel_cooperative, launch_kernel_cooperative_on_stream, launch_kernel_ex,
     launch_kernel_ex_cooperative, launch_kernel_ex_cooperative_on_stream,
     launch_kernel_ex_on_stream, launch_kernel_on_stream, BlockRequirement, ConstantHandle,
-    ContextLimit, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, DeviceBuffer,
+    ContextLimit, CudaContext, CudaEvent, CudaGraph, CudaGraphExec, CaptureStatus, StreamCaptureMode, capture_status, CudaFunction, CudaModule, CudaStream, DeviceBuffer,
     DeviceCopy, DeviceLaunchLimits, DynamicSharedMemoryRequirement, EmbeddedModule,
     EmbeddedModuleError, KernelLaunchConfig, KernelLaunchContract, LaunchAxis, LaunchConfig1D,
     LaunchConfig2D, LaunchConfig3D, LaunchContractError, LaunchContractSpec, LaunchDimension,
